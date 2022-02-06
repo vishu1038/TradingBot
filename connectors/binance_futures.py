@@ -7,7 +7,7 @@ logger = logging.getLogger()
 class BinanceFuturesClient:
     def __init__(self, testnet):
         if testnet:
-            self.base_url = "https://testnet.binnacefutures.com"
+            self.base_url = "https://testnet.binancefuture.com"
         else:
             self.base_url = "https://fapi.binance.com"
 
@@ -15,7 +15,7 @@ class BinanceFuturesClient:
 
         logger.info("Binance Futures Client successfully Initialized")
 
-    def make_request(self, method, endpoint, data ):
+    def make_request(self, method, endpoint, data):
         if method == "GET":
             response = requests.get(self.base_url + endpoint, params=data)
         else:
@@ -31,31 +31,29 @@ class BinanceFuturesClient:
     def get_contracts(self):
         exchange_info = self.make_request("GET", "/fapi/v1/exchangeInfo", None)
 
-        contracts  =dict()
+        contracts = dict()
 
         if exchange_info is not None:
             for contract_data in exchange_info['symbols']:
-                contracts[contract_data['pair']]  = contract_data
+                contracts[contract_data['pair']] = contract_data
 
         return contracts
-
 
     def get_historical_candles(self, symbol, interval):
         data = dict()
         data['symbol'] = symbol
         data['interval'] = interval
-        data ['limit'] = 1000
+        data['limit'] = 1000
 
-        raw_candles = self.make_request("GET". "fapi/v1/klines", data)
+        raw_candles = self.make_request("GET", "/fapi/v1/klines", data)
 
-        candles= []
+        candles = []
 
         if raw_candles is not None:
             for c in raw_candles:
                 candles.append([c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
 
-
-        return
+        return candles
 
     def get_bid_ask(self, symbol):
         data = dict()
