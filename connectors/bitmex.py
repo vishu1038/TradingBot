@@ -1,5 +1,6 @@
 import requests
 
+
 def get_contracts():
     response_object = requests.get("https://www.bitmex.com/api/v1/instrument/active")
 
@@ -9,5 +10,6 @@ def get_contracts():
         contracts.append(contract['symbol'])
 
     return contracts
+
 
 print(get_contracts())
