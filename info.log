@@ -26,3 +26,15 @@
 2022-02-07 01:30:11,718 INFO :: Binance Futures Client successfully Initialized
 2022-02-07 01:30:31,689 INFO :: Binance Futures Client successfully Initialized
 2022-02-07 01:30:58,875 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:17:46,787 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:17:47,354 ERROR :: Error while making GET request to /fapi/v1/account:{'code': -1021, 'msg': "Timestamp for this request was 1000ms ahead of the server's time."} (Error Code:400)
+2022-02-09 22:18:25,888 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:18:26,405 ERROR :: Error while making GET request to /fapi/v1/account:{'code': -1021, 'msg': "Timestamp for this request was 1000ms ahead of the server's time."} (Error Code:400)
+2022-02-09 22:18:44,791 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:18:45,398 ERROR :: Error while making GET request to /fapi/v1/account:{'code': -1021, 'msg': "Timestamp for this request was 1000ms ahead of the server's time."} (Error Code:400)
+2022-02-09 22:25:37,271 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:40:07,416 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:41:52,104 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:42:37,362 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:43:11,590 INFO :: Binance Futures Client successfully Initialized
+2022-02-09 22:44:24,551 INFO :: Binance Futures Client successfully Initialized
