@@ -38,3 +38,16 @@
 2022-02-09 22:42:37,362 INFO :: Binance Futures Client successfully Initialized
 2022-02-09 22:43:11,590 INFO :: Binance Futures Client successfully Initialized
 2022-02-09 22:44:24,551 INFO :: Binance Futures Client successfully Initialized
+2022-03-01 18:19:20,538 INFO :: Binance connection opened
+2022-03-01 18:19:40,559 ERROR :: Binance connection error: 
+2022-03-01 18:19:40,669 ERROR :: error from callback <bound method BinanceFuturesClient.on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x0000024311D8B9D0>>: BinanceFuturesClient.on_close() takes 2 positional arguments but 4 were given
+2022-03-01 18:19:40,669 ERROR :: Binance connection error: BinanceFuturesClient.on_close() takes 2 positional arguments but 4 were given
+2022-03-01 18:19:40,673 INFO :: Binance Futures Client successfully Initialized
+2022-03-01 18:28:03,252 INFO :: Binance Futures Client successfully Initialized
+2022-03-01 18:28:03,925 INFO :: Binance connection opened
+2022-03-02 10:32:20,178 INFO :: Binance Futures Client successfully Initialized
+2022-03-02 10:32:21,533 INFO :: Binance connection opened
+2022-03-02 10:38:01,159 INFO :: Binance Futures Client successfully Initialized
+2022-03-02 10:38:02,139 INFO :: Binance connection opened
+2022-03-02 10:39:34,222 INFO :: Binance Futures Client successfully Initialized
+2022-03-02 10:39:34,884 INFO :: Binance connection opened
