@@ -24,7 +24,5 @@ if __name__ == "__main__":
     binance = BinanceFuturesClient("5727e21465d0a34be5e3f82bfc1882eca641dc031647c2f33ac34e788d4daf02",
                                    "a27bd67c08753f4948b27990fd591b74c3a415fee8b811bddb4ffa4563c9aa37", True)
 
-    
-
     root = tk.Tk()
     root.mainloop()
