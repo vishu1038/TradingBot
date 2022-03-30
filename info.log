@@ -51,3 +51,24 @@
 2022-03-02 10:38:02,139 INFO :: Binance connection opened
 2022-03-02 10:39:34,222 INFO :: Binance Futures Client successfully Initialized
 2022-03-02 10:39:34,884 INFO :: Binance connection opened
+2022-03-19 10:35:07,452 INFO :: Binance Futures Client successfully Initialized
+2022-03-19 10:35:08,735 INFO :: Binance connection opened
+2022-03-19 10:35:08,735 ERROR :: error from callback <bound method BinanceFuturesClient.on_open of <connectors.binance_futures.BinanceFuturesClient object at 0x000002BC12D40040>>: 'str' object has no attribute 'symbol'
+2022-03-19 10:35:08,735 ERROR :: Binance connection error: 'str' object has no attribute 'symbol'
+2022-03-19 11:24:08,935 ERROR :: Binance connection error: Connection to remote host was lost.
+2022-03-19 11:24:08,936 ERROR :: error from callback <bound method BinanceFuturesClient.on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000002BC12D40040>>: BinanceFuturesClient.on_close() takes 2 positional arguments but 4 were given
+2022-03-19 11:24:08,936 ERROR :: Binance connection error: BinanceFuturesClient.on_close() takes 2 positional arguments but 4 were given
+2022-03-19 11:24:52,579 INFO :: Binance Futures Client successfully Initialized
+2022-03-19 11:24:53,516 INFO :: Binance connection opened
+2022-03-19 11:24:53,516 ERROR :: error from callback <bound method BinanceFuturesClient.on_open of <connectors.binance_futures.BinanceFuturesClient object at 0x0000020D64276080>>: 'str' object has no attribute 'symbol'
+2022-03-19 11:24:53,516 ERROR :: Binance connection error: 'str' object has no attribute 'symbol'
+2022-03-29 21:13:21,489 INFO :: Binance Futures Client successfully Initialized
+2022-03-29 21:13:22,863 INFO :: Binance connection opened
+2022-03-29 21:13:22,863 ERROR :: error from callback <bound method BinanceFuturesClient.on_open of <connectors.binance_futures.BinanceFuturesClient object at 0x00000158167165F0>>: 'str' object has no attribute 'symbol'
+2022-03-29 21:13:22,863 ERROR :: Binance connection error: 'str' object has no attribute 'symbol'
+2022-03-29 21:22:10,965 INFO :: Binance Futures Client successfully Initialized
+2022-03-29 21:22:11,636 INFO :: Binance connection opened
+2022-03-29 21:22:11,636 ERROR :: error from callback <bound method BinanceFuturesClient.on_open of <connectors.binance_futures.BinanceFuturesClient object at 0x000001E977DF6410>>: 'str' object has no attribute 'symbol'
+2022-03-29 21:22:11,636 ERROR :: Binance connection error: 'str' object has no attribute 'symbol'
+2022-03-30 22:11:39,682 INFO :: Binance Futures Client successfully Initialized
+2022-03-30 22:11:41,164 INFO :: Binance connection opened
