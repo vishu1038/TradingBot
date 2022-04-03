@@ -272,3 +272,32 @@
 2022-04-03 11:56:43,074 INFO :: Binance Futures Client successfully Initialized
 2022-04-03 11:56:43,939 INFO :: Binance connection opened
 2022-04-03 11:56:44,420 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 12:58:01,200 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 12:58:02,465 INFO :: Binance connection opened
+2022-04-03 12:58:02,636 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 12:58:03,156 ERROR :: Error while making POST request to /api/v1/order:{'error': {'message': 'Invalid leavesQty for lotSize', 'name': 'HTTPError'}} (Error Code:400)
+2022-04-03 12:58:38,540 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 12:58:39,345 INFO :: Binance connection opened
+2022-04-03 12:58:39,526 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 12:58:39,941 ERROR :: Error while making POST request to /api/v1/order:{'error': {'message': 'Invalid leavesQty for lotSize', 'name': 'HTTPError'}} (Error Code:400)
+2022-04-03 12:59:56,296 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 12:59:57,734 INFO :: Binance connection opened
+2022-04-03 12:59:58,277 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:01:08,601 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:01:09,995 INFO :: Binance connection opened
+2022-04-03 13:01:10,347 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:03:34,915 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:03:36,208 INFO :: Binance connection opened
+2022-04-03 13:03:36,698 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:05:34,639 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:05:36,033 INFO :: Binance connection opened
+2022-04-03 13:05:36,239 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:05:51,689 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:05:52,855 INFO :: Binance connection opened
+2022-04-03 13:05:53,489 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:06:14,283 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:06:15,367 INFO :: Binance connection opened
+2022-04-03 13:06:15,528 INFO :: Bitmex Client Successfully Initialized
+2022-04-03 13:06:30,705 INFO :: Binance Futures Client successfully Initialized
+2022-04-03 13:06:31,580 INFO :: Binance connection opened
+2022-04-03 13:06:32,941 INFO :: Bitmex Client Successfully Initialized
