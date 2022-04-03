@@ -15,6 +15,7 @@ import threading
 
 from models import *
 
+
 logger = logging.getLogger()
 
 
@@ -84,7 +85,7 @@ class BinanceFuturesClient:
 
         if exchange_info is not None:
             for contract_data in exchange_info['symbols']:
-                contracts[contract_data['pair']] = Contract(contract_data)
+                contracts[contract_data['pair']] = Contract(contract_data, "binance")
 
         return contracts
 
@@ -129,7 +130,7 @@ class BinanceFuturesClient:
 
         if account_data is not None:
             for a in account_data['assets']:
-                balances[a['asset']] = Balance(a)
+                balances[a['asset']] = Balance(a, "binance")
 
         return balances
 
@@ -188,9 +189,8 @@ class BinanceFuturesClient:
         return order_status
 
     def _start_ws(self):
-        self.ws = websocket.WebSocketApp(self._wss_url, on_open=self._on_open, on_close=self._on_close,
-                                         on_error=self._on_error,
-                                         on_message=self._on_message)
+        self._ws = websocket.WebSocketApp(self._wss_url, on_open=self._on_open, on_close=self._on_close,
+                                         on_error=self._on_error, on_message=self._on_message)
         while True:
             try:
                 self._ws.run_forever()
@@ -205,7 +205,6 @@ class BinanceFuturesClient:
 
     def _on_close(self, ws):
         logger.warning("Binance Websocket connection closed")
-        return
 
     def _on_error(self, ws, msg: str):
         logger.error("Binance connection error: %s", msg)
