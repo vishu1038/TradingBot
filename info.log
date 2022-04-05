@@ -1020,3 +1020,108 @@
 2022-04-04 10:45:46,019 INFO :: Binance connection opened
 2022-04-04 10:45:46,231 INFO :: Bitmex Client Successfully Initialized
 2022-04-04 10:45:47,072 INFO :: Bitmex connection opened
+2022-04-04 12:42:31,750 INFO :: Binance Futures Client successfully Initialized
+2022-04-04 12:42:32,324 INFO :: Binance connection opened
+2022-04-04 12:42:32,527 INFO :: Bitmex Client Successfully Initialized
+2022-04-04 12:42:33,240 INFO :: Bitmex connection opened
+2022-04-04 12:44:40,251 INFO :: Binance Futures Client successfully Initialized
+2022-04-04 12:44:40,853 INFO :: Binance connection opened
+2022-04-04 12:44:41,110 INFO :: Bitmex Client Successfully Initialized
+2022-04-04 12:44:42,130 INFO :: Bitmex connection opened
+2022-04-05 09:35:54,104 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:35:55,098 INFO :: Binance connection opened
+2022-04-05 09:36:00,032 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:36:02,863 INFO :: Bitmex connection opened
+2022-04-05 09:41:59,507 ERROR :: Error while making GET request to /fapi/v1/account:{'code': -1021, 'msg': 'Timestamp for this request is outside of the recvWindow.'} (Error Code:400)
+2022-04-05 09:41:59,519 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:42:10,910 INFO :: Binance connection opened
+2022-04-05 09:42:11,296 ERROR :: Error while making GET request to /api/v1/user/margin:{'error': {'message': 'This request has expired - `expires` is in the past. Current time: 1649131931', 'name': 'HTTPError'}} (Error Code:400)
+2022-04-05 09:42:11,297 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:42:16,722 INFO :: Bitmex connection opened
+2022-04-05 09:44:50,528 ERROR :: Connection Error while making GET request to /fapi/v1/account: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+2022-04-05 09:44:50,529 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:45:02,280 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:02,281 ERROR :: Connection Error while making GET request to /api/v1/instrument/active: HTTPSConnectionPool(host='testnet.bitmex.com', port=443): Max retries exceeded with url: /api/v1/instrument/active (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x0000021D141E5E10>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:02,282 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x0000021D142121A0>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:02,284 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:14,336 ERROR :: Connection Error while making GET request to /api/v1/user/margin: HTTPSConnectionPool(host='testnet.bitmex.com', port=443): Max retries exceeded with url: /api/v1/user/margin?currency=all (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x0000021D141E5E70>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:14,338 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:45:16,344 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:16,344 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x0000021D142121A0>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:16,344 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:26,369 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:26,370 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x0000021D141E5600>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:26,370 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:28,405 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:28,405 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x0000021D141E5600>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:28,405 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:30,402 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:30,403 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x0000021D142121A0>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:30,403 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:30,418 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:30,418 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x0000021D141E5600>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:30,419 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:46,120 ERROR :: Connection Error while making GET request to /fapi/v1/exchangeInfo: HTTPSConnectionPool(host='testnet.binancefuture.com', port=443): Max retries exceeded with url: /fapi/v1/exchangeInfo (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F65AA05FC0>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:58,175 ERROR :: Connection Error while making GET request to /fapi/v1/account: HTTPSConnectionPool(host='testnet.binancefuture.com', port=443): Max retries exceeded with url: /fapi/v1/account?timestamp=1649132146120&signature=56fd70972d88e47d7602c8af14454e7b9109250158ecf8cb6aad9a227c2ce491 (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F65AA06350>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:58,177 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:45:58,177 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:58,177 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:58,182 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:58,187 ERROR :: Connection Error while making GET request to /api/v1/instrument/active: HTTPSConnectionPool(host='testnet.bitmex.com', port=443): Max retries exceeded with url: /api/v1/instrument/active (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F65AA06020>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:58,190 ERROR :: Connection Error while making GET request to /api/v1/user/margin: HTTPSConnectionPool(host='testnet.bitmex.com', port=443): Max retries exceeded with url: /api/v1/user/margin?currency=all (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F65AA064D0>: Failed to establish a new connection: [Errno 11001] getaddrinfo failed'))
+2022-04-05 09:45:58,195 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:45:58,196 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:45:58,196 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:45:58,196 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:00,188 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:00,188 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:00,188 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:00,200 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:00,201 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:00,201 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:02,198 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:02,198 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:02,199 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:02,212 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:02,212 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:02,212 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:04,214 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:04,218 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:04,219 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:04,219 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:04,219 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:04,220 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:06,226 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:06,226 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:06,227 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:06,227 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:06,227 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:06,227 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:16,258 ERROR :: Binance connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:16,258 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:16,258 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:20,282 ERROR :: Bitmex connection error: [Errno 11001] getaddrinfo failed
+2022-04-05 09:46:20,282 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:20,282 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:20,395 ERROR :: Binance connection error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:997)
+2022-04-05 09:46:20,396 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:20,396 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:22,455 ERROR :: Bitmex connection error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:997)
+2022-04-05 09:46:22,455 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:22,456 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:22,467 ERROR :: Binance connection error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:997)
+2022-04-05 09:46:22,468 ERROR :: error from callback <bound method BinanceFuturesClient._on_close of <connectors.binance_futures.BinanceFuturesClient object at 0x000001F65AA04E50>>: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:22,468 ERROR :: Binance connection error: BinanceFuturesClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:24,519 ERROR :: Bitmex connection error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain (_ssl.c:997)
+2022-04-05 09:46:24,519 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x000001F65AA053C0>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:24,519 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 09:46:25,065 INFO :: Binance connection opened
+2022-04-05 09:46:27,173 INFO :: Bitmex connection opened
+2022-04-05 09:46:44,607 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:46:45,133 INFO :: Binance connection opened
+2022-04-05 09:46:45,657 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:46:46,336 INFO :: Bitmex connection opened
+2022-04-05 09:48:22,853 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 09:48:23,491 INFO :: Binance connection opened
+2022-04-05 09:48:24,458 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 09:48:25,089 INFO :: Bitmex connection opened

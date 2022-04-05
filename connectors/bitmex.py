@@ -116,14 +116,15 @@ class BitmexClient:
         data['partial'] = True
         data['binSize'] = timeframe
         data['count'] = 500
+        data['reverse'] = True
 
         raw_candles = self._make_request("GET", "/api/v1/trade/bucketed", data)
 
         candles = []
 
         if raw_candles is not None:
-            for c in raw_candles:
-                candles.append(c, "bitmex")
+            for c in reversed(raw_candles):
+                candles.append(Candle(c, timeframe, "bitmex"))
 
         return candles
     
