@@ -1125,3 +1125,20 @@
 2022-04-05 09:48:23,491 INFO :: Binance connection opened
 2022-04-05 09:48:24,458 INFO :: Bitmex Client Successfully Initialized
 2022-04-05 09:48:25,089 INFO :: Bitmex connection opened
+2022-04-05 10:02:44,258 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 10:02:46,896 INFO :: Binance connection opened
+2022-04-05 10:02:49,438 ERROR :: Error while making GET request to /api/v1/instrument/active:{'error': {'message': 'This request has expired - `expires` is in the past. Current time: 1649133169', 'name': 'HTTPError'}} (Error Code:400)
+2022-04-05 10:03:09,400 ERROR :: Connection Error while making GET request to /api/v1/user/margin: HTTPSConnectionPool(host='testnet.bitmex.com', port=443): Max retries exceeded with url: /api/v1/user/margin?currency=all (Caused by SSLError(SSLEOFError(8, 'EOF occurred in violation of protocol (_ssl.c:997)')))
+2022-04-05 10:03:09,402 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 10:03:30,458 ERROR :: Bitmex connection error: [WinError 10060] A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond
+2022-04-05 10:03:30,460 ERROR :: error from callback <bound method BitmexClient._on_close of <connectors.bitmex.BitmexClient object at 0x0000025512CF5390>>: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 10:03:30,460 ERROR :: Bitmex connection error: BitmexClient._on_close() takes 2 positional arguments but 4 were given
+2022-04-05 10:04:33,990 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 10:04:34,624 INFO :: Binance connection opened
+2022-04-05 10:04:36,570 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 10:04:37,296 INFO :: Bitmex connection opened
+2022-04-05 10:04:37,548 ERROR :: Error while making POST request to /api/v1/order:{'error': {'message': 'Invalid orderQty', 'name': 'ValidationError'}} (Error Code:400)
+2022-04-05 10:04:58,766 INFO :: Binance Futures Client successfully Initialized
+2022-04-05 10:05:00,587 INFO :: Bitmex Client Successfully Initialized
+2022-04-05 10:05:01,023 INFO :: Binance connection opened
+2022-04-05 10:05:01,275 INFO :: Bitmex connection opened
