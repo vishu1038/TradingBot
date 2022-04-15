@@ -4,6 +4,8 @@ import logging
 from connectors.binance_futures import BinanceFuturesClient
 from connectors.bitmex import BitmexClient
 
+from interface.root_component import Root
+
 logger = logging.getLogger()
 
 logger.setLevel(logging.INFO)
@@ -28,5 +30,5 @@ if __name__ == "__main__":
     bitmex = BitmexClient("FPiT_KayarevHNO-M5MTE1lo",
                           "CG0C3AxheouDXVJbQCmG-Rs0m4mMB92vbdd5aAXvxkz46O28", True)
 
-    root = tk.Tk()
+    root = Root()
     root.mainloop()
