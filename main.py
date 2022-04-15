@@ -30,5 +30,5 @@ if __name__ == "__main__":
     bitmex = BitmexClient("FPiT_KayarevHNO-M5MTE1lo",
                           "CG0C3AxheouDXVJbQCmG-Rs0m4mMB92vbdd5aAXvxkz46O28", True)
 
-    root = Root()
+    root = Root(binance, bitmex)
     root.mainloop()
