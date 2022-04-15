@@ -1,4 +1,3 @@
-import tkinter as tk
 import logging
 
 from connectors.binance_futures import BinanceFuturesClient

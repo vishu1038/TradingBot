@@ -17,6 +17,7 @@ from models import *
 
 logger = logging.getLogger()
 
+
 class BitmexClient:
     def __init__(self, public_key: str, secret_key: str, testnet: bool):
 
@@ -52,7 +53,6 @@ class BitmexClient:
 
         message = method + endpoint + "?" + urlencode(data) + expires if len(data) > 0 else method + endpoint + expires
         return hmac.new(self._secret_key.encode(), message.encode(), hashlib.sha256).hexdigest()
-
 
     def _make_request(self, method: str, endpoint: str, data: typing.Dict):
 
@@ -134,7 +134,8 @@ class BitmexClient:
 
         return candles
     
-    def place_order(self, contract: Contract, order_type: str, quantity: int, side: str, price=None, tif=None) -> OrderStatus:
+    def place_order(self, contract: Contract, order_type: str, quantity: int, side: str,
+                    price=None, tif=None) -> OrderStatus:
         data = dict()
         
         data['symbol'] = contract.symbol
@@ -181,7 +182,7 @@ class BitmexClient:
 
     def _start_ws(self):
         self._ws = websocket.WebSocketApp(self._wss_url, on_open=self._on_open, on_close=self._on_close,
-                                         on_error=self._on_error, on_message=self._on_message)
+                                          on_error=self._on_error, on_message=self._on_message)
         while True:
             try:
                 self._ws.run_forever()
@@ -228,4 +229,3 @@ class BitmexClient:
             self._ws.send(json.dumps(data))
         except Exception as e:
             logger.error("Websocket error while subscribing to %s %s updates: %s", topic, e)
-

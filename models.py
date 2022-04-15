@@ -4,6 +4,7 @@ import datetime
 BITMEX_MULTIPLIER = 0.00000001
 BITMEX_TF_MINUTES = {"1m": 1, "5m": 5, "1h": 60, "1d": 1440}
 
+
 class Balance:
     def __init__(self, info, exchange):
         if exchange == "binance":
@@ -53,6 +54,7 @@ def tick_todecimals(tick_size: float) -> int:
         return len(split_tick[1])
     else:
         return 0
+
 
 class Contract:
     def __init__(self, contract_info, exchange):
