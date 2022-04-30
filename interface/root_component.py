@@ -25,7 +25,7 @@ class Root(tk.Tk):
         self._right_frame.pack(side=tk.LEFT)
 
         self._logging_frame = Logging(self._left_frame, bg=BG_COLOR)
-        self._logging_frame.pack(side=tk.TOP)
+        self._logging_frame.pack(side=tk.BOTTOM)
 
         self._watchlist_frame = Watchlist(self.binance.contracts, self.bitmex.contracts,
                                           self._left_frame, bg=BG_COLOR)

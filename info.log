@@ -1354,3 +1354,28 @@
 2022-04-15 23:15:35,464 INFO :: Binance connection opened
 2022-04-15 23:15:36,192 INFO :: Bitmex Client Successfully Initialized
 2022-04-15 23:15:36,960 INFO :: Bitmex connection opened
+2022-04-30 22:56:39,347 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 22:56:40,037 INFO :: Binance connection opened
+2022-04-30 22:56:43,922 ERROR :: Error while making GET request to /api/v1/instrument/active:{'error': {'message': 'This request has expired - `expires` is in the past. Current time: 1651339604', 'name': 'HTTPError'}} (Error Code:400)
+2022-04-30 22:56:44,271 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 22:56:46,243 INFO :: Bitmex connection opened
+2022-04-30 22:58:04,937 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 22:58:05,534 INFO :: Binance connection opened
+2022-04-30 22:58:06,378 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 22:58:09,172 INFO :: Bitmex connection opened
+2022-04-30 23:00:19,040 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 23:00:19,676 INFO :: Binance connection opened
+2022-04-30 23:00:19,994 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 23:00:21,167 INFO :: Bitmex connection opened
+2022-04-30 23:01:12,236 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 23:01:12,790 INFO :: Binance connection opened
+2022-04-30 23:01:13,038 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 23:01:14,526 INFO :: Bitmex connection opened
+2022-04-30 23:54:12,424 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 23:54:13,030 INFO :: Binance connection opened
+2022-04-30 23:54:13,368 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 23:54:14,449 INFO :: Bitmex connection opened
+2022-04-30 23:58:56,468 INFO :: Binance Futures Client successfully Initialized
+2022-04-30 23:58:57,114 INFO :: Binance connection opened
+2022-04-30 23:58:57,581 INFO :: Bitmex Client Successfully Initialized
+2022-04-30 23:58:58,876 INFO :: Bitmex connection opened
