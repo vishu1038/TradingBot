@@ -1431,3 +1431,11 @@
 2022-05-01 00:55:36,231 INFO :: Bitmex connection opened
 2022-05-01 00:55:58,752 ERROR :: Error while making GET request to /fapi/v1/ticker/bookTicker:{'code': -4108, 'msg': 'Symbol is on delivering or delivered or settling or closed or pre-trading.'} (Error Code:400)
 2022-05-01 00:56:00,571 ERROR :: Error while making GET request to /fapi/v1/ticker/bookTicker:{'code': -4108, 'msg': 'Symbol is on delivering or delivered or settling or closed or pre-trading.'} (Error Code:400)
+2022-05-01 01:16:32,924 INFO :: Binance Futures Client successfully Initialized
+2022-05-01 01:16:33,504 INFO :: Binance connection opened
+2022-05-01 01:16:33,624 INFO :: Bitmex Client Successfully Initialized
+2022-05-01 01:16:35,118 INFO :: Bitmex connection opened
+2022-05-01 01:17:03,951 INFO :: Binance Futures Client successfully Initialized
+2022-05-01 01:17:04,446 INFO :: Binance connection opened
+2022-05-01 01:17:04,680 INFO :: Bitmex Client Successfully Initialized
+2022-05-01 01:17:05,502 INFO :: Bitmex connection opened
