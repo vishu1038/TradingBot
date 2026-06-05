@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TradingBot — Live Dashboard</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --fg:#e6edf3; --muted:#8b949e;
+    --green:#3fb950; --red:#f85149; --blue:#58a6ff; --yellow:#d29922; --border:#30363d;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
+           background:var(--panel); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0; font-weight:600; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); display:inline-block; }
+  .dot.on { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .conn { font-size:12px; color:var(--muted); }
+  .controls { margin-left:auto; display:flex; gap:8px; flex-wrap:wrap; }
+  button { background:var(--panel2); color:var(--fg); border:1px solid var(--border);
+           padding:8px 14px; border-radius:7px; cursor:pointer; font-size:13px; font-weight:600; }
+  button:hover { border-color:var(--blue); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button.start { border-color:var(--green); } button.stop { border-color:var(--red); }
+  button.train { border-color:var(--yellow); }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:14px; }
+  @media (max-width:820px){ main{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+              margin:0 0 10px; }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .stat { background:var(--panel2); border-radius:8px; padding:10px 12px; }
+  .stat .k { font-size:11px; color:var(--muted); text-transform:uppercase; }
+  .stat .v { font-size:20px; font-weight:700; margin-top:3px; }
+  .v.green{color:var(--green);} .v.red{color:var(--red);} .v.blue{color:var(--blue);}
+  .v.yellow{color:var(--yellow);}
+  .promo { margin-top:12px; padding:10px 12px; border-radius:8px; background:var(--panel2);
+           font-size:13px; line-height:1.5; }
+  .promo.ready { background:rgba(63,185,80,.15); border:1px solid var(--green); }
+  .promo.notready { border:1px solid var(--border); }
+  canvas { width:100%; height:120px; display:block; background:var(--panel2); border-radius:8px; }
+  .bar { height:10px; background:var(--panel2); border-radius:5px; overflow:hidden; margin:8px 0; }
+  .bar > div { height:100%; width:0%; background:var(--yellow); transition:width .2s; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; text-transform:uppercase; font-size:11px; }
+  td.buy{color:var(--green);font-weight:700;} td.bd-sell, td.sell{color:var(--red);font-weight:700;}
+  .scroll { max-height:300px; overflow:auto; }
+  #log { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.5;
+         max-height:300px; overflow:auto; white-space:pre-wrap; }
+  #log .INFO{color:var(--fg);} #log .WARNING{color:var(--yellow);} #log .ERROR{color:var(--red);}
+  .full { grid-column:1 / -1; }
+  .pnl-pos{color:var(--green);} .pnl-neg{color:var(--red);}
+  .meta { font-size:12px; color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="connDot"></span>
+  <h1>TradingBot — Live</h1>
+  <span class="conn" id="connText">connecting…</span>
+  <span class="conn" id="modeBadge"></span>
+  <div class="controls">
+    <button class="start" id="btnStart">▶ Start</button>
+    <button class="stop"  id="btnStop">■ Stop</button>
+    <button class="train" id="btnTrain">🧠 Train RL</button>
+    <button id="btnReady">🎓 Check Readiness</button>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>Account / Engine</h2>
+    <div class="stats">
+      <div class="stat"><div class="k">Equity</div><div class="v" id="sEquity">—</div></div>
+      <div class="stat"><div class="k">Realized PnL</div><div class="v" id="sRpnl">—</div></div>
+      <div class="stat"><div class="k">Unrealized PnL</div><div class="v" id="sUpnl">—</div></div>
+      <div class="stat"><div class="k">Position</div><div class="v" id="sPos">—</div></div>
+      <div class="stat"><div class="k"># Trades</div><div class="v" id="sTrades">—</div></div>
+      <div class="stat"><div class="k">Last Signal</div><div class="v" id="sSig">—</div></div>
+    </div>
+    <div class="promo notready" id="promo">Promotion: press “Check Readiness”.</div>
+  </section>
+
+  <section class="panel">
+    <h2>Equity Curve <span class="meta" id="eqMeta"></span></h2>
+    <canvas id="eqCanvas" width="600" height="120"></canvas>
+    <h2 style="margin-top:14px;">RL Training</h2>
+    <div class="bar"><div id="trainBar"></div></div>
+    <div class="meta" id="trainText">idle — press “Train RL” to learn a policy on the live feed.</div>
+  </section>
+
+  <section class="panel full">
+    <h2>Live Trades</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Side</th><th>Qty</th><th>Price</th><th>PnL</th><th>Strategy</th></tr></thead>
+        <tbody id="trades"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel full">
+    <h2>Live Log</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (n,d=2) => (n==null||isNaN(n)) ? "—" : Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const pnlClass = n => n>0 ? "pnl-pos" : n<0 ? "pnl-neg" : "";
+
+// ---- equity sparkline -------------------------------------------------
+const eq = []; const EQ_MAX = 600;
+function drawEquity(){
+  const c = $("eqCanvas"), ctx = c.getContext("2d");
+  const W = c.width, H = c.height; ctx.clearRect(0,0,W,H);
+  if(eq.length < 2) return;
+  const ys = eq.map(p=>p.equity), min = Math.min(...ys), max = Math.max(...ys);
+  const span = (max-min)||1, pad = 6;
+  ctx.beginPath();
+  eq.forEach((p,i)=>{
+    const x = pad + i*(W-2*pad)/(eq.length-1);
+    const y = H-pad - (p.equity-min)/span*(H-2*pad);
+    i? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+  });
+  const up = ys[ys.length-1] >= ys[0];
+  ctx.strokeStyle = up ? "#3fb950" : "#f85149"; ctx.lineWidth = 2; ctx.stroke();
+  $("eqMeta").textContent = `${eq.length} pts · last ${fmt(ys[ys.length-1])}`;
+}
+
+// ---- state rendering --------------------------------------------------
+function applyState(s){
+  if(s.mode) $("modeBadge").textContent = "mode: " + String(s.mode).toUpperCase();
+  if("equity" in s) $("sEquity").textContent = fmt(s.equity);
+  if("realized_pnl" in s){ const e=$("sRpnl"); e.textContent=fmt(s.realized_pnl); e.className="v "+(s.realized_pnl>=0?"green":"red"); }
+  if("unrealized_pnl" in s){ const e=$("sUpnl"); e.textContent=fmt(s.unrealized_pnl); e.className="v "+(s.unrealized_pnl>=0?"green":"red"); }
+  if("position" in s) $("sPos").textContent = fmt(s.position,6);
+  if("n_trades" in s) $("sTrades").textContent = s.n_trades;
+  if("last_signal" in s){ const v=s.last_signal; const e=$("sSig");
+    e.textContent = v>0?"LONG (+1)":v<0?"SHORT (−1)":"FLAT (0)"; e.className="v "+(v>0?"green":v<0?"red":"blue"); }
+}
+
+// ---- trades + log -----------------------------------------------------
+function addTrade(t){
+  const tb=$("trades"), tr=document.createElement("tr");
+  const sideCls = t.side==="BUY"?"buy":"sell";
+  tr.innerHTML = `<td>${t.time||""}</td><td class="${sideCls}">${t.side}</td>`+
+    `<td>${fmt(t.quantity,6)}</td><td>${fmt(t.price)}</td>`+
+    `<td class="${pnlClass(t.pnl)}">${fmt(t.pnl)}</td><td>${t.strategy||""}</td>`;
+  tb.insertBefore(tr, tb.firstChild);
+  while(tb.children.length>200) tb.removeChild(tb.lastChild);
+}
+function addLog(l){
+  const box=$("log"), line=document.createElement("div");
+  line.className=l.level||"INFO"; line.textContent=l.message;
+  box.appendChild(line);
+  while(box.children.length>400) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ---- promotion --------------------------------------------------------
+function showPromo(v){
+  const el=$("promo");
+  if(v.ready){ el.className="promo ready";
+    el.innerHTML="🎓 <b>READY FOR LIVE</b> — all criteria passed. "+(v.recommendation||""); }
+  else { el.className="promo notready";
+    const reasons=(v.failed&&v.failed.length?v.failed:v.reasons)||[];
+    el.innerHTML="<b>NOT READY</b>"+(v.score!=null?` (score ${fmt(v.score*100,0)}%)`:"")+
+      (reasons.length?"<br>· "+reasons.map(r=>typeof r==="string"?r:JSON.stringify(r)).join("<br>· "):""); }
+}
+
+// ---- training ---------------------------------------------------------
+function onTrain(d){
+  const bar=$("trainBar"), txt=$("trainText");
+  if(d.phase==="start"){ bar.style.width="0%"; txt.textContent=`training started · ${d.bars} bars · ${d.iterations} iters`; }
+  else if(d.phase==="iter"){ const pct=Math.round(100*d.iteration/d.total);
+    bar.style.width=pct+"%";
+    txt.textContent=`iter ${d.iteration}/${d.total} · best reward ${fmt(d.best_reward,3)} · avg ${fmt(d.avg_reward,3)}`; }
+  else if(d.phase==="done"){ bar.style.width="100%"; txt.textContent="✓ training complete — policy saved to "+d.model_path; }
+  else if(d.phase==="error"){ txt.textContent="✗ training error: "+d.error; }
+}
+
+// ---- SSE wiring -------------------------------------------------------
+function connect(){
+  const es = new EventSource("/events");
+  es.addEventListener("hello", ()=>{ $("connDot").className="dot on"; $("connText").textContent="live"; });
+  es.addEventListener("state",  e=>applyState(JSON.parse(e.data)));
+  es.addEventListener("engine", e=>{ const d=JSON.parse(e.data); if(d.state) applyState(d.state); });
+  es.addEventListener("fill",   e=>addTrade(JSON.parse(e.data)));
+  es.addEventListener("log",    e=>addLog(JSON.parse(e.data)));
+  es.addEventListener("train",  e=>onTrain(JSON.parse(e.data)));
+  es.addEventListener("equity", e=>{ const d=JSON.parse(e.data);
+    eq.push(d); if(eq.length>EQ_MAX) eq.shift(); drawEquity(); });
+  es.onerror = ()=>{ $("connDot").className="dot"; $("connText").textContent="reconnecting…"; };
+}
+
+// ---- controls ---------------------------------------------------------
+const post = p => fetch(p,{method:"POST"}).then(r=>r.json());
+$("btnStart").onclick = ()=>post("/api/start");
+$("btnStop").onclick  = ()=>post("/api/stop");
+$("btnTrain").onclick = ()=>post("/api/train").then(r=>{ if(!r.ok) $("trainText").textContent="⚠ "+(r.error||"could not start"); });
+$("btnReady").onclick = ()=>fetch("/api/readiness").then(r=>r.json()).then(showPromo);
+
+connect();
+</script>
+</body>
+</html>

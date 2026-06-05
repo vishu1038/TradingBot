@@ -124,8 +124,13 @@ def run_episode(env: TradingEnv, policy: LinearPolicy) -> float:
 
 def train_cem(env: TradingEnv, obs_dim: int, iterations: int = 25,
               population: int = 40, elite_frac: float = 0.25, init_std: float = 0.5,
-              seed: int = 0) -> LinearPolicy:
-    """Cross-entropy method over the flat policy parameters. Returns the best policy."""
+              seed: int = 0, progress_cb=None) -> LinearPolicy:
+    """Cross-entropy method over the flat policy parameters. Returns the best policy.
+
+    If `progress_cb` is given, it is called once per iteration with a dict of progress
+    metrics (iteration, total, avg/elite/best reward). This lets a live dashboard show
+    training advancing in real time without coupling the optimizer to any UI.
+    """
     rng = np.random.default_rng(seed)
     policy = LinearPolicy(obs_dim)
     n_params = policy.n_params
@@ -156,6 +161,18 @@ def train_cem(env: TradingEnv, obs_dim: int, iterations: int = 25,
 
         logger.info("iter %2d/%d | avg=%+.5f | elite_avg=%+.5f | best=%+.5f",
                     it + 1, iterations, rewards.mean(), rewards[elite_idx].mean(), best_reward)
+
+        if progress_cb is not None:
+            try:
+                progress_cb({
+                    "iteration": it + 1,
+                    "total": iterations,
+                    "avg_reward": float(rewards.mean()),
+                    "elite_reward": float(rewards[elite_idx].mean()),
+                    "best_reward": best_reward,
+                })
+            except Exception as e:  # a UI hook must never kill training
+                logger.error("train progress_cb raised: %s", e)
 
     policy.set_flat(best_theta)
     return policy
@@ -202,6 +219,47 @@ def train_sb3(df: pd.DataFrame, timesteps: int = 20_000):  # pragma: no cover - 
     os.makedirs("models", exist_ok=True)
     model.save(os.path.join("models", "rl_ppo"))
     logger.info("Saved PPO model -> models/rl_ppo.zip (load via PPO.load in your own runner)")
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard entry point — train while streaming progress to an event bus
+# --------------------------------------------------------------------------- #
+def train_to_bus(event_bus, df: pd.DataFrame = None, iterations: int = 20,
+                 population: int = 40, window: int = 32, seed: int = 0) -> dict:
+    """Run CEM training, publishing `train` events to `event_bus`, and save the policy.
+
+    Returns a small summary dict. Designed to be called on a background thread by the web
+    dashboard's /api/train endpoint. Publishes:
+        train {phase: "start"|"iter"|"done"|"error", ...}
+    """
+    def publish(phase, **kw):
+        if event_bus is not None:
+            try:
+                event_bus.publish("train", {"phase": phase, **kw})
+            except Exception:
+                pass
+
+    try:
+        if df is None:
+            df = synthetic_ohlcv()
+        env = TradingEnv(df, window=window, reward_mode="pnl")
+        obs_dim = observation_dim(env.window)
+        publish("start", iterations=iterations, bars=env.n_bars, obs_dim=obs_dim)
+        logger.info("Dashboard training: %d bars, obs_dim=%d, %d iters",
+                    env.n_bars, obs_dim, iterations)
+
+        policy = train_cem(
+            env, obs_dim, iterations=iterations, population=population, seed=seed,
+            progress_cb=lambda p: publish("iter", **p),
+        )
+        save_policy(MODEL_PATH, policy, env)
+        publish("done", model_path=MODEL_PATH)
+        logger.info("Dashboard training complete -> %s", MODEL_PATH)
+        return {"ok": True, "model_path": MODEL_PATH, "iterations": iterations}
+    except Exception as e:
+        logger.error("Dashboard training failed: %s", e, exc_info=True)
+        publish("error", error=str(e))
+        return {"ok": False, "error": str(e)}
 
 
 # --------------------------------------------------------------------------- #

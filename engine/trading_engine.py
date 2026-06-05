@@ -65,6 +65,7 @@ class TradingEngine:
         run_id: typing.Optional[str] = None,
         poll_seconds: typing.Optional[float] = None,
         confirm_live: bool = False,
+        event_bus=None,
     ):
         self.client = client
         self.strategy = strategy
@@ -75,6 +76,7 @@ class TradingEngine:
         self.initial_capital = float(initial_capital)
         self.notifier = notifier
         self.evaluator = evaluator
+        self.event_bus = event_bus       # optional pub/sub for the live dashboard
         self.run_id = run_id or uuid.uuid4().hex[:12]
 
         # Resolve and guard the requested mode (may downgrade live -> paper).
@@ -155,6 +157,7 @@ class TradingEngine:
         logger.info("TradingEngine started (mode=%s, symbol=%s, run_id=%s).",
                     self.mode, self.symbol, self.run_id)
         self._notify(f"Engine started: {self.mode} {self.symbol} ({self.run_id})")
+        self._publish("engine", {"event": "started", "state": self.get_state()})
 
     def stop(self) -> None:
         """Signal the loop to stop. Does not join (loop is daemon)."""
@@ -163,6 +166,7 @@ class TradingEngine:
         self.running = False
         logger.info("TradingEngine stop requested (run_id=%s).", self.run_id)
         self._notify(f"Engine stopped: {self.mode} {self.symbol} ({self.run_id})")
+        self._publish("engine", {"event": "stopped", "state": self.get_state()})
 
     # ------------------------------------------------------------- main loop
     def _run_loop(self) -> None:
@@ -213,6 +217,11 @@ class TradingEngine:
         self.equity = equity_now
         self.risk_manager.update_equity(equity_now)
         self._record_equity(equity_now)
+
+        # Stream a live equity point + full state snapshot to any dashboard subscribers.
+        self._publish("equity", {"ts": self._now_ms(), "equity": round(equity_now, 2),
+                                 "price": round(price, 2), "signal": self.last_signal})
+        self._publish("state", self.get_state())
 
         if self.database is not None:
             try:
@@ -383,8 +392,6 @@ class TradingEngine:
         )
 
     def _emit_trade_callback(self, trade: dict) -> None:
-        if self.trade_callback is None:
-            return
         ui = {
             "time": datetime.now().strftime("%H:%M:%S"),
             "symbol": trade["symbol"],
@@ -392,9 +399,15 @@ class TradingEngine:
             "strategy": trade["strategy"],
             "side": trade["side"],
             "quantity": trade["quantity"],
+            "price": trade.get("price"),
             "status": trade["status"],
             "pnl": trade["pnl"],
         }
+        # Always stream the fill to the event bus (the dashboard listens here);
+        # the Tk trade_callback is optional and only present in the desktop GUI.
+        self._publish("fill", ui)
+        if self.trade_callback is None:
+            return
         try:
             self.trade_callback(ui)
         except Exception as e:
@@ -416,6 +429,15 @@ class TradingEngine:
     @staticmethod
     def _now_ms() -> int:
         return int(time.time() * 1000)
+
+    # ----------------------------------------------------------- event bus
+    def _publish(self, type: str, data: typing.Any = None) -> None:
+        if self.event_bus is None:
+            return
+        try:
+            self.event_bus.publish(type, data)
+        except Exception as e:
+            logger.error("event_bus.publish(%s) raised: %s", type, e)
 
     # ----------------------------------------------------------- notifier
     def _notify(self, message: str) -> None:
