@@ -31,7 +31,7 @@ class BitmexClient:
         self._public_key = public_key
         self._secret_key = secret_key
 
-        self_ws = None
+        self._ws = None
 
         self.contracts = self.get_contracts()
         self.balances = self.get_balances()
@@ -178,7 +178,7 @@ class BitmexClient:
         if order_status is not None:
             for order in order_status:
                 if order['orderID'] == order_id:
-                    return OrderStatus(order_status[0], "bitmex")
+                    return OrderStatus(order, "bitmex")
 
     def _start_ws(self):
         self._ws = websocket.WebSocketApp(self._wss_url, on_open=self._on_open, on_close=self._on_close,
@@ -228,4 +228,4 @@ class BitmexClient:
         try:
             self._ws.send(json.dumps(data))
         except Exception as e:
-            logger.error("Websocket error while subscribing to %s %s updates: %s", topic, e)
+            logger.error("Websocket error while subscribing to %s updates: %s", topic, e)

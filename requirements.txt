@@ -1,0 +1,23 @@
+# --- Existing runtime deps (connectors + GUI) ---
+requests
+websocket-client
+python-dateutil
+
+# --- Configuration ---
+python-dotenv
+
+# --- Data / backtesting / ML (Phase 1 & 2 scaffold) ---
+numpy
+pandas
+scikit-learn
+joblib
+
+# Gradient-boosted tree models for the supervised-ML strategy.
+# LightGBM is the default; either works with strategies/ml_strategy.py.
+lightgbm
+# xgboost            # uncomment to use XGBoost instead of LightGBM
+
+# --- Optional, recommended later ---
+# pandas-ta          # richer technical indicators (we ship hand-rolled ones in strategies/features.py)
+# matplotlib         # embed equity-curve charts in the GUI (Phase 4)
+# python-telegram-bot # phone alerts (Phase 4)

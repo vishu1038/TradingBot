@@ -1,0 +1,27 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment / secrets
+.env
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+info.log
+
+# Data & model artifacts
+data/*.db
+data/*.sqlite
+data/*.parquet
+data/*.csv
+models/*.pkl
+models/*.joblib
+*.ckpt
+
+# OS / editor
+.DS_Store
+Thumbs.db
