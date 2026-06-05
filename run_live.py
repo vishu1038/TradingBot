@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import threading
 import time
 import typing
@@ -103,6 +104,26 @@ def build_real_client():
                                    testnet=False)
 
 
+def build_testnet_client():
+    """Authenticated Binance Futures TESTNET client (fake money, real matching engine).
+
+    Unlike build_real_client (prod, market-data-only), this is a full authenticated client on
+    testnet.binancefuture.com: it can place/cancel REAL orders against the testnet book, so
+    fills, slippage, min-notional, lot/tick steps, leverage and liquidation are all real — just
+    with play money. Requires testnet API keys in .env (BINANCE_PUBLIC_KEY/SECRET_KEY); returns
+    None if they're absent so the caller can fall back / explain.
+    """
+    from config import CONFIG
+    from connectors.binance_futures import BinanceFuturesClient
+
+    if not (CONFIG.binance_public_key and CONFIG.binance_secret_key):
+        logger.error("--testnet needs testnet API keys in .env (BINANCE_PUBLIC_KEY / "
+                     "BINANCE_SECRET_KEY). Create them at https://testnet.binancefuture.com/ .")
+        return None
+    return BinanceFuturesClient(CONFIG.binance_public_key, CONFIG.binance_secret_key,
+                                testnet=True)
+
+
 def fetch_history(real_client, symbol: str, timeframe: str, n_bars: int):
     """Assemble up to `n_bars` recent candles for `symbol` as a DataFrame.
 
@@ -144,6 +165,47 @@ def fetch_history(real_client, symbol: str, timeframe: str, n_bars: int):
                                        "close", "volume"])
 
 
+def select_active_universe(real_client, *, size: int = 8, min_quote_volume: float = 5e7,
+                           always_include=("BTCUSDT", "ETHUSDT"),
+                           exclude_substrings=("USDC", "_", "1000")) -> typing.List[str]:
+    """Rank Binance USDⓈ-M perps by *current* trading activity and return the top `size`.
+
+    "Activity" = recent move size scaled by liquidity: abs(24h % change) * sqrt(quote volume).
+    Volatility gives quick trade opportunities; the volume term (and `min_quote_volume` floor)
+    keeps us in liquid books so spread/slippage/liquidation stay sane — important for the small
+    real-money target. Always keeps the `always_include` anchors. Falls back to DEFAULT_SYMBOLS
+    on any error so startup never hinges on this call.
+    """
+    import math
+    try:
+        rows = real_client._make_request("GET", "/fapi/v1/ticker/24hr", {})
+        if not isinstance(rows, list):
+            raise ValueError("unexpected ticker payload")
+        scored = []
+        for r in rows:
+            sym = r.get("symbol", "")
+            if not sym.endswith("USDT") or any(x in sym for x in exclude_substrings):
+                continue
+            qv = float(r.get("quoteVolume", 0.0))
+            if qv < min_quote_volume:
+                continue
+            pct = abs(float(r.get("priceChangePercent", 0.0)))
+            scored.append((pct * math.sqrt(qv), sym))
+        scored.sort(reverse=True)
+        picked = [s for _, s in scored]
+        # Pin the anchors at the front, then fill from the activity-ranked list (dedup).
+        out = list(always_include)
+        for s in picked:
+            if s not in out:
+                out.append(s)
+        out = out[:max(size, len(always_include))]
+        logger.info("Auto-universe: top %d active perps -> %s", len(out), ", ".join(out))
+        return out
+    except Exception as e:  # noqa: BLE001 - never let universe selection block startup
+        logger.warning("Auto-universe selection failed (%s); using DEFAULT_SYMBOLS.", e)
+        return [s.strip().upper() for s in DEFAULT_SYMBOLS.split(",")][:size]
+
+
 def build_training_df(use_live: bool, real_client, symbol: str, timeframe: str,
                       n_bars: int = 5000):
     """OHLCV frame to train the RL policy on: live history if reachable, else synthetic."""
@@ -172,10 +234,17 @@ class MultiEngineController:
                  initial_capital: float):
         self.engines = engines
         self.event_bus = event_bus
+        self._capital_per = float(initial_capital)
         self.initial_capital_total = initial_capital * len(engines)
         self.symbol = f"{len(engines)} symbols: " + ", ".join(engines.keys())
         self.mode = next(iter(engines.values())).mode if engines else "paper"
         self.running = False
+        # Engines may be added/removed at runtime (UniverseManager) while get_state() is read
+        # concurrently from the aggregate loop AND the HTTP handler — guard the dict + carry the
+        # equity/realized PnL of retired engines so the portfolio total stays continuous.
+        self._lock = threading.RLock()
+        self._retired_equity = 0.0
+        self._retired_realized = 0.0
         self._stop = threading.Event()
         self._thread: typing.Optional[threading.Thread] = None
 
@@ -197,6 +266,38 @@ class MultiEngineController:
         self._stop.set()
         logger.info("MultiEngineController stopped all engines.")
 
+    # --------------------------------------------------------- live mutation
+    def _refresh_label(self) -> None:
+        """Recompute the human-readable symbol label after the engine set changes."""
+        self.symbol = f"{len(self.engines)} symbols: " + ", ".join(self.engines.keys())
+
+    def add_engine(self, sym: str, engine: TradingEngine) -> None:
+        """Add a per-symbol engine at runtime, starting it if the controller is running."""
+        with self._lock:
+            if sym in self.engines:
+                return
+            self.engines[sym] = engine
+            self.initial_capital_total += self._capital_per
+            self._refresh_label()
+            if self.running:
+                engine.start()
+
+    def remove_engine(self, sym: str) -> typing.Optional[TradingEngine]:
+        """Stop and drop a per-symbol engine, folding its equity/PnL into retired totals so
+        the aggregate portfolio figures stay continuous. Returns the removed engine (or None)."""
+        with self._lock:
+            engine = self.engines.pop(sym, None)
+            if engine is None:
+                return None
+            try:
+                engine.stop()
+            except Exception as e:  # noqa: BLE001 - removal must not raise
+                logger.warning("[universe] %s stop during removal failed: %s", sym, e)
+            self._retired_equity += float(getattr(engine, "equity", 0.0))
+            self._retired_realized += float(getattr(engine, "realized_pnl", 0.0))
+            self._refresh_label()
+            return engine
+
     # ------------------------------------------------------------- aggregation
     def _aggregate_loop(self) -> None:
         """Publish one combined state + equity event per second for the dashboard."""
@@ -215,20 +316,25 @@ class MultiEngineController:
         trades = 0
         halted = False
         per_symbol = []
-        for sym, eng in self.engines.items():
-            s = eng.get_state()
-            eq += s["equity"]; cash += s["cash"]
-            rpnl += s["realized_pnl"]; upnl += s["unrealized_pnl"]
-            trades += s["n_trades"]
-            halted = halted or s["halted"]
-            per_symbol.append({"symbol": sym, "equity": round(s["equity"], 2),
-                               "position": round(s["position"], 6),
-                               "n_trades": s["n_trades"],
-                               "realized_pnl": round(s["realized_pnl"], 2)})
+        with self._lock:
+            # Seed with retired engines so the portfolio total doesn't jump when one is dropped.
+            eq += self._retired_equity
+            rpnl += self._retired_realized
+            for sym, eng in self.engines.items():
+                s = eng.get_state()
+                eq += s["equity"]; cash += s["cash"]
+                rpnl += s["realized_pnl"]; upnl += s["unrealized_pnl"]
+                trades += s["n_trades"]
+                halted = halted or s["halted"]
+                per_symbol.append({"symbol": sym, "equity": round(s["equity"], 2),
+                                   "position": round(s["position"], 6),
+                                   "n_trades": s["n_trades"],
+                                   "realized_pnl": round(s["realized_pnl"], 2)})
+            running = any(e.running for e in self.engines.values())
         return {
             "mode": self.mode,
             "symbol": self.symbol,
-            "running": any(e.running for e in self.engines.values()),
+            "running": running,
             "equity": round(eq, 2),
             "cash": round(cash, 2),
             "position": 0.0,
@@ -280,7 +386,8 @@ class ContinuousTrainer:
 
     def __init__(self, engines, event_bus, fetch_df, *, iterations: int,
                  population: int, train_bars: int, interval: float,
-                 workers: int = 0, swap_into_engine: bool = True, advisor=None):
+                 workers: int = 0, swap_into_engine: bool = True, advisor=None,
+                 churn_penalty: float = 0.0):
         self.engines = engines
         self.event_bus = event_bus
         self.fetch_df = fetch_df            # callable(symbol) -> DataFrame | None
@@ -288,6 +395,7 @@ class ContinuousTrainer:
         self.population = population
         self.train_bars = train_bars
         self.interval = interval
+        self.churn_penalty = float(churn_penalty)   # extra reward penalty per unit turnover
         # Workers <= 0 means "decide from CPU count, capped at #symbols". This is the number of
         # SEPARATE PROCESSES training runs across — the whole point of the offload: it pulls
         # CEM off the main process so the HTTP/SSE server isn't GIL-starved (no more dashboard
@@ -414,7 +522,7 @@ class ContinuousTrainer:
                             break
                         kw = dict(iterations=self.iterations, population=self.population,
                                   init_theta=self._theta.get(sym), model_path=model_path,
-                                  seed=self.cycle)
+                                  seed=self.cycle, churn_penalty=self.churn_penalty)
                         self._publish("start", sym, iterations=self.iterations, bars=len(df))
                         try:
                             futures[executor.submit(_pool_train_worker, (sym, df, kw))] = sym
@@ -463,7 +571,7 @@ class ContinuousTrainer:
                             res = train_policy(
                                 df, iterations=self.iterations, population=self.population,
                                 init_theta=self._theta.get(sym), model_path=model_path,
-                                seed=self.cycle)
+                                seed=self.cycle, churn_penalty=self.churn_penalty)
                             res["symbol"] = sym
                         except Exception as e:
                             res = {"ok": False, "symbol": sym, "error": str(e)}
@@ -476,15 +584,138 @@ class ContinuousTrainer:
                 executor.shutdown(wait=False, cancel_futures=True)
 
 
+class UniverseManager:
+    """Periodically re-ranks Binance perps by activity and cycles the live engine set:
+    adds engines for newly-active symbols, removes stale ones. Live-only. Anti-thrash via
+    a rank buffer + min-dwell. The ContinuousTrainer auto-trains added symbols (it snapshots
+    keys); removed symbols are simply dropped."""
+
+    def __init__(self, controller: MultiEngineController, trainer, real_client,
+                 make_engine, event_bus, *, size: int = 8, interval: float = 1800.0):
+        self.controller = controller
+        self.trainer = trainer
+        self.real_client = real_client
+        self.make_engine = make_engine
+        self.event_bus = event_bus
+        self.size = int(size)
+        self.interval = float(interval)
+        self._added_cycle: typing.Dict[str, int] = {}   # sym -> cycle index when added
+        self._stop = threading.Event()
+        self._thread: typing.Optional[threading.Thread] = None
+        self.cycle = 0
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="universe-mgr", daemon=True)
+        self._thread.start()
+        logger.info("UniverseManager started: re-ranking top %d active perps every %.0fs.",
+                    self.size, self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # Brief settle before the first cycle (let engines/dashboard come up), then cycle and
+        # wait `interval` BETWEEN cycles. Never let an exception kill the thread.
+        self._stop.wait(5.0)
+        while not self._stop.is_set():
+            self.cycle += 1
+            try:
+                self._rebalance()
+            except Exception as e:  # noqa: BLE001 - cycling must never crash its thread
+                logger.warning("[universe] cycle %d failed: %s", self.cycle, e)
+            self._stop.wait(self.interval)
+
+    def _rebalance(self) -> None:
+        # Fully dynamic ranking (no anchors): trade whatever is most active right now.
+        ranked = select_active_universe(self.real_client, size=self.size, always_include=())
+        if not ranked:
+            return
+        keep_buffer = ranked[:math.ceil(self.size * 1.5)]   # broader retention set
+        desired_top = ranked[:self.size]
+        current = set(self.controller.engines.keys())
+
+        # ADD: newly-active symbols not yet running.
+        for sym in desired_top:
+            if sym in current:
+                continue
+            eng = self.make_engine(sym)
+            if eng is not None:
+                self.controller.add_engine(sym, eng)
+                self._added_cycle[sym] = self.cycle
+                logger.info("[universe] cycle %d: ADD %s (now active).", self.cycle, sym)
+
+        # REMOVE: symbols that fell out of the broader keep buffer (min-dwell enforced).
+        for sym in list(current):
+            if sym in keep_buffer:
+                continue
+            if self.cycle - self._added_cycle.get(sym, -999) < 1:
+                continue   # too freshly added — let it dwell at least one cycle
+            self.controller.remove_engine(sym)
+            self.trainer._theta.pop(sym, None)
+            self._added_cycle.pop(sym, None)
+            logger.info("[universe] cycle %d: REMOVE %s (no longer active).", self.cycle, sym)
+
+        # Converge toward `size`: if still over, drop the lowest-ranked extras (not in the top
+        # `size`), oldest dwell first, respecting min-dwell.
+        if len(self.controller.engines) > self.size:
+            extras = [s for s in self.controller.engines.keys() if s not in desired_top]
+            extras.sort(key=lambda s: self._added_cycle.get(s, -999))   # oldest dwell first
+            for sym in extras:
+                if len(self.controller.engines) <= self.size:
+                    break
+                if self.cycle - self._added_cycle.get(sym, -999) < 1:
+                    continue
+                self.controller.remove_engine(sym)
+                self.trainer._theta.pop(sym, None)
+                self._added_cycle.pop(sym, None)
+                logger.info("[universe] cycle %d: TRIM %s (over target size).",
+                            self.cycle, sym)
+
+        try:
+            self.event_bus.publish("universe", {
+                "cycle": self.cycle,
+                "active": list(self.controller.engines.keys()),
+                "ranked": ranked,
+            })
+        except Exception:  # noqa: BLE001 - publishing is best-effort
+            pass
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Multi-symbol live/paper trading dashboard.")
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
-    ap.add_argument("--timeframe", default="1m")
+    ap.add_argument("--timeframe", default="5m",
+                    help="candle timeframe. 5m default: on real data the base strategy went "
+                         "from -6%% (1m, fee-churn) to +16%% (5m) — bigger move-to-fee ratio.")
+    ap.add_argument("--auto-universe", action="store_true",
+                    help="ignore --symbols and pick the most ACTIVE (volatile x liquid) Binance "
+                         "perps right now (needs a reachable exchange).")
+    ap.add_argument("--universe-size", type=int, default=8,
+                    help="how many symbols --auto-universe selects.")
+    ap.add_argument("--cycle-universe", action="store_true",
+                    help="periodically re-rank Binance perps and CYCLE the live engine set "
+                         "(add newly-active symbols, drop stale ones). Implies a dynamic "
+                         "initial universe; needs a reachable exchange.")
+    ap.add_argument("--cycle-interval", type=float, default=1800.0,
+                    help="seconds between --cycle-universe re-rankings.")
+    ap.add_argument("--churn-penalty", type=float, default=0.0,
+                    help="extra RL reward penalty per unit turnover (discourages over-trading) "
+                         "fed into continuous training. Default 0: a single-split OOS test on SOL "
+                         "was inconclusive (CEM seed-noise dominated), and moving to 5m already "
+                         "cuts structural over-trading. Tunable knob, off by default.")
     ap.add_argument("--capital", type=float, default=10_000, help="capital PER symbol")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--poll", type=float, default=None, help="seconds between polls")
     ap.add_argument("--force-replay", action="store_true")
+    ap.add_argument("--testnet", action="store_true",
+                    help="trade on the Binance Futures TESTNET matching engine (fake money, REAL "
+                         "fills/slippage/min-notional/leverage/liquidation). Needs testnet API "
+                         "keys in .env. This is true paper trading 'on the platform', not a local "
+                         "simulation.")
     ap.add_argument("--no-browser", action="store_true")
     # --- training (RL) -----------------------------------------------------
     ap.add_argument("--history", type=int, default=8000,
@@ -520,43 +751,79 @@ def main() -> None:
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
-    # --- choose data source ------------------------------------------------
+    # --- choose data source + execution venue ------------------------------
+    # engine_mode: "testnet" places REAL orders on Binance testnet (fake money); "paper"
+    # simulates fills locally against live prod market data.
     use_live = False
     real_client = None
-    if not args.force_replay and exchange_reachable():
+    engine_mode = "paper"
+    if args.testnet:
+        real_client = build_testnet_client()
+        if real_client is not None:
+            use_live = True
+            engine_mode = "testnet"
+            # Demo trades at the real-money target size: default per-symbol capital to $100 on
+            # testnet (override with --capital) so position sizing & min-notional mirror live.
+            if args.capital == 10_000:
+                args.capital = 100.0
+                logger.info("TESTNET: per-symbol capital defaulted to $100 (override --capital).")
+            logger.info("TESTNET mode — placing REAL orders on Binance testnet (fake money, "
+                        "real fills/min-notional/leverage/liquidation).")
+        else:
+            logger.warning("Testnet client unavailable (missing keys?); falling back to local "
+                           "paper on whatever data source is reachable.")
+    if not use_live and not args.force_replay and exchange_reachable():
         try:
             real_client = build_real_client()
             use_live = True
-            logger.info("Exchange REACHABLE — using LIVE market data (paper fills).")
+            logger.info("Exchange REACHABLE — using LIVE market data (LOCAL paper fills).")
         except Exception as e:
             logger.warning("Real connector failed (%s); falling back to replay.", e)
     if not use_live:
         logger.warning("Exchange not reachable — using SYNTHETIC replay feed per symbol. "
                        "Re-run on an exchange-reachable network for live data.")
 
+    # Auto-universe: trade whatever is most active right now (needs a live exchange).
+    if args.auto_universe:
+        if use_live and real_client is not None:
+            symbols = select_active_universe(real_client, size=args.universe_size)
+        else:
+            logger.warning("--auto-universe needs a reachable exchange; using --symbols instead.")
+    # --cycle-universe implies a dynamic INITIAL set too (unless --auto-universe already picked
+    # one). Fully dynamic — no anchors — so the initial set matches what the cycler will keep.
+    elif args.cycle_universe:
+        if use_live and real_client is not None:
+            symbols = select_active_universe(real_client, size=args.universe_size,
+                                             always_include=())
+        else:
+            logger.warning("--cycle-universe needs a reachable exchange; using --symbols "
+                           "for the initial set.")
+
     poll = args.poll if args.poll is not None else (10.0 if use_live else 0.4)
 
     # --- build one engine per symbol --------------------------------------
-    engines: typing.Dict[str, TradingEngine] = {}
-    for i, sym in enumerate(symbols):
+    # Factory closure: builds a single per-symbol engine. Used both for the initial set
+    # AND by the UniverseManager to spin up engines for newly-active symbols at runtime.
+    # Returns None when a live symbol isn't tradable on the exchange.
+    def make_engine(sym: str, i: int = 0) -> typing.Optional[TradingEngine]:
         if use_live:
             client = real_client
             if sym not in getattr(client, "contracts", {}):
                 logger.warning("Symbol %s not on exchange; skipping.", sym)
-                continue
+                return None
         else:
             start_px = _REPLAY_START_PRICE.get(sym, 100.0 * (i + 1))
             df = make_synthetic_ohlcv(n=3000, seed=7 + i, start_price=start_px)
             client = ReplayClient(df=df, symbol=sym, warmup=200)
 
-        engines[sym] = TradingEngine(
+        return TradingEngine(
             client=client,
             strategy=EmaCrossStrategy(),
             risk_manager=RiskManager(RiskLimits(), starting_equity=args.capital),
             database=None,
             symbol=sym,
             timeframe=args.timeframe,
-            mode="paper",
+            mode=engine_mode,
             initial_capital=args.capital,
             notifier=ConsoleNotifier(),
             evaluator=PromotionEvaluator(),
@@ -564,6 +831,12 @@ def main() -> None:
             event_bus=GLOBAL_BUS,
             publish_step_updates=False,    # the controller publishes the aggregate
         )
+
+    engines: typing.Dict[str, TradingEngine] = {}
+    for i, sym in enumerate(symbols):
+        eng = make_engine(sym, i)
+        if eng is not None:
+            engines[sym] = eng
 
     if not engines:
         raise SystemExit("No tradable symbols; aborting.")
@@ -605,6 +878,7 @@ def main() -> None:
             iterations=args.train_iterations, population=args.train_population,
             train_bars=args.train_bars, interval=args.train_interval,
             workers=args.train_workers, advisor=advisor,
+            churn_penalty=args.churn_penalty,
         )
 
     # Wire the "Train RL" button: train one symbol now on a long history, warm-starting from
@@ -623,6 +897,22 @@ def main() -> None:
                             model_path=os.path.join("models", f"rl_{train_symbol}.npz"),
                             symbol=train_symbol)
 
+    # Optional live token cycling: re-rank perps periodically and add/drop engines. Live-only,
+    # and needs the continuous trainer (it drops removed symbols' cached policies + auto-trains
+    # newly-added ones). Disabled otherwise.
+    universe_mgr = None
+    if args.cycle_universe and use_live:
+        if trainer is not None:
+            universe_mgr = UniverseManager(controller, trainer, real_client, make_engine,
+                                           GLOBAL_BUS, size=args.universe_size,
+                                           interval=args.cycle_interval)
+        else:
+            logger.warning("--cycle-universe needs continuous training (it auto-trains added "
+                           "symbols); ignoring because --no-continuous is set.")
+    elif args.cycle_universe and not use_live:
+        logger.warning("--cycle-universe needs a reachable exchange; cycling disabled "
+                       "(running the fixed initial set).")
+
     ctx = AppContext(event_bus=GLOBAL_BUS, engine=controller, start_training=start_training)
     server = DashboardServer(ctx, host=args.host, port=args.port)
     server.start()
@@ -630,6 +920,8 @@ def main() -> None:
         advisor.start()
     if trainer is not None:
         trainer.start()
+    if universe_mgr is not None:
+        universe_mgr.start()
 
     src = "LIVE Binance data" if use_live else "synthetic replay feed"
     logger.info("=" * 66)
@@ -643,6 +935,10 @@ def main() -> None:
                     "hot-swap into the live engines (toggle with --no-continuous).")
     else:
         logger.info("Continuous RL training: OFF (engines trade EMA cross).")
+    if universe_mgr is not None:
+        logger.info("Token cycling: ON — re-ranking the top %d active perps every %.0fs and "
+                    "cycling engines in/out (churn penalty %.4f).",
+                    args.universe_size, args.cycle_interval, args.churn_penalty)
     logger.info("Click ▶ Start. Trades for all symbols stream into one table.")
     logger.info("=" * 66)
 
@@ -654,6 +950,8 @@ def main() -> None:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
+        if universe_mgr is not None:
+            universe_mgr.stop()
         if advisor is not None:
             advisor.stop()
         if trainer is not None:

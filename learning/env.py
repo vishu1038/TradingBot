@@ -173,7 +173,8 @@ class TradingEnv(_EnvBase):
 
     def __init__(self, df: pd.DataFrame, window: int = 32, fee: float = 0.0004,
                  slippage: float = 0.0002, initial_capital: float = 10_000.0,
-                 reward_mode: str = "pnl", max_drawdown_blowout: Optional[float] = None):
+                 reward_mode: str = "pnl", max_drawdown_blowout: Optional[float] = None,
+                 churn_penalty: float = 0.0):
         if _HAS_GYM:
             super().__init__()
         if reward_mode not in ("pnl", "sharpe", "pnl_minus_drawdown"):
@@ -184,6 +185,10 @@ class TradingEnv(_EnvBase):
         self.initial_capital = float(initial_capital)
         self.reward_mode = reward_mode
         self.max_drawdown_blowout = max_drawdown_blowout
+        # Extra per-unit-turnover penalty applied ONLY to the training reward (not to equity),
+        # to bias the learned policy away from churn beyond what the literal fee discourages.
+        # The equity/PnL still uses the true exchange cost, so backtest equity stays honest.
+        self.churn_penalty = float(churn_penalty)
 
         # Precompute features, normalization stats, and the per-bar close returns.
         self.features = prepare_frame(df)
@@ -272,6 +277,10 @@ class TradingEnv(_EnvBase):
         self.peak_equity = new_peak
 
         reward = self._shape_reward(pnl, new_dd)
+        # Training-only churn regularizer: discourage turnover beyond the literal fee. Does
+        # NOT touch equity (above), so the simulated PnL/equity curve stays realistic.
+        if self.churn_penalty:
+            reward -= self.churn_penalty * turnover
 
         self.t += 1
         terminated = self.t > self.end_t

@@ -90,7 +90,7 @@ class TradingEngine:
         # Loop pacing: explicit override, else fast for paper, timeframe-based for live.
         if poll_seconds is not None:
             self.poll_seconds = float(poll_seconds)
-        elif self.mode == "live":
+        elif self.mode in ("live", "testnet"):
             self.poll_seconds = float(_TF_SECONDS.get(timeframe, 3_600))
         else:
             self.poll_seconds = 5.0
@@ -119,6 +119,14 @@ class TradingEngine:
     def _resolve_mode(self, mode: str, confirm_live: bool) -> str:
         """Return a safe mode, downgrading live->paper unless all gates pass."""
         mode = (mode or "paper").lower()
+        if mode == "paper":
+            return "paper"
+        # TESTNET: real orders on Binance's testnet matching engine, but FAKE money. It places
+        # real orders (so fills/slippage/min-notional/leverage/liquidation are real) yet needs
+        # NO real-money gate — the whole point is risk-free realism. The client must itself be
+        # pointed at testnet (testnet=True) with testnet keys; this engine just routes orders.
+        if mode == "testnet":
+            return "testnet"
         if mode != "live":
             return "paper"
 
@@ -294,10 +302,10 @@ class TradingEngine:
         side = "BUY" if delta_qty > 0 else "SELL"
         qty = abs(delta_qty)
 
-        if self.mode == "live":
+        if self.mode in ("live", "testnet"):
             fill_price = self._place_real_order(side, qty, mark_price)
             if fill_price is None:
-                logger.error("Live order returned no fill; state unchanged.")
+                logger.error("%s order returned no fill; state unchanged.", self.mode)
                 return
         else:
             fill_price = self._simulate_fill(side, mark_price)

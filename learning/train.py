@@ -300,7 +300,7 @@ DEFAULT_HIDDEN = (24,)   # one tanh hidden layer of 24 units — the default "le
 def train_policy(df: pd.DataFrame, *, iterations: int = 20, population: int = 40,
                  window: int = 32, seed: int = 0, init_theta=None,
                  model_path: str = MODEL_PATH, init_std: float = 0.5, hidden=DEFAULT_HIDDEN,
-                 progress_cb=None) -> dict:
+                 churn_penalty: float = 0.0, progress_cb=None) -> dict:
     """Pure CEM training: build the env, train, save the policy, return a plain dict.
 
     No event bus — every value in/out is picklable, so this runs unchanged either inline on a
@@ -310,7 +310,7 @@ def train_policy(df: pd.DataFrame, *, iterations: int = 20, population: int = 40
     24-unit tanh layer; `()` = the old linear policy). `progress_cb` is forwarded to CEM (only
     used in the in-process path — it cannot cross a process boundary).
     """
-    env = TradingEnv(df, window=window, reward_mode="pnl")
+    env = TradingEnv(df, window=window, reward_mode="pnl", churn_penalty=churn_penalty)
     obs_dim = observation_dim(env.window)
     # A warm-start vector only fits if its length matches THIS architecture; otherwise (e.g.
     # the architecture changed since the last cycle) start fresh rather than crash.
