@@ -20,6 +20,8 @@ data/*.parquet
 data/*.csv
 models/*.pkl
 models/*.joblib
+models/*.npz
+models/*.zip
 *.ckpt
 
 # OS / editor

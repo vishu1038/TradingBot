@@ -271,14 +271,31 @@ Phases 0–2 are scaffolded and runnable. Status:
 | Performance metrics | `backtesting/metrics.py` | ✅ |
 | Risk manager (sizing + drawdown kill switch) | `risk/risk_manager.py` | ✅ |
 | End-to-end demo runner | `run_backtest.py` | ✅ |
-| Wire strategies into GUI + live testnet executor | — | ⬜ Phase 2/3 |
-| RL agent + Gym env | `learning/` | ⬜ Phase 3 |
-| Telegram phone alerts | `alerts/` | ⬜ Phase 4 |
+| Live/paper trading engine (mode switch + live safety gate) | `engine/trading_engine.py` | ✅ |
+| GUI control panel wired into Root + TradesWatch | `interface/control_component.py` | ✅ |
+| RL Gym env + CEM trainer + RL strategy | `learning/`, `strategies/rl_strategy.py` | ✅ |
+| Phone alerts (Telegram + console) | `alerts/` | ✅ |
+| Self-assessing promotion ("ready for real money") gate | `promotion/evaluator.py` | ✅ |
+| Validated edge on REAL data (walk-forward) | — | ⬜ needs market access |
+| Live paper run on testnet | — | ⬜ needs exchange-reachable network + keys |
 
-**Run it:** `pip install -r requirements.txt` then `python run_backtest.py` (offline synthetic
-demo) or `python run_backtest.py BTCUSDT 1h` (real testnet data, requires keys in `.env`).
-The synthetic run is *expected* to show ~0/negative net return after costs — random-walk data
-has no edge to find; it only proves the pipeline, cost model, and walk-forward guards work.
+**Run the backtest demo:** `pip install -r requirements.txt` then `python run_backtest.py`
+(offline synthetic) or `python run_backtest.py BTCUSDT 1h` (real testnet data, keys in `.env`).
+**Train the RL agent:** `python learning/train.py` (synthetic, saves `models/rl_policy.npz`).
+**Launch the GUI bot:** `python main.py` (paper mode; requires exchange-reachable network + keys).
+Synthetic runs are *expected* to show ~0/negative net return after costs — random-walk data has
+no edge; they only prove the pipeline, cost model, and walk-forward guards work.
+
+### Paper → real-money path (safety model)
+1. The bot runs **paper** by default. `engine/trading_engine.py` will only trade real money when
+   **both** `ALLOW_LIVE_TRADING=true` (env) **and** `confirm_live=True` (code) are set — otherwise
+   it logs why and downgrades to paper.
+2. `promotion/evaluator.py` watches the paper track record and only returns `ready=True` when **all**
+   hard criteria hold (default: ≥100 trades, ≥14 days, ≥5% return, Sharpe ≥1.0, max drawdown ≤15%,
+   win rate ≥45%, profit factor ≥1.2, ≥60% of sub-windows profitable). When it flips to ready, the
+   notifier fires a "🎓 READY FOR LIVE" phone alert.
+3. Graduation is **necessary but not sufficient** — live fills/slippage/latency differ from paper.
+   Recommended next step after graduation: a **reduced-size live trial**, not full size.
 
 ---
 
