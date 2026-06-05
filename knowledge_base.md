@@ -6,11 +6,14 @@ account balances, manage a symbol watchlist, and (via the connector layer) place
 orders.
 
 - **Repository:** https://github.com/vishu1038/TradingBot.git
-- **Language:** Python 3.10 (`.pyc` artifacts are `cpython-310`)
-- **GUI:** Tkinter (standard library)
-- **Status:** Work-in-progress / educational project. Watchlist + live price streaming +
-  logging UI are functional. Order placement exists in the connectors but is **not yet wired
-  to the GUI**; the trades table is display-only.
+- **Language:** Python (originally 3.10; current dev/runtime is **3.14** — gymnasium/SB3 are
+  unavailable there, so the default RL path is numpy-only by design)
+- **GUI:** Tkinter desktop (`main.py`) **and** a stdlib web dashboard (`web/`, used by
+  `run_live.py` — headless, phone/LAN-reachable, the primary UI now)
+- **Status:** Working scaffold (Phases 0–3). Multi-symbol live/paper trading with an auto live
+  data source, a web dashboard, and an always-on continuous RL retraining loop that hot-swaps
+  the learned policy into the live engines. Validated *edge* on real data is still ⬜ (needs
+  market access + out-of-sample walk-forward). See §8.
 
 ---
 
@@ -226,8 +229,10 @@ account.
 11. Wrap the backtester as a **Gymnasium environment** (state → action → reward).
 12. Train an RL agent (start with the FinRL / Stable-Baselines3 stack), validate walk-forward,
     then run it live on testnet with online/periodic retraining ("active adjustment").
-13. Add online learning: retrain or fine-tune on a rolling window (e.g. nightly) so the agent
-    adapts to new regimes.
+13. Add online learning: retrain or fine-tune on a rolling window so the agent adapts to new
+    regimes. ✅ **Implemented** as `ContinuousTrainer` in `run_live.py` — a continuous,
+    warm-started retraining loop that hot-swaps the refreshed policy into each live engine
+    (see §8 "Multi-symbol live dashboard + continuous learning").
 
 ### Phase 4 — GUI control & phone alerts
 14. **GUI:** Start/Stop bot button, strategy selector + hyperparameters, live equity-curve
@@ -276,6 +281,15 @@ Phases 0–2 are scaffolded and runnable. Status:
 | RL Gym env + CEM trainer + RL strategy | `learning/`, `strategies/rl_strategy.py` | ✅ |
 | Phone alerts (Telegram + console) | `alerts/` | ✅ |
 | Self-assessing promotion ("ready for real money") gate | `promotion/evaluator.py` | ✅ |
+| Stdlib web dashboard (SSE, no Tkinter) — headless/BBB-friendly | `web/server.py`, `web/dashboard.html` | ✅ |
+| Multi-symbol live/paper runner (1 engine/symbol, 1 dashboard) | `run_live.py` | ✅ |
+| Auto data source (live Binance if reachable, else synthetic replay) | `run_live.py` | ✅ |
+| Paged historical fetch (beyond Binance's 1000/req cap) | `run_live.py` (`fetch_history`) | ✅ |
+| **Continuous RL retraining loop + live hot-swap** | `run_live.py` (`ContinuousTrainer`) | ✅ |
+| Warm-started (incremental) CEM training | `learning/train.py` (`init_theta`) | ✅ |
+| Multi-core training offload (process pool, fixes GUI GIL starvation) | `run_live.py` (`--train-workers`) | ✅ |
+| MLP policy (tanh hidden layer) replacing bare linear map | `learning/train.py` (`MLPPolicy`), `strategies/rl_strategy.py` | ✅ |
+| Optional Claude advisory overlay via local `claude` CLI (no API key) | `advisors/claude_cli_advisor.py` (`--claude-advisor`) | ✅ |
 | Validated edge on REAL data (walk-forward) | — | ⬜ needs market access |
 | Live paper run on testnet | — | ⬜ needs exchange-reachable network + keys |
 
@@ -283,8 +297,57 @@ Phases 0–2 are scaffolded and runnable. Status:
 (offline synthetic) or `python run_backtest.py BTCUSDT 1h` (real testnet data, keys in `.env`).
 **Train the RL agent:** `python learning/train.py` (synthetic, saves `models/rl_policy.npz`).
 **Launch the GUI bot:** `python main.py` (paper mode; requires exchange-reachable network + keys).
+**Launch the multi-symbol web dashboard:** `python run_live.py` (auto-detects live vs. synthetic;
+opens http://localhost:8765). This is the primary way to run the bot now — see the subsection below.
 Synthetic runs are *expected* to show ~0/negative net return after costs — random-walk data has
 no edge; they only prove the pipeline, cost model, and walk-forward guards work.
+
+### Multi-symbol live dashboard + continuous learning (`run_live.py`)
+The current top-level runner. Runs **one `TradingEngine` per symbol**, all sharing a single
+`EventBus` and a single **stdlib web dashboard** (`web/server.py`, Server-Sent Events — no
+Tkinter, so it runs headless and is reachable from a phone/LAN; ideal for the BeagleBone deploy
+in `deploy/beaglebone.md`). A `MultiEngineController` fans start/stop/readiness across the
+engines and publishes the aggregated portfolio state; each engine emits only symbol-tagged
+fills so the trades table interleaves all symbols.
+
+- **Data source — automatic:** probes Binance futures; if reachable uses real public market data
+  (paper fills, no keys needed), else falls back to a per-symbol synthetic `ReplayClient`. Same
+  command works on either network.
+- **Default symbols** lean toward higher-volatility alts for more learning signal:
+  `BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,XRPUSDT,SUIUSDT` (override `--symbols`).
+- **Longer training period:** `fetch_history()` pages *backwards* through `/fapi/v1/klines`
+  (Binance caps 1000–1500/req) to assemble thousands of bars; `--history` (default 5000).
+- **Continuous self-training (`ContinuousTrainer`):** an always-on background loop that, per
+  symbol per cycle, retrains the CEM policy on the freshest bars, saves `models/rl_<symbol>.npz`,
+  and **hot-swaps a fresh `RLStrategy` onto the live engine** (the engine reads `self.strategy`
+  every step, so the swap is picked up with no restart). Each cycle **warm-starts** CEM from the
+  previous policy (`init_theta`), so it is *incremental* refinement, not a from-scratch retrain.
+  Engines bootstrap on `EmaCrossStrategy` and switch to the learned policy once the first cycle
+  for that symbol completes. Disable with `--no-continuous`; tune with `--train-iterations`
+  (default 30), `--train-population` (50), `--train-bars` (4000), `--train-interval` (45s).
+- **Multi-core offload (`--train-workers`):** the CEM sweep runs in a `ProcessPoolExecutor`
+  (Windows *spawn*), **one symbol per worker process**, instead of an in-process thread. This
+  was the fix for the dashboard's "connection errors": an in-process training thread holds the
+  GIL and starves the stdlib SSE/HTTP server threads, so the browser's EventSource keeps
+  reconnecting. Moving CEM into child processes frees the main-process GIL (the dashboard stays
+  responsive, `/api/state` ~140 ms even mid-training) *and* gives true parallelism across cores.
+  `--train-workers 0` (default) auto-sizes to `min(#symbols, cpu_count−1)`. Fallbacks are
+  sleep-tolerant: a `TimeoutError` (e.g. laptop sleep) cancels stragglers but **keeps** the pool;
+  only a `BrokenProcessPool` permanently degrades to in-thread sequential training. Note: spawn
+  re-imports `run_live` per worker, so the *first* sweep has a one-time per-worker startup cost.
+- **Policy is now a small MLP, not a bare linear map** (`learning/train.py` `MLPPolicy`): one
+  `tanh` hidden layer (`DEFAULT_HIDDEN=(24,)`) feeding raw action logits, still CEM-trained and
+  numpy-only. `LinearPolicy` is kept as the `hidden=()` special case for backward compatibility.
+  Models save in a layered format (`kind/n_layers/W{i}/b{i}` + legacy `W`/`b` when single-layer),
+  and `strategies/rl_strategy.py` loads either the layered or the old flat format and does the
+  matching MLP forward pass at inference. Train/inference parity is verified (mem == disk).
+- **Reward/penalty semantics:** the CEM objective is `TradingEnv` episode return, whose per-bar
+  reward is `position * next_return − cost*|turnover|` — i.e. realized PnL net of fees+slippage.
+  Profitable positions are rewarded, losing/churny ones penalized. This is honest *continuous*
+  batch retraining on a rolling window; it is **not** per-tick online RL and **not** evidence of
+  edge — validate out-of-sample before trusting any policy.
+- **Useful flags:** `--host 0.0.0.0` (expose on LAN/phone), `--force-replay`, `--timeframe`,
+  `--capital` (per symbol), `--no-browser`.
 
 ### Paper → real-money path (safety model)
 1. The bot runs **paper** by default. `engine/trading_engine.py` will only trade real money when
@@ -341,6 +404,24 @@ real value at the edges:
 - **Strategy config via chat:** describe a strategy in English; Claude emits the parameter set.
 - Use the **Anthropic Python SDK** with the latest model (e.g. `claude-opus-4-8` for analysis,
   `claude-haiku-4-5` for cheap high-frequency sentiment scoring).
+
+**Implemented — Claude advisor with no API key (`advisors/claude_cli_advisor.py`).** Because
+this environment has the authenticated `claude` Code CLI (subscription auth) but **no Anthropic
+API key**, the advisor shells out headlessly instead of using the SDK:
+`claude -p "<prompt>" --output-format json --system-prompt "<advisor persona>"
+--exclude-dynamic-system-prompt-sections --model opus`, and reads the answer from the JSON
+envelope's `result` field. Two CLI gotchas were essential: (1) `claude -p` by default runs the
+full Claude Code *coding agent*, so `--system-prompt` must **replace** that framing with a terse
+JSON-only advisor persona or it just offers to help with your project; (2) on Windows you must
+invoke `claude.cmd` — `shutil.which("claude")` returns an extensionless shim `subprocess` can't
+exec. `ClaudeAdvisor` runs a **slow** background thread (default every 300 s — each call is
+~3-10 s of latency and counts against subscription usage; this is a *macro* overlay, not a
+per-tick signal) producing `{bias∈[-1,1], confidence∈[0,1], veto, rationale}` per symbol. Every
+failure mode (CLI missing, timeout, non-zero exit, unparseable output) degrades to NEUTRAL so it
+can never block the trading loop. `AdvisedStrategy` wraps the base strategy and lets the advice
+only **gate** signals — veto → flat, or suppress entries that fight a confident directional bias
+— it never invents trades, so the deterministic engine + `RiskManager` stay authoritative.
+Default **OFF**; enable with `--claude-advisor` (tune `--advisor-interval`, `--advisor-model`).
 
 ### D. Hybrid / ensemble *(realistic production shape)*
 - **ML signal (B-A) → RL or rules for sizing/risk → LLM for sentiment feature + alerts.** Each

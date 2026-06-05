@@ -84,30 +84,74 @@ def load_real(symbol: str, timeframe: str, limit: int = 3000) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Linear-softmax policy + CEM agent (numpy only)
 # --------------------------------------------------------------------------- #
-class LinearPolicy:
-    """Linear-softmax policy: logits = obs @ W + b, action = argmax(logits) (greedy)."""
+class MLPPolicy:
+    """Feed-forward policy: tanh-activated hidden layers feeding 3 action logits, greedy
+    argmax. `hidden=()` collapses to a single linear layer — i.e. exactly the original
+    linear-softmax policy — so the old behaviour is a strict special case. A hidden layer lets
+    the policy learn NON-LINEAR interactions between indicators (e.g. "go long only when RSI is
+    low AND the MACD histogram is turning up AND volatility is rising"), which a single linear
+    layer literally cannot represent. Still numpy-only and CEM-trainable (no autodiff)."""
 
-    def __init__(self, obs_dim: int, n_actions: int = N_ACTIONS):
-        self.obs_dim = obs_dim
-        self.n_actions = n_actions
-        self.W = np.zeros((obs_dim, n_actions), dtype=np.float32)
-        self.b = np.zeros(n_actions, dtype=np.float32)
+    def __init__(self, obs_dim: int, hidden=(), n_actions: int = N_ACTIONS):
+        self.obs_dim = int(obs_dim)
+        self.n_actions = int(n_actions)
+        self.hidden = tuple(int(h) for h in hidden)
+        sizes = (self.obs_dim,) + self.hidden + (self.n_actions,)
+        # Each layer is a mutable [W, b] pair so set_flat can rebind in place.
+        self.layers = [[np.zeros((nin, nout), dtype=np.float32),
+                        np.zeros(nout, dtype=np.float32)]
+                       for nin, nout in zip(sizes[:-1], sizes[1:])]
 
     @property
     def n_params(self) -> int:
-        return self.obs_dim * self.n_actions + self.n_actions
+        return int(sum(W.size + b.size for W, b in self.layers))
 
     def set_flat(self, theta: np.ndarray) -> None:
-        w_size = self.obs_dim * self.n_actions
-        self.W = theta[:w_size].reshape(self.obs_dim, self.n_actions).astype(np.float32)
-        self.b = theta[w_size:].astype(np.float32)
+        theta = np.asarray(theta, dtype=np.float32).reshape(-1)
+        off = 0
+        for layer in self.layers:
+            W, b = layer
+            wsz = W.size
+            layer[0] = theta[off:off + wsz].reshape(W.shape); off += wsz
+            bsz = b.size
+            layer[1] = theta[off:off + bsz].copy(); off += bsz
 
     def get_flat(self) -> np.ndarray:
-        return np.concatenate([self.W.reshape(-1), self.b]).astype(np.float32)
+        parts = []
+        for W, b in self.layers:
+            parts.append(W.reshape(-1)); parts.append(b)
+        return np.concatenate(parts).astype(np.float32)
+
+    def _logits(self, obs: np.ndarray) -> np.ndarray:
+        h = np.asarray(obs, dtype=np.float32)
+        last = len(self.layers) - 1
+        for i, (W, b) in enumerate(self.layers):
+            z = h @ W + b
+            h = z if i == last else np.tanh(z)   # tanh on hidden, raw logits on output
+        return h
 
     def act(self, obs: np.ndarray) -> int:
-        logits = obs @ self.W + self.b
-        return int(np.argmax(logits))
+        return int(np.argmax(self._logits(obs)))
+
+    def as_dict(self) -> dict:
+        """In-memory representation used to hot-swap an RLStrategy without touching disk."""
+        return {"layers": [(W, b) for W, b in self.layers], "hidden": self.hidden}
+
+
+class LinearPolicy(MLPPolicy):
+    """Backward-compatible alias: the original linear-softmax policy (no hidden layer).
+    Exposes `.W`/`.b` so existing callers and the legacy save format keep working."""
+
+    def __init__(self, obs_dim: int, n_actions: int = N_ACTIONS):
+        super().__init__(obs_dim, hidden=(), n_actions=n_actions)
+
+    @property
+    def W(self) -> np.ndarray:
+        return self.layers[0][0]
+
+    @property
+    def b(self) -> np.ndarray:
+        return self.layers[0][1]
 
 
 def run_episode(env: TradingEnv, policy: LinearPolicy) -> float:
@@ -124,25 +168,33 @@ def run_episode(env: TradingEnv, policy: LinearPolicy) -> float:
 
 def train_cem(env: TradingEnv, obs_dim: int, iterations: int = 25,
               population: int = 40, elite_frac: float = 0.25, init_std: float = 0.5,
-              seed: int = 0, progress_cb=None) -> LinearPolicy:
+              seed: int = 0, progress_cb=None, init_theta=None, hidden=()) -> MLPPolicy:
     """Cross-entropy method over the flat policy parameters. Returns the best policy.
 
     If `progress_cb` is given, it is called once per iteration with a dict of progress
     metrics (iteration, total, avg/elite/best reward). This lets a live dashboard show
     training advancing in real time without coupling the optimizer to any UI.
+
+    `init_theta` (optional flat parameter vector) WARM-STARTS the search: the CEM mean is
+    seeded with it instead of zeros, so continuous retraining refines the previous policy
+    rather than restarting from scratch each cycle. The best policy returned carries its
+    achieved episode reward on `policy.best_reward`.
     """
     rng = np.random.default_rng(seed)
-    policy = LinearPolicy(obs_dim)
+    policy = MLPPolicy(obs_dim, hidden=hidden)
     n_params = policy.n_params
-    mean = np.zeros(n_params, dtype=np.float64)
+    if init_theta is not None and len(np.asarray(init_theta).reshape(-1)) == n_params:
+        mean = np.asarray(init_theta, dtype=np.float64).reshape(-1).copy()
+    else:
+        mean = np.zeros(n_params, dtype=np.float64)
     std = np.full(n_params, init_std, dtype=np.float64)
     n_elite = max(2, int(population * elite_frac))
 
     best_theta = mean.copy()
     best_reward = -np.inf
 
-    logger.info("CEM: %d params, %d iters, pop=%d, elite=%d",
-                n_params, iterations, population, n_elite)
+    logger.info("CEM: %d params (hidden=%s), %d iters, pop=%d, elite=%d",
+                n_params, hidden or "linear", iterations, population, n_elite)
     for it in range(iterations):
         samples = rng.normal(mean, std, size=(population, n_params))
         rewards = np.empty(population, dtype=np.float64)
@@ -175,19 +227,37 @@ def train_cem(env: TradingEnv, obs_dim: int, iterations: int = 25,
                 logger.error("train progress_cb raised: %s", e)
 
     policy.set_flat(best_theta)
+    policy.best_reward = best_reward
     return policy
 
 
 # --------------------------------------------------------------------------- #
 # Persistence
 # --------------------------------------------------------------------------- #
-def save_policy(path: str, policy: LinearPolicy, env: TradingEnv) -> None:
-    """Save params + the exact normalization stats / window so inference matches training."""
+def save_policy(path: str, policy: MLPPolicy, env: TradingEnv) -> None:
+    """Save params + the exact normalization stats / window so inference matches training.
+
+    Layered format (supports linear AND multi-layer MLP): a `kind`/`n_layers` header plus
+    `W{i}`/`b{i}` per layer. For a single-layer (linear) policy we ALSO write legacy `W`/`b`
+    keys so older readers keep working."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    np.savez(path, W=policy.W, b=policy.b,
-             mean=env.mean, std=env.std,
-             window=np.int64(env.window), obs_dim=np.int64(observation_dim(env.window)))
-    logger.info("Saved RL policy -> %s", path)
+    blob = {
+        "kind": "mlp",
+        "n_layers": np.int64(len(policy.layers)),
+        "hidden": np.asarray(policy.hidden, dtype=np.int64),
+        "mean": env.mean, "std": env.std,
+        "window": np.int64(env.window),
+        "obs_dim": np.int64(observation_dim(env.window)),
+    }
+    for i, (W, b) in enumerate(policy.layers):
+        blob[f"W{i}"] = W
+        blob[f"b{i}"] = b
+    if len(policy.layers) == 1:           # legacy compatibility for linear policies
+        blob["W"] = policy.layers[0][0]
+        blob["b"] = policy.layers[0][1]
+    np.savez(path, **blob)
+    logger.info("Saved RL policy -> %s (layers=%d, hidden=%s)",
+                path, len(policy.layers), policy.hidden or "linear")
 
 
 # --------------------------------------------------------------------------- #
@@ -224,38 +294,98 @@ def train_sb3(df: pd.DataFrame, timesteps: int = 20_000):  # pragma: no cover - 
 # --------------------------------------------------------------------------- #
 # Dashboard entry point — train while streaming progress to an event bus
 # --------------------------------------------------------------------------- #
-def train_to_bus(event_bus, df: pd.DataFrame = None, iterations: int = 20,
-                 population: int = 40, window: int = 32, seed: int = 0) -> dict:
-    """Run CEM training, publishing `train` events to `event_bus`, and save the policy.
+DEFAULT_HIDDEN = (24,)   # one tanh hidden layer of 24 units — the default "less basic" policy
 
-    Returns a small summary dict. Designed to be called on a background thread by the web
-    dashboard's /api/train endpoint. Publishes:
-        train {phase: "start"|"iter"|"done"|"error", ...}
+
+def train_policy(df: pd.DataFrame, *, iterations: int = 20, population: int = 40,
+                 window: int = 32, seed: int = 0, init_theta=None,
+                 model_path: str = MODEL_PATH, init_std: float = 0.5, hidden=DEFAULT_HIDDEN,
+                 progress_cb=None) -> dict:
+    """Pure CEM training: build the env, train, save the policy, return a plain dict.
+
+    No event bus — every value in/out is picklable, so this runs unchanged either inline on a
+    thread (the manual Train button) or inside a separate worker PROCESS (the continuous
+    multi-core trainer). `init_theta` warm-starts CEM (incremental learning); `model_path`
+    lets each symbol persist to its own file; `hidden` sets the MLP architecture (default one
+    24-unit tanh layer; `()` = the old linear policy). `progress_cb` is forwarded to CEM (only
+    used in the in-process path — it cannot cross a process boundary).
+    """
+    env = TradingEnv(df, window=window, reward_mode="pnl")
+    obs_dim = observation_dim(env.window)
+    # A warm-start vector only fits if its length matches THIS architecture; otherwise (e.g.
+    # the architecture changed since the last cycle) start fresh rather than crash.
+    policy = train_cem(env, obs_dim, iterations=iterations, population=population, seed=seed,
+                       init_theta=init_theta, init_std=init_std, hidden=hidden,
+                       progress_cb=progress_cb)
+    save_policy(model_path, policy, env)
+    best = float(getattr(policy, "best_reward", 0.0))
+    pdict = policy.as_dict()
+    pdict.update({"mean": env.mean, "std": env.std, "window": env.window})
+    return {
+        "ok": True,
+        "model_path": model_path,
+        "iterations": iterations,
+        "bars": env.n_bars,
+        "best_reward": best,
+        "theta": policy.get_flat(),
+        "policy": pdict,
+    }
+
+
+def _pool_train_worker(payload):
+    """Top-level, picklable entry point for ProcessPoolExecutor — trains ONE symbol in a
+    worker process. `payload` is (symbol, df, kwargs_dict). Never raises across the pool
+    boundary: failures come back as {"ok": False, ...} so one bad symbol can't kill the loop.
+    """
+    symbol, df, kw = payload
+    try:
+        res = train_policy(df, **kw)
+        res["symbol"] = symbol
+        return res
+    except Exception as e:  # noqa: BLE001 - must not propagate across the process boundary
+        return {"ok": False, "symbol": symbol, "error": str(e)}
+
+
+def train_to_bus(event_bus, df: pd.DataFrame = None, iterations: int = 20,
+                 population: int = 40, window: int = 32, seed: int = 0,
+                 init_theta=None, model_path: str = MODEL_PATH,
+                 symbol: str = None, init_std: float = 0.5, hidden=DEFAULT_HIDDEN) -> dict:
+    """Run CEM training inline, publishing `train` events to `event_bus`, and save the policy.
+
+    Used by the dashboard's /api/train button (the in-process, progress-streaming path).
+    Publishes: train {phase: "start"|"iter"|"done"|"error", symbol?, ...}. Delegates the
+    actual optimization to `train_policy` so the inline and multi-core paths stay identical.
     """
     def publish(phase, **kw):
         if event_bus is not None:
             try:
-                event_bus.publish("train", {"phase": phase, **kw})
+                payload = {"phase": phase}
+                if symbol is not None:
+                    payload["symbol"] = symbol
+                payload.update(kw)
+                event_bus.publish("train", payload)
             except Exception:
                 pass
 
     try:
         if df is None:
             df = synthetic_ohlcv()
-        env = TradingEnv(df, window=window, reward_mode="pnl")
-        obs_dim = observation_dim(env.window)
-        publish("start", iterations=iterations, bars=env.n_bars, obs_dim=obs_dim)
-        logger.info("Dashboard training: %d bars, obs_dim=%d, %d iters",
-                    env.n_bars, obs_dim, iterations)
+        publish("start", iterations=iterations, bars=len(df), obs_dim=observation_dim(window))
+        logger.info("Training%s: %d bars, %d iters%s",
+                    f" {symbol}" if symbol else "", len(df), iterations,
+                    " (warm start)" if init_theta is not None else "")
 
-        policy = train_cem(
-            env, obs_dim, iterations=iterations, population=population, seed=seed,
-            progress_cb=lambda p: publish("iter", **p),
-        )
-        save_policy(MODEL_PATH, policy, env)
-        publish("done", model_path=MODEL_PATH)
-        logger.info("Dashboard training complete -> %s", MODEL_PATH)
-        return {"ok": True, "model_path": MODEL_PATH, "iterations": iterations}
+        res = train_policy(df, iterations=iterations, population=population, window=window,
+                           seed=seed, init_theta=init_theta, model_path=model_path,
+                           init_std=init_std, hidden=hidden,
+                           progress_cb=lambda p: publish("iter", **p))
+        best = res["best_reward"]
+        publish("done", model_path=model_path, best_reward=best)
+        logger.info("Training complete%s -> %s (best=%+.5f)",
+                    f" {symbol}" if symbol else "", model_path, best)
+        if symbol is not None:
+            res["symbol"] = symbol
+        return res
     except Exception as e:
         logger.error("Dashboard training failed: %s", e, exc_info=True)
         publish("error", error=str(e))

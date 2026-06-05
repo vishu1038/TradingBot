@@ -9,9 +9,11 @@ __pycache__/
 venv/
 env/
 
-# Logs
+# Logs / process redirect artifacts
 *.log
 info.log
+*.err
+*.out
 
 # Data & model artifacts
 data/*.db

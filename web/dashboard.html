@@ -192,12 +192,13 @@ function showPromo(v){
 // ---- training ---------------------------------------------------------
 function onTrain(d){
   const bar=$("trainBar"), txt=$("trainText");
-  if(d.phase==="start"){ bar.style.width="0%"; txt.textContent=`training started · ${d.bars} bars · ${d.iterations} iters`; }
+  const sym = d.symbol ? d.symbol+" · " : "";
+  if(d.phase==="start"){ bar.style.width="0%"; txt.textContent=`${sym}training · ${d.bars} bars · ${d.iterations} iters`; }
   else if(d.phase==="iter"){ const pct=Math.round(100*d.iteration/d.total);
     bar.style.width=pct+"%";
-    txt.textContent=`iter ${d.iteration}/${d.total} · best reward ${fmt(d.best_reward,3)} · avg ${fmt(d.avg_reward,3)}`; }
-  else if(d.phase==="done"){ bar.style.width="100%"; txt.textContent="✓ training complete — policy saved to "+d.model_path; }
-  else if(d.phase==="error"){ txt.textContent="✗ training error: "+d.error; }
+    txt.textContent=`${sym}iter ${d.iteration}/${d.total} · best ${fmt(d.best_reward,4)} · avg ${fmt(d.avg_reward,4)}`; }
+  else if(d.phase==="done"){ bar.style.width="100%"; txt.textContent=`✓ ${sym}policy updated (best ${fmt(d.best_reward,4)}) → ${d.model_path}`; }
+  else if(d.phase==="error"){ txt.textContent=`✗ ${sym}training error: ${d.error}`; }
 }
 
 // ---- SSE wiring -------------------------------------------------------

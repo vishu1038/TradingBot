@@ -37,6 +37,7 @@ from core.event_bus import GLOBAL_BUS, BusLogHandler
 from connectors.replay import ReplayClient, make_synthetic_ohlcv
 from risk.risk_manager import RiskManager, RiskLimits
 from engine.trading_engine import TradingEngine
+from learning.train import train_to_bus
 from alerts.notifier import ConsoleNotifier
 from promotion.evaluator import PromotionEvaluator
 from strategies.ema_cross import EmaCrossStrategy
@@ -44,10 +45,22 @@ from web.server import AppContext, DashboardServer
 
 logger = logging.getLogger("run_live")
 
+# Default symbol set leans toward higher-volatility alts (more trading signal for the RL
+# policy to learn from) while keeping BTC/ETH as lower-vol anchors. Override with --symbols.
+DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,XRPUSDT,SUIUSDT"
+
 # Rough starting price per symbol for the synthetic fallback so each feed looks distinct.
 _REPLAY_START_PRICE = {
     "BTCUSDT": 60_000.0, "ETHUSDT": 3_000.0, "SOLUSDT": 150.0,
     "BNBUSDT": 600.0, "XRPUSDT": 0.6, "ADAUSDT": 0.45, "DOGEUSDT": 0.15,
+    "AVAXUSDT": 35.0, "LINKUSDT": 18.0, "SUIUSDT": 3.5, "NEARUSDT": 6.0,
+    "DOTUSDT": 7.0, "APTUSDT": 9.0, "INJUSDT": 25.0, "TIAUSDT": 8.0,
+}
+
+# Timeframe -> milliseconds, used to page backwards through klines when fetching history.
+_TF_MS = {
+    "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000,
 }
 
 
@@ -90,34 +103,62 @@ def build_real_client():
                                    testnet=False)
 
 
-def build_training_df(use_live: bool, real_client, symbol: str, timeframe: str):
-    """OHLCV frame to train the RL policy on: live history if reachable, else synthetic.
+def fetch_history(real_client, symbol: str, timeframe: str, n_bars: int):
+    """Assemble up to `n_bars` recent candles for `symbol` as a DataFrame.
 
-    Returns a pandas DataFrame with timestamp/open/high/low/close/volume columns — the
-    shape train_to_bus / TradingEnv expect.
+    The stock connector's get_historical_candles caps at Binance's 1000/request, which on a
+    1m timeframe is only ~16h of data — far too short to train on. This pages BACKWARDS
+    through /fapi/v1/klines via endTime (Binance allows up to 1500/request) until it has
+    n_bars or runs out of history, giving the RL policy a much longer training period.
     """
     import pandas as pd
 
+    contract = real_client.contracts.get(symbol)
+    if contract is None:
+        return None
+
+    rows: list = []
+    end_time = None
+    remaining = int(n_bars)
+    safety = 0
+    while remaining > 0 and safety < 60:
+        safety += 1
+        data = {"symbol": symbol, "interval": timeframe, "limit": min(1500, remaining)}
+        if end_time is not None:
+            data["endTime"] = end_time
+        raw = real_client._make_request("GET", "/fapi/v1/klines", data)
+        if not raw:
+            break
+        chunk = [(int(c[0]), float(c[1]), float(c[2]), float(c[3]),
+                  float(c[4]), float(c[5])) for c in raw]
+        rows = chunk + rows
+        remaining -= len(chunk)
+        end_time = chunk[0][0] - 1          # page strictly older than the earliest bar
+        if len(chunk) < data["limit"]:
+            break                            # exchange returned all it has
+    if not rows:
+        return None
+
+    rows = sorted(set(rows), key=lambda r: r[0])   # de-dup overlaps, chronological
+    return pd.DataFrame(rows, columns=["timestamp", "open", "high", "low",
+                                       "close", "volume"])
+
+
+def build_training_df(use_live: bool, real_client, symbol: str, timeframe: str,
+                      n_bars: int = 5000):
+    """OHLCV frame to train the RL policy on: live history if reachable, else synthetic."""
     if use_live and real_client is not None:
         try:
-            contract = real_client.contracts.get(symbol)
-            candles = real_client.get_historical_candles(contract, timeframe)
-            if candles and len(candles) >= 500:
+            df = fetch_history(real_client, symbol, timeframe, n_bars)
+            if df is not None and len(df) >= 500:
                 logger.info("Training data: %d live %s %s candles.",
-                            len(candles), symbol, timeframe)
-                return pd.DataFrame({
-                    "timestamp": [c.timestamp for c in candles],
-                    "open": [c.open for c in candles],
-                    "high": [c.high for c in candles],
-                    "low": [c.low for c in candles],
-                    "close": [c.close for c in candles],
-                    "volume": [c.volume for c in candles],
-                })
-            logger.warning("Live history too short (%d candles); training on synthetic.",
-                           0 if not candles else len(candles))
+                            len(df), symbol, timeframe)
+                return df
+            logger.warning("Live history too short (%s candles); training on synthetic.",
+                           0 if df is None else len(df))
         except Exception as e:
             logger.warning("Could not fetch live history (%s); training on synthetic.", e)
-    return make_synthetic_ohlcv(n=3000)
+    return make_synthetic_ohlcv(n=max(3000, n_bars))
 
 
 class MultiEngineController:
@@ -217,9 +258,227 @@ class MultiEngineController:
         }
 
 
+class ContinuousTrainer:
+    """Continuously retrains a per-symbol RL policy on the freshest market data and
+    hot-swaps it into the live engine, so each symbol's strategy keeps adapting.
+
+    How this answers "keep training itself based on the reward/penalty on each trade":
+    the CEM objective is the episode return of the TradingEnv, whose per-bar reward is
+    ``position * next_bar_return - cost*|turnover|`` (learning/env.py). That is exactly the
+    realized PnL of trading, net of fees+slippage — profitable positions are rewarded and
+    losing / churny ones are penalized. Each cycle WARM-STARTS CEM from the previous policy
+    (so it refines rather than restarts), retrains on the latest bars, saves
+    ``models/rl_<symbol>.npz``, and assigns a fresh ``RLStrategy`` onto the engine. The
+    engine reads ``self.strategy`` at the top of every step, so the swap takes effect on the
+    next iteration with no restart.
+
+    Note: CEM on rolling windows is incremental *batch* retraining, not true per-tick online
+    RL — but it is continuous (loops forever) and each round folds in the newest price action
+    and the realized trading reward. It is honest to call this "continuously learning"; it is
+    NOT evidence of edge (validate out-of-sample before trusting any policy).
+    """
+
+    def __init__(self, engines, event_bus, fetch_df, *, iterations: int,
+                 population: int, train_bars: int, interval: float,
+                 workers: int = 0, swap_into_engine: bool = True, advisor=None):
+        self.engines = engines
+        self.event_bus = event_bus
+        self.fetch_df = fetch_df            # callable(symbol) -> DataFrame | None
+        self.iterations = iterations
+        self.population = population
+        self.train_bars = train_bars
+        self.interval = interval
+        # Workers <= 0 means "decide from CPU count, capped at #symbols". This is the number of
+        # SEPARATE PROCESSES training runs across — the whole point of the offload: it pulls
+        # CEM off the main process so the HTTP/SSE server isn't GIL-starved (no more dashboard
+        # connection errors) and symbols train truly in parallel across cores.
+        import os as _os
+        n_sym = max(1, len(engines))
+        self.workers = int(workers) if workers and workers > 0 else \
+            max(1, min(n_sym, (_os.cpu_count() or 2) - 1))
+        self.swap_into_engine = swap_into_engine
+        self.advisor = advisor              # optional ClaudeAdvisor: wraps the swapped strategy
+        self._theta: typing.Dict[str, typing.Any] = {}   # symbol -> last flat policy
+        self._stop = threading.Event()
+        self._thread: typing.Optional[threading.Thread] = None
+        self.cycle = 0
+        self.running = False
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        logger.info("ContinuousTrainer started: %d symbols across %d worker process(es), "
+                    "%d iters/cycle, pop=%d, %d bars, every %.0fs between sweeps.",
+                    len(self.engines), self.workers, self.iterations, self.population,
+                    self.train_bars, self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.running = False
+
+    def _publish(self, phase: str, sym: str, **kw) -> None:
+        """Coarse, symbol-tagged train event. Per-iteration progress is NOT streamed in the
+        multi-core path (it can't cross a process boundary) — instead each symbol emits a
+        'start' when submitted and a 'done'/'error' when its worker returns. Fewer events also
+        means a lighter SSE stream, which helps the dashboard stay connected."""
+        if self.event_bus is None:
+            return
+        try:
+            payload = {"phase": phase, "symbol": sym}
+            payload.update(kw)
+            self.event_bus.publish("train", payload)
+        except Exception:
+            pass
+
+    def _prepare_job(self, sym):
+        """Fetch + trim the freshest bars for one symbol on the MAIN process (the worker only
+        does CPU-bound CEM). Returns (df, model_path) or None to skip."""
+        import os
+        df = self.fetch_df(sym)
+        if df is None or len(df) < 300:
+            logger.warning("[trainer] %s: insufficient data (%s bars); skipping.",
+                           sym, 0 if df is None else len(df))
+            return None
+        if self.train_bars and len(df) > self.train_bars:
+            df = df.iloc[-self.train_bars:].reset_index(drop=True)
+        return df, os.path.join("models", f"rl_{sym}.npz")
+
+    def _apply_result(self, sym, res, source: str = "worker") -> None:
+        """Hot-swap a finished policy into the live engine + publish the outcome. `source` is
+        just for the log line ("worker" = process pool, "in-thread" = sequential fallback)."""
+        from strategies.rl_strategy import RLStrategy
+        if not res or not res.get("ok"):
+            err = (res or {}).get("error", "unknown")
+            logger.error("[trainer] %s training failed: %s", sym, err)
+            self._publish("error", sym, error=str(err))
+            return
+        self._theta[sym] = res.get("theta")
+        if self.swap_into_engine and res.get("policy") and sym in self.engines:
+            strat = RLStrategy(policy=res["policy"])
+            if self.advisor is not None:    # optional Claude advisory overlay (gates trades)
+                from advisors.claude_cli_advisor import AdvisedStrategy
+                strat = AdvisedStrategy(strat, self.advisor, sym)
+            self.engines[sym].strategy = strat
+        best = res.get("best_reward", 0.0)
+        logger.info("[trainer] %s cycle %d: best=%+.5f — RL policy hot-swapped (%s).",
+                    sym, self.cycle, best, source)
+        self._publish("done", sym, model_path=res.get("model_path"), best_reward=best)
+
+    def _loop(self) -> None:
+        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures.process import BrokenProcessPool
+        from learning.train import _pool_train_worker, train_policy
+
+        os.makedirs("models", exist_ok=True)
+
+        # Try to bring up a process pool. If the platform refuses (rare), degrade gracefully to
+        # in-thread sequential training so the loop still runs — just without the GIL relief.
+        executor = None
+        if self.workers > 1:
+            try:
+                executor = ProcessPoolExecutor(max_workers=self.workers)
+            except Exception as e:
+                logger.warning("[trainer] process pool unavailable (%s); running sequentially "
+                               "in-thread.", e)
+                executor = None
+
+        try:
+            while not self._stop.is_set():
+                self.cycle += 1
+                jobs = {}  # symbol -> (df, model_path)
+                for sym in list(self.engines.keys()):
+                    if self._stop.is_set():
+                        break
+                    try:
+                        prepared = self._prepare_job(sym)
+                    except Exception as e:
+                        logger.error("[trainer] %s data fetch error: %s", sym, e)
+                        continue
+                    if prepared is not None:
+                        jobs[sym] = prepared
+
+                if executor is not None:
+                    # ---- multi-core path: one process per symbol, collect as they finish ----
+                    # Bounded so a stuck worker can NEVER hang the loop: if a whole sweep
+                    # overruns the deadline we cancel, fall back to in-thread for the rest of
+                    # this run, and shut the pool down. Workers spawn lazily (Windows re-imports
+                    # the app per process), so the first sweep is the slow one.
+                    futures = {}
+                    for sym, (df, model_path) in jobs.items():
+                        if self._stop.is_set():
+                            break
+                        kw = dict(iterations=self.iterations, population=self.population,
+                                  init_theta=self._theta.get(sym), model_path=model_path,
+                                  seed=self.cycle)
+                        self._publish("start", sym, iterations=self.iterations, bars=len(df))
+                        try:
+                            futures[executor.submit(_pool_train_worker, (sym, df, kw))] = sym
+                        except Exception as e:
+                            logger.error("[trainer] %s submit failed: %s", sym, e)
+                    # Generous: worker spawn + heavy import + train, scaled to the batch.
+                    deadline_s = 120.0 + 45.0 * len(futures)
+                    try:
+                        for fut in as_completed(futures, timeout=deadline_s):
+                            if self._stop.is_set():
+                                break
+                            sym = futures[fut]
+                            try:
+                                res = fut.result()
+                            except BrokenProcessPool:
+                                raise               # handled below — pool is dead
+                            except Exception as e:
+                                res = {"ok": False, "symbol": sym, "error": str(e)}
+                            self._apply_result(sym, res, source="worker")
+                    except TimeoutError:
+                        # A slow/asleep sweep (e.g. laptop suspended) — NOT a broken pool.
+                        # Drop this sweep's stragglers and keep the pool for the next cycle;
+                        # the next sweep retrains the same symbols anyway.
+                        pending = [s for f, s in futures.items() if not f.done()]
+                        logger.warning("[trainer] sweep exceeded %ds; skipping stragglers %s "
+                                       "this cycle (pool kept).", int(deadline_s), pending)
+                        for f in futures:
+                            f.cancel()
+                    except BrokenProcessPool as e:
+                        # The pool is genuinely dead — fall back to in-thread for the rest of
+                        # the run so training continues (without GIL relief).
+                        logger.error("[trainer] worker pool broke (%s); switching to in-thread "
+                                     "sequential training.", e)
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except Exception:
+                            pass
+                        executor = None
+                else:
+                    # ---- fallback: sequential, in this thread (no GIL relief) --------------
+                    for sym, (df, model_path) in jobs.items():
+                        if self._stop.is_set():
+                            break
+                        self._publish("start", sym, iterations=self.iterations, bars=len(df))
+                        try:
+                            res = train_policy(
+                                df, iterations=self.iterations, population=self.population,
+                                init_theta=self._theta.get(sym), model_path=model_path,
+                                seed=self.cycle)
+                            res["symbol"] = sym
+                        except Exception as e:
+                            res = {"ok": False, "symbol": sym, "error": str(e)}
+                        self._apply_result(sym, res, source="in-thread")
+
+                # Pause between full sweeps; responsive to stop().
+                self._stop.wait(self.interval)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Multi-symbol live/paper trading dashboard.")
-    ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT")
+    ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--timeframe", default="1m")
     ap.add_argument("--capital", type=float, default=10_000, help="capital PER symbol")
     ap.add_argument("--host", default="127.0.0.1")
@@ -227,6 +486,30 @@ def main() -> None:
     ap.add_argument("--poll", type=float, default=None, help="seconds between polls")
     ap.add_argument("--force-replay", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
+    # --- training (RL) -----------------------------------------------------
+    ap.add_argument("--history", type=int, default=8000,
+                    help="bars of history to fetch for training (paged from the exchange)")
+    ap.add_argument("--no-continuous", action="store_true",
+                    help="disable the always-on background retraining loop")
+    ap.add_argument("--train-iterations", type=int, default=30,
+                    help="CEM iterations per symbol per continuous cycle (training LENGTH)")
+    ap.add_argument("--train-population", type=int, default=50,
+                    help="CEM population per iteration (more = more thorough search)")
+    ap.add_argument("--train-bars", type=int, default=4000,
+                    help="most-recent bars each retraining cycle trains on (training LENGTH)")
+    ap.add_argument("--train-interval", type=float, default=45.0,
+                    help="seconds to pause between full retraining sweeps")
+    ap.add_argument("--train-workers", type=int, default=0,
+                    help="parallel training PROCESSES (0 = auto: min(#symbols, cpu-1)). "
+                         "Offloads CEM off the main process so the dashboard stays responsive.")
+    # --- optional Claude CLI advisor (no API key — uses the local `claude` subscription) ---
+    ap.add_argument("--claude-advisor", action="store_true",
+                    help="enable a SLOW Claude advisory overlay via the `claude` CLI that can "
+                         "veto/bias trades (advisory only; needs the claude CLI on PATH)")
+    ap.add_argument("--advisor-interval", type=float, default=300.0,
+                    help="seconds between Claude advisory refreshes per symbol")
+    ap.add_argument("--advisor-model", default="opus",
+                    help="model for the Claude advisor (CLI alias, e.g. opus/sonnet/haiku)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s :: %(message)s")
@@ -287,21 +570,66 @@ def main() -> None:
 
     controller = MultiEngineController(engines, GLOBAL_BUS, args.capital)
 
-    # Wire the "Train RL" button: train a CEM policy on the first symbol's data (live
-    # history when the exchange is reachable, else synthetic), streaming progress to the
-    # dashboard. Without this the page reports "Training is not configured".
+    # Per-symbol training-data provider: a long live history (paged from the exchange) when
+    # reachable, else a stable synthetic frame for that symbol. Shared by the manual "Train
+    # RL" button and the continuous retraining loop.
+    def fetch_training_df(symbol: str):
+        if use_live and real_client is not None:
+            df = fetch_history(real_client, symbol, args.timeframe, args.history)
+            if df is not None and len(df) >= 300:
+                return df
+            logger.warning("[trainer] %s: live history unavailable; using synthetic.", symbol)
+        i = symbols.index(symbol) if symbol in symbols else 0
+        start_px = _REPLAY_START_PRICE.get(symbol, 100.0 * (i + 1))
+        return make_synthetic_ohlcv(n=max(3000, args.history), seed=7 + i,
+                                    start_price=start_px)
+
+    # Optional Claude advisory overlay (off unless --claude-advisor). Uses the local `claude`
+    # CLI (no API key). Advisory only: it can veto/bias the engine's trades, never place them.
+    advisor = None
+    if args.claude_advisor:
+        from advisors.claude_cli_advisor import ClaudeAdvisor, available as _claude_ok
+        if _claude_ok():
+            advisor = ClaudeAdvisor(list(engines.keys()), fetch_training_df, GLOBAL_BUS,
+                                    interval=args.advisor_interval, timeframe=args.timeframe,
+                                    model=args.advisor_model)
+        else:
+            logger.warning("--claude-advisor requested but `claude` CLI not on PATH; skipping.")
+
+    # Always-on background learner: keeps each symbol's RL policy adapting to fresh data and
+    # hot-swaps it into the live engine. Disable with --no-continuous.
+    trainer = None
+    if not args.no_continuous:
+        trainer = ContinuousTrainer(
+            engines, GLOBAL_BUS, fetch_training_df,
+            iterations=args.train_iterations, population=args.train_population,
+            train_bars=args.train_bars, interval=args.train_interval,
+            workers=args.train_workers, advisor=advisor,
+        )
+
+    # Wire the "Train RL" button: train one symbol now on a long history, warm-starting from
+    # the continuous trainer's latest policy for that symbol if it has one. Streams progress
+    # to the dashboard. Without this the page reports "Training is not configured".
     train_symbol = next(iter(engines.keys()))
 
     def start_training():
-        from learning.train import train_to_bus
-        df = build_training_df(use_live, real_client, train_symbol, args.timeframe)
-        logger.info("Training RL policy on %s (%s)...", train_symbol,
-                    "live data" if use_live else "synthetic feed")
-        return train_to_bus(GLOBAL_BUS, df=df, iterations=20)
+        df = fetch_training_df(train_symbol)
+        logger.info("Manual training: RL policy on %s (%d bars, %s)...", train_symbol,
+                    len(df), "live data" if use_live else "synthetic feed")
+        init_theta = trainer._theta.get(train_symbol) if trainer is not None else None
+        import os
+        return train_to_bus(GLOBAL_BUS, df=df, iterations=max(20, args.train_iterations),
+                            population=args.train_population, init_theta=init_theta,
+                            model_path=os.path.join("models", f"rl_{train_symbol}.npz"),
+                            symbol=train_symbol)
 
     ctx = AppContext(event_bus=GLOBAL_BUS, engine=controller, start_training=start_training)
     server = DashboardServer(ctx, host=args.host, port=args.port)
     server.start()
+    if advisor is not None:
+        advisor.start()
+    if trainer is not None:
+        trainer.start()
 
     src = "LIVE Binance data" if use_live else "synthetic replay feed"
     logger.info("=" * 66)
@@ -310,6 +638,11 @@ def main() -> None:
     logger.info("Dashboard -> %s", server.url)
     if args.host == "0.0.0.0":
         logger.info("From phone/LAN: http://<this-machine-ip>:%d/", args.port)
+    if trainer is not None:
+        logger.info("Continuous RL training: ON — policies retrain on fresh data and "
+                    "hot-swap into the live engines (toggle with --no-continuous).")
+    else:
+        logger.info("Continuous RL training: OFF (engines trade EMA cross).")
     logger.info("Click ▶ Start. Trades for all symbols stream into one table.")
     logger.info("=" * 66)
 
@@ -321,6 +654,10 @@ def main() -> None:
         while True:
             time.sleep(1.0)
     except KeyboardInterrupt:
+        if advisor is not None:
+            advisor.stop()
+        if trainer is not None:
+            trainer.stop()
         controller.stop()
         server.stop()
 

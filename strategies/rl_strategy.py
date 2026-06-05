@@ -31,10 +31,9 @@ class RLStrategy(Strategy):
     name = "rl_policy"
 
     def __init__(self, policy: Optional[dict] = None, path: Optional[str] = None):
-        """Provide either `policy` (a dict with keys W, b, mean, std, window) or a `path`
-        to an .npz saved by learning/train.py. With neither, generate_signals raises."""
-        self.W = None
-        self.b = None
+        """Provide either `policy` (an in-memory dict, see `_set_policy`) or a `path` to an
+        .npz saved by learning/train.py. With neither, generate_signals raises."""
+        self.layers = None        # list of (W, b) — one entry = linear, >1 = MLP
         self.mean = None
         self.std = None
         self.window = None
@@ -44,25 +43,43 @@ class RLStrategy(Strategy):
             self.load(path)
 
     def _set_policy(self, policy: dict) -> None:
-        self.W = np.asarray(policy["W"], dtype=np.float32)
-        self.b = np.asarray(policy["b"], dtype=np.float32)
+        """Accepts either the layered form {"layers": [(W,b),...]} produced by MLPPolicy, or
+        the legacy linear form {"W":..., "b":...}. Both carry mean/std/window."""
+        if policy.get("layers") is not None:
+            self.layers = [(np.asarray(W, dtype=np.float32), np.asarray(b, dtype=np.float32))
+                           for (W, b) in policy["layers"]]
+        else:  # legacy single-layer linear policy
+            self.layers = [(np.asarray(policy["W"], dtype=np.float32),
+                            np.asarray(policy["b"], dtype=np.float32))]
         self.mean = np.asarray(policy["mean"], dtype=np.float32)
         self.std = np.asarray(policy["std"], dtype=np.float32)
         self.window = int(np.asarray(policy["window"]).item())
 
     def load(self, path: str) -> "RLStrategy":
-        """Load policy params + normalization stats from an .npz file."""
+        """Load policy params + normalization stats from an .npz file (layered or legacy)."""
         with np.load(path, allow_pickle=False) as blob:
-            self._set_policy({k: blob[k] for k in ("W", "b", "mean", "std", "window")})
-        logger.info("RLStrategy loaded from %s (window=%d, obs_dim=%d)",
-                    path, self.window, self.W.shape[0])
+            keys = set(blob.files)
+            if "n_layers" in keys:
+                n = int(np.asarray(blob["n_layers"]).item())
+                layers = [(blob[f"W{i}"], blob[f"b{i}"]) for i in range(n)]
+                self._set_policy({"layers": layers, "mean": blob["mean"],
+                                  "std": blob["std"], "window": blob["window"]})
+            else:  # legacy file with bare W/b
+                self._set_policy({k: blob[k] for k in ("W", "b", "mean", "std", "window")})
+        logger.info("RLStrategy loaded from %s (window=%d, layers=%d, obs_dim=%d)",
+                    path, self.window, len(self.layers), self.layers[0][0].shape[0])
         return self
 
     def _act(self, obs: np.ndarray) -> int:
-        return int(np.argmax(obs @ self.W + self.b))
+        h = np.asarray(obs, dtype=np.float32)
+        last = len(self.layers) - 1
+        for i, (W, b) in enumerate(self.layers):
+            z = h @ W + b
+            h = z if i == last else np.tanh(z)   # MUST match MLPPolicy._logits exactly
+        return int(np.argmax(h))
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
-        if self.W is None:
+        if self.layers is None:
             raise RuntimeError(
                 "RLStrategy has no policy loaded. Pass policy=... or path=... (e.g. "
                 "models/rl_policy.npz produced by learning/train.py).")
