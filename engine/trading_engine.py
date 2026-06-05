@@ -66,6 +66,7 @@ class TradingEngine:
         poll_seconds: typing.Optional[float] = None,
         confirm_live: bool = False,
         event_bus=None,
+        publish_step_updates: bool = True,
     ):
         self.client = client
         self.strategy = strategy
@@ -77,6 +78,10 @@ class TradingEngine:
         self.notifier = notifier
         self.evaluator = evaluator
         self.event_bus = event_bus       # optional pub/sub for the live dashboard
+        # When several engines share one bus/dashboard, a controller aggregates and
+        # publishes the combined state/equity; individual engines then suppress their
+        # own per-step state/equity events (fills are always published, symbol-tagged).
+        self.publish_step_updates = publish_step_updates
         self.run_id = run_id or uuid.uuid4().hex[:12]
 
         # Resolve and guard the requested mode (may downgrade live -> paper).
@@ -143,6 +148,8 @@ class TradingEngine:
             return "binance"
         if "bitmex" in name:
             return "bitmex"
+        if "replay" in name:
+            return "replay"
         return "unknown"
 
     # ----------------------------------------------------------- thread mgmt
@@ -219,9 +226,11 @@ class TradingEngine:
         self._record_equity(equity_now)
 
         # Stream a live equity point + full state snapshot to any dashboard subscribers.
-        self._publish("equity", {"ts": self._now_ms(), "equity": round(equity_now, 2),
-                                 "price": round(price, 2), "signal": self.last_signal})
-        self._publish("state", self.get_state())
+        # Suppressed when a controller publishes aggregated updates (multi-symbol mode).
+        if self.publish_step_updates:
+            self._publish("equity", {"ts": self._now_ms(), "equity": round(equity_now, 2),
+                                     "price": round(price, 2), "signal": self.last_signal})
+            self._publish("state", self.get_state())
 
         if self.database is not None:
             try:

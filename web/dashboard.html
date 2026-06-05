@@ -61,6 +61,7 @@
   <span class="dot" id="connDot"></span>
   <h1>TradingBot — Live</h1>
   <span class="conn" id="connText">connecting…</span>
+  <span class="conn" id="symbolBadge"></span>
   <span class="conn" id="modeBadge"></span>
   <div class="controls">
     <button class="start" id="btnStart">▶ Start</button>
@@ -82,6 +83,11 @@
       <div class="stat"><div class="k">Last Signal</div><div class="v" id="sSig">—</div></div>
     </div>
     <div class="promo notready" id="promo">Promotion: press “Check Readiness”.</div>
+    <div id="perSymbolWrap" style="display:none;margin-top:12px;">
+      <h2>Per-Symbol</h2>
+      <table><thead><tr><th>Symbol</th><th>Equity</th><th>Pos</th><th>Trades</th><th>Realized</th></tr></thead>
+        <tbody id="perSymbol"></tbody></table>
+    </div>
   </section>
 
   <section class="panel">
@@ -96,7 +102,7 @@
     <h2>Live Trades</h2>
     <div class="scroll">
       <table>
-        <thead><tr><th>Time</th><th>Side</th><th>Qty</th><th>Price</th><th>PnL</th><th>Strategy</th></tr></thead>
+        <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>PnL</th><th>Strategy</th><th>Exch</th></tr></thead>
         <tbody id="trades"></tbody>
       </table>
     </div>
@@ -134,6 +140,7 @@ function drawEquity(){
 
 // ---- state rendering --------------------------------------------------
 function applyState(s){
+  if(s.symbol) $("symbolBadge").textContent = "symbol: " + s.symbol;
   if(s.mode) $("modeBadge").textContent = "mode: " + String(s.mode).toUpperCase();
   if("equity" in s) $("sEquity").textContent = fmt(s.equity);
   if("realized_pnl" in s){ const e=$("sRpnl"); e.textContent=fmt(s.realized_pnl); e.className="v "+(s.realized_pnl>=0?"green":"red"); }
@@ -142,15 +149,24 @@ function applyState(s){
   if("n_trades" in s) $("sTrades").textContent = s.n_trades;
   if("last_signal" in s){ const v=s.last_signal; const e=$("sSig");
     e.textContent = v>0?"LONG (+1)":v<0?"SHORT (−1)":"FLAT (0)"; e.className="v "+(v>0?"green":v<0?"red":"blue"); }
+  if(Array.isArray(s.per_symbol)){
+    $("perSymbolWrap").style.display="block";
+    $("perSymbol").innerHTML = s.per_symbol.map(p=>
+      `<tr><td><b>${p.symbol}</b></td><td>${fmt(p.equity)}</td>`+
+      `<td>${fmt(p.position,4)}</td><td>${p.n_trades}</td>`+
+      `<td class="${pnlClass(p.realized_pnl)}">${fmt(p.realized_pnl)}</td></tr>`).join("");
+  }
 }
 
 // ---- trades + log -----------------------------------------------------
 function addTrade(t){
   const tb=$("trades"), tr=document.createElement("tr");
   const sideCls = t.side==="BUY"?"buy":"sell";
-  tr.innerHTML = `<td>${t.time||""}</td><td class="${sideCls}">${t.side}</td>`+
+  tr.innerHTML = `<td>${t.time||""}</td><td><b>${t.symbol||"—"}</b></td>`+
+    `<td class="${sideCls}">${t.side}</td>`+
     `<td>${fmt(t.quantity,6)}</td><td>${fmt(t.price)}</td>`+
-    `<td class="${pnlClass(t.pnl)}">${fmt(t.pnl)}</td><td>${t.strategy||""}</td>`;
+    `<td class="${pnlClass(t.pnl)}">${fmt(t.pnl)}</td>`+
+    `<td>${t.strategy||""}</td><td>${t.exchange||""}</td>`;
   tb.insertBefore(tr, tb.firstChild);
   while(tb.children.length>200) tb.removeChild(tb.lastChild);
 }
