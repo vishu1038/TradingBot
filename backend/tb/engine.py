@@ -1080,7 +1080,19 @@ class Engine:
         if not forced and self.universe and self.clock() - self.universe_at < cfg.universe_refresh_s:
             return
         cur = {r["symbol"]: r["in_universe_since"] for r in self.store.get_universe()}
-        rows = await self.io(uni.refresh, self.data, cfg, cur, self.clock())
+        venue_info = None
+        dropped: list[str] = []
+        if not self.paper:
+            try:
+                venue_info = await self.io(self.ex.exchange_info)
+            except ExchangeError as e:
+                log.warning("order-venue exchangeInfo unavailable (%s); keeping the current universe", e)
+                self.universe_at = self.clock() - cfg.universe_refresh_s + 60
+                return
+        rows = await self.io(uni.refresh, self.data, cfg, cur, self.clock(), venue_info, dropped)
+        if dropped:
+            self.dropped_venue = dropped
+            log.warning("universe: dropped %s (hot on prod, not TRADING on the %s venue)", ", ".join(dropped), self.mode)
         if not rows:
             log.warning("universe refresh returned no symbols; keeping the old list")
             self.universe_at = self.clock() - cfg.universe_refresh_s + 120

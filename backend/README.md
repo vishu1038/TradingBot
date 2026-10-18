@@ -36,6 +36,13 @@ Env (`.env` at the repo root, never logged): `BINANCE_API_KEY`, `BINANCE_API_SEC
 - `live`: needs `ALLOW_LIVE_TRADING=true` in the env AND `--confirm-live` (or `TB_CONFIRM_LIVE=true`). The
   first 20 live trades run at 0.5x size. Starts stopped.
 
+Testnet: `BINANCE_ENV=testnet scripts/dev.sh --mode binance_demo` (keys from https://testnet.binancefuture.com in `.env`).
+Signals/features keep using PROD market data; the universe is the prod hot list intersected with symbols
+TRADING on the order venue (dropped coins are logged), and sizing, filters, stop/TP placement, position marking
+and PnL use the venue's own exchangeInfo, mark prices and fills (stops are always recomputed from the actual
+fill and checked against a fresh venue mark). Before the first run, check the keys and the order flow with
+`.venv/bin/python scripts/demo_smoke.py --dry-run`, then without `--dry-run` (one ETHUSDT round trip).
+
 Only one engine can run per DB (flock on `var/tb.sqlite.engine.lock`).
 
 ## Engine behaviour in short

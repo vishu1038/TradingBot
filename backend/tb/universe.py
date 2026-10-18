@@ -65,8 +65,18 @@ def rank_candidates(cands: Sequence[Candidate]) -> list[Candidate]:
     return sorted(ok, key=lambda c: c.score, reverse=True)
 
 
-def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float | None = None) -> list[dict]:
-    """Build the new universe rows. ``current`` = {symbol: in_universe_since}."""
+def venue_filter(ranked: Sequence[str], venue_info: Mapping[str, SymbolInfo]) -> list[str]:
+    """Keep only symbols that are TRADING on the order venue (rank order preserved)."""
+    return [s for s in ranked if s in venue_info and venue_info[s].status == "TRADING"]
+
+
+def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float | None = None,
+            venue_info: Mapping[str, SymbolInfo] | None = None, dropped: list[str] | None = None) -> list[dict]:
+    """Build the new universe rows. ``current`` = {symbol: in_universe_since}.
+
+    ``venue_info`` (the ORDER venue's exchangeInfo, binance_demo/live) restricts the result to symbols the
+    venue can trade: the ranking is computed on prod data, then intersected with the venue; coins of the prod
+    top list that the venue lacks are appended to ``dropped`` and replaced by the next-ranked tradable ones."""
     now = now or time.time()
     info = ex.exchange_info()
     tickers = {t.symbol: t for t in ex.tickers_24h()}
@@ -88,7 +98,13 @@ def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float 
             log.warning("universe: klines failed for %s: %s", c.symbol, e)
     ranked = rank_candidates(pre)
     by = {c.symbol: c for c in ranked}
-    chosen = select([c.symbol for c in ranked], list(current), cfg.universe_size)
+    order = [c.symbol for c in ranked]
+    chosen = select(order, list(current), cfg.universe_size)
+    if venue_info is not None:
+        tradable = venue_filter(order, venue_info)
+        if dropped is not None:
+            dropped.extend(s for s in chosen if s not in set(tradable))
+        chosen = select(tradable, [s for s in current if s in set(tradable)], cfg.universe_size)
     rows = []
     for rank, s in enumerate(chosen, 1):
         c = by[s]
