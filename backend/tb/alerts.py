@@ -1,8 +1,9 @@
 """Alerts: pluggable notifiers behind a non-blocking, rate-limited dispatcher.
 
 * ``Notifier`` is the interface (a native Android push channel can implement it later).
-* ``GoogleChatNotifier`` POSTs ``{"text": ...}`` to the incoming-webhook URL in env
-  ``GOOGLE_CHAT_WEBHOOK_URL``. The URL carries key/token query params: it is never logged and is
+* ``GoogleChatNotifier`` POSTs ``{"text": ...}`` (plus ``cardsV2`` cards for trade, kill, safety,
+  error and daily events) to the incoming-webhook URL in env ``GOOGLE_CHAT_WEBHOOK_URL``.
+  Cards carry no images: a webhook cannot upload files and the bot's charts are not public. The URL carries key/token query params: it is never logged and is
   masked in repr and in every error string.
 * ``AlertDispatcher`` owns a background thread + queue, so the engine never blocks. It coalesces
   bursts into one message (webhooks allow ~1 msg/s per space), retries 429/5xx with backoff, and
@@ -10,18 +11,56 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 log = logging.getLogger("tb.alerts")
 
 MAX_TEXT = 3800  # Google Chat text limit is ~4096 chars
+MAX_CARDS = 8    # cards coalesced into one webhook message
+
+GREEN, RED, AMBER, BLUE, GREY = "#1e8e3e", "#d93025", "#f29900", "#1a73e8", "#5f6368"
+
+
+@dataclass
+class Alert:
+    """One queued alert: ``text`` for text-only channels; ``headline`` + ``card`` for card channels."""
+    text: str
+    headline: str = ""
+    card: dict | None = None
+
+
+def _esc(v: Any) -> str:
+    return html.escape(str(v), quote=False)
+
+
+def _colored(v: Any, color: str | None) -> str:
+    return f'<font color="{color}">{_esc(v)}</font>' if color else _esc(v)
+
+
+def build_card(title: str, subtitle: str, rows: Sequence[tuple[str, Any, str | None]],
+               card_id: str = "tb") -> dict:
+    """A cardsV2 entry: header + one section of label/value rows (value optionally coloured)."""
+    widgets: list[dict] = [{"decoratedText": {"topLabel": _esc(label), "text": _colored(value, color)}}
+                           for label, value, color in rows]
+    dash = os.environ.get("TB_DASHBOARD_URL", "").strip()
+    if dash.startswith(("http://", "https://")):
+        widgets.append({"buttonList": {"buttons": [{"text": "Open dashboard",
+                                                    "onClick": {"openLink": {"url": dash}}}]}})
+    return {"cardId": card_id, "card": {"header": {"title": _esc(title), "subtitle": _esc(subtitle)},
+                                        "sections": [{"widgets": widgets}]}}
+
+
+def _pct(a: float, b: float) -> str:
+    return f"{(b / a - 1) * 100:+.2f}%" if a else ""
 
 
 class NotifyError(Exception):
@@ -37,7 +76,9 @@ class Notifier(Protocol):
     name: str
 
     def send(self, text: str) -> None:
-        """Deliver one message synchronously; raise NotifyError on failure."""
+        """Deliver one message synchronously; raise NotifyError on failure.
+
+        Notifiers with ``supports_cards = True`` are called as ``send(text, cards=[...])``."""
 
 
 def mask_url(url: str) -> str:
@@ -55,6 +96,7 @@ def mask_url(url: str) -> str:
 
 class GoogleChatNotifier:
     name = "google_chat"
+    supports_cards = True
 
     def __init__(self, url: str, session: Any = None, timeout: float = 10.0):
         self._url = url
@@ -75,11 +117,14 @@ class GoogleChatNotifier:
                 t = t.replace(q, "***")
         return t
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, cards: list[dict] | None = None) -> None:
         import requests
 
         sess = self._session or requests
-        body = json.dumps({"text": text[:MAX_TEXT]}).encode("utf-8")
+        payload: dict[str, Any] = {"text": text[:MAX_TEXT]}
+        if cards:
+            payload["cardsV2"] = cards[:MAX_CARDS]
+        body = json.dumps(payload).encode("utf-8")
         try:
             r = sess.post(self._url, data=body, timeout=self._timeout,
                           headers={"Content-Type": "application/json; charset=UTF-8"})
@@ -117,7 +162,7 @@ class AlertDispatcher:
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self.dedupe_s = dedupe_s
-        self._q: queue.Queue[str] = queue.Queue(maxsize=max_queue)
+        self._q: queue.Queue[Alert] = queue.Queue(maxsize=max_queue)
         self._seen: dict[str, float] = {}
         self._stop = threading.Event()
         self._idle = threading.Event()
@@ -132,7 +177,8 @@ class AlertDispatcher:
         return bool(self.notifiers)
 
     # ------------------------------------------------------------------ public API
-    def send(self, text: str, *, dedupe_key: str | None = None) -> None:
+    def send(self, text: str, *, dedupe_key: str | None = None, headline: str = "",
+             card: dict | None = None) -> None:
         if not self.notifiers:
             return
         if dedupe_key:
@@ -146,33 +192,66 @@ class AlertDispatcher:
         self._ensure_thread()
         try:
             self._idle.clear()
-            self._q.put_nowait(text)
+            self._q.put_nowait(Alert(text, headline or text, card))
         except queue.Full:
             self.dropped += 1
 
     def trade_opened(self, symbol: str, side: str, entry: float, qty: float, notional: float,
                      sl: float, tp: float, prob: float | None = None, mode: str = "") -> None:
         p = f" p={prob:.2f}" if prob is not None else ""
+        arrow = "▲" if side.lower() == "long" else "▼"
+        rows = [("Entry", f"{entry:g}", None), ("Size", f"{qty:g} (${notional:.0f})", None),
+                ("Stop", f"{sl:g} ({_pct(entry, sl)})", RED)]
+        if tp:
+            rows.append(("Target", f"{tp:g} ({_pct(entry, tp)})", GREEN))
+        if prob is not None:
+            rows.append(("Model prob", f"{prob:.2f}", BLUE))
         self.send(f"[{mode}] OPEN {side.upper()} {symbol} @ {entry:g} qty {qty:g} (${notional:.0f}) "
-                  f"SL {sl:g} TP {tp:g}{p}")
+                  f"SL {sl:g} TP {tp:g}{p}",
+                  headline=f"{arrow} OPEN {side.upper()} {symbol} @ {entry:g}",
+                  card=build_card(f"{arrow} OPEN {side.upper()} · {symbol}", mode, rows, "open"))
 
     def trade_closed(self, symbol: str, side: str, entry: float, exit_price: float, pnl: float,
                      fees: float, reason: str, mode: str = "") -> None:
         net = pnl                       # pnl is NET (after fees and funding)
+        label = {"tp": "✅ TP hit", "sl": "🛑 SL hit", "trail": "🪢 Trailing stop", "kill": "☠️ Kill close",
+                 "liquidation": "💥 Liquidated", "manual": "✋ Closed manually"}.get(reason, f"Closed ({reason})")
+        rows = [("Side", side.upper(), None),
+                ("Entry → exit", f"{entry:g} → {exit_price:g} ({_pct(entry, exit_price)})", None),
+                ("Net PnL", f"{net:+.2f} USDT", GREEN if net > 0 else RED), ("Fees", f"{fees:.2f}", GREY)]
         self.send(f"[{mode}] CLOSE {side.upper()} {symbol} {entry:g} -> {exit_price:g} "
-                  f"net PnL {net:+.2f} (fees {fees:.2f}) reason={reason}")
+                  f"net PnL {net:+.2f} (fees {fees:.2f}) reason={reason}",
+                  headline=f"{label} {symbol} {net:+.2f} USDT",
+                  card=build_card(f"{label} · {symbol}", mode, rows, "close"))
 
     def kill(self, reason: str, equity: float, dd_pct: float, mode: str = "") -> None:
-        self.send(f"[{mode}] KILL SWITCH TRIPPED: {reason}. equity {equity:.2f}, drawdown {dd_pct:.1f}%")
+        rows = [("Reason", reason, RED), ("Bot equity", f"{equity:.2f}", None), ("Drawdown", f"{dd_pct:.1f}%", RED),
+                ("Next step", "positions closed; manual reset_kill required", AMBER)]
+        self.send(f"[{mode}] KILL SWITCH TRIPPED: {reason}. equity {equity:.2f}, drawdown {dd_pct:.1f}%",
+                  headline=f"☠️ KILL SWITCH TRIPPED ({dd_pct:.1f}% drawdown)",
+                  card=build_card("☠️ KILL SWITCH TRIPPED", mode, rows, "kill"))
+
+    def safety(self, state: str, reasons: Sequence[str], mode: str = "") -> None:
+        rows = [("State", state, {"NORMAL": GREEN, "DEGRADED": AMBER}.get(state, RED))]
+        rows += [("Reason", r, None) for r in list(reasons)[:5]]
+        self.send(f"[{mode}] SAFETY {state}: {'; '.join(reasons)}", dedupe_key=f"safety:{state}",
+                  headline=f"🚦 Safety {state}", card=build_card(f"🚦 Safety → {state}", mode, rows, "safety"))
 
     def engine_error(self, where: str, err: str) -> None:
-        self.send(f"ENGINE ERROR in {where}: {err}"[:500], dedupe_key=f"err:{where}")
+        self.send(f"ENGINE ERROR in {where}: {err}"[:500], dedupe_key=f"err:{where}",
+                  headline=f"⚠️ Engine error in {where}",
+                  card=build_card("⚠️ Engine error", where, [("Where", where, AMBER), ("Error", err[:400], None)],
+                                  "error"))
 
     def daily_summary(self, *, date: str, trades: int, wins: int, pnl: float, equity: float,
                       mode: str = "") -> None:
         wr = f"{100 * wins / trades:.0f}%" if trades else "n/a"
+        rows = [("Trades", trades, None), ("Win rate", wr, None),
+                ("PnL", f"{pnl:+.2f} USDT", GREEN if pnl >= 0 else RED), ("Bot equity", f"{equity:.2f}", None)]
         self.send(f"[{mode}] DAILY {date}: {trades} trades, win rate {wr}, PnL {pnl:+.2f}, "
-                  f"equity {equity:.2f}")
+                  f"equity {equity:.2f}",
+                  headline=f"📊 Daily {date}: {pnl:+.2f} USDT",
+                  card=build_card(f"📊 Daily summary · {date}", mode, rows, "daily"))
 
     def flush(self, timeout: float = 10.0) -> bool:
         """Wait until the queue has been delivered (tests / shutdown)."""
@@ -192,17 +271,17 @@ class AlertDispatcher:
         self._thread = threading.Thread(target=self._run, name="tb-alerts", daemon=True)
         self._thread.start()
 
-    def _drain_batch(self, first: str) -> str:
-        parts = [first]
-        size = len(first)
-        while size < MAX_TEXT - 300:
+    def _drain_batch(self, first: Alert) -> list[Alert]:
+        batch = [first]
+        size = len(first.text)
+        while size < MAX_TEXT - 300 and sum(a.card is not None for a in batch) < MAX_CARDS:
             try:
                 nxt = self._q.get_nowait()
             except queue.Empty:
                 break
-            parts.append(nxt)
-            size += len(nxt) + 1
-        return "\n".join(parts)
+            batch.append(nxt)
+            size += len(nxt.text) + 1
+        return batch
 
     def _run(self) -> None:
         last_sent = 0.0
@@ -216,17 +295,22 @@ class AlertDispatcher:
             wait = self.min_interval - (time.monotonic() - last_sent)
             if wait > 0:
                 time.sleep(wait)          # while waiting, bursts accumulate and are coalesced
-            text = self._drain_batch(first)
-            self._deliver(text)
+            self._deliver(self._drain_batch(first))
             last_sent = time.monotonic()
             if self._q.empty():
                 self._idle.set()
 
-    def _deliver(self, text: str) -> None:
+    def _deliver(self, batch: list[Alert]) -> None:
+        text = "\n".join(a.text for a in batch)
+        headlines = "\n".join(a.headline or a.text for a in batch)
+        cards = [dict(a.card, cardId=f"{a.card['cardId']}-{i}") for i, a in enumerate(batch) if a.card]
         for n in self.notifiers:
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    n.send(text)
+                    if cards and getattr(n, "supports_cards", False):
+                        n.send(headlines, cards=cards)
+                    else:
+                        n.send(text)
                     self.sent += 1
                     break
                 except NotifyError as e:

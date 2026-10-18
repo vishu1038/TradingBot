@@ -270,7 +270,7 @@ class Guard:
         if changed:
             self._say(logging.WARNING, f"safety state {prev} -> {state}: {'; '.join(reasons) or 'recovered'}")
             if self.alerts and _rank(state) > _rank(prev):
-                self.alerts.send(f"[{self.mode}] SAFETY {state}: {'; '.join(reasons)}", dedupe_key=f"safety:{state}")
+                self.alerts.safety(state, reasons, self.mode)
 
 
 def _rank(s: str) -> int:

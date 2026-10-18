@@ -20,7 +20,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDis
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import __version__, capital
 from .config import Settings, db_path, models_dir, resolve_mode, ui_dir
 from .risk import drawdown_pct
 from .safety import merged_safety
@@ -168,7 +168,11 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
 
     @app.get("/api/equity")
     def equity(limit: int = Query(2000, ge=1, le=20000)) -> list[dict]:
-        return store.get_equity(limit)
+        # In demo/live the history before the $-stake started is wallet-sized (e.g. 5000 USDT on
+        # testnet) and would dwarf the bot's own curve; show only points since the stake began.
+        since = capital.since_t(store)
+        rows = store.get_equity(limit)
+        return [r for r in rows if r["t"] >= since] if since is not None else rows
 
     @app.get("/api/logs")
     def logs(limit: int = Query(200, ge=1, le=2000)) -> list[dict]:

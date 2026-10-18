@@ -16,6 +16,7 @@ from typing import Any
 
 FLOOR_KEY = "capital_floor_trade_id"
 BASIS_KEY = "capital_basis"           # the capital_usd value the peak/start equity refer to
+SINCE_KEY = "capital_since_t"         # unix s when the stake started; equity history before it is wallet-sized
 
 
 def is_active(cfg: Any, mode: str) -> bool:
@@ -28,6 +29,16 @@ def floor_id(store, create: bool = False) -> int | None:
         r = store.one("SELECT COALESCE(MAX(id),0) m FROM trades")
         v = int(r["m"])
         store.kv_set(FLOOR_KEY, v)
+        if store.kv_get(SINCE_KEY) is None:
+            import time
+
+            store.kv_set(SINCE_KEY, int(time.time()))
+    return None if v is None else int(v)
+
+
+def since_t(store) -> int | None:
+    """When the stake started (None if never set): the equity chart starts here in demo/live."""
+    v = store.kv_get(SINCE_KEY)
     return None if v is None else int(v)
 
 

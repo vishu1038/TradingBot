@@ -284,3 +284,14 @@ def test_websocket_does_not_replay_old_events(env):
                 break
         else:
             raise AssertionError("no tick received")
+
+
+def test_equity_history_starts_at_the_capital_stake(env):
+    from tb import capital
+
+    c, s = env
+    for t, eq in ((1000, 5000.0), (2000, 4999.0), (3000, 100.0), (4000, 101.5)):
+        s.add_equity(t, eq)
+    assert len(c.get("/api/equity").json()) == 4               # no stake: full history
+    s.kv_set(capital.SINCE_KEY, 3000)
+    assert [r["equity"] for r in c.get("/api/equity").json()] == [100.0, 101.5]

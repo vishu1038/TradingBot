@@ -122,7 +122,7 @@ def test_error_alerts_deduped():
     d.engine_error("prices", "other")
     d.flush(3)
     text = "".join(json.loads(c["data"])["text"] for c in s.calls)
-    assert text.count("ENGINE ERROR in bars") == 1 and text.count("ENGINE ERROR in prices") == 1
+    assert text.count("Engine error in bars") == 1 and text.count("Engine error in prices") == 1
 
 
 def test_event_formats():
@@ -145,6 +145,37 @@ def test_event_formats():
     joined = "\n".join(got)
     for needle in ("OPEN LONG ETHUSDT", "CLOSE LONG ETHUSDT", "reason=tp", "KILL SWITCH", "DAILY 2026-10-18", "win rate 75%"):
         assert needle in joined
+
+
+def test_google_chat_gets_cards_with_headline_text():
+    s = Sess()
+    d = AlertDispatcher([GoogleChatNotifier(URL, session=s)], min_interval=0.2)
+    d.trade_opened("ETHUSDT", "long", 2364.8, 0.067, 158.4, 2215.5, 2439.4, 0.81, "binance_demo")
+    d.trade_closed("ETH<USDT>", "long", 2364.8, 2215.5, -10.2, 0.16, "sl", "binance_demo")
+    d.safety("DEGRADED", ["guard heartbeat stale"], "binance_demo")
+    assert d.flush(5)
+    d.close()
+    bodies = [json.loads(c["data"]) for c in s.calls]
+    cards = [c for b in bodies for c in b.get("cardsV2", [])]
+    assert len(cards) == 3 and len({c["cardId"] for c in cards}) == 3       # coalesced, unique ids
+    titles = [c["card"]["header"]["title"] for c in cards]
+    assert titles[0] == "▲ OPEN LONG · ETHUSDT" and "SL hit" in titles[1] and "DEGRADED" in titles[2]
+    rows = {w["decoratedText"]["topLabel"]: w["decoratedText"]["text"]
+            for w in cards[1]["card"]["sections"][0]["widgets"] if "decoratedText" in w}
+    assert '<font color="#d93025">-10.20 USDT</font>' == rows["Net PnL"]   # loss in red
+    assert "ETH&lt;USDT&gt;" in titles[1]                                  # HTML escaped
+    text = "\n".join(b["text"] for b in bodies)
+    assert "OPEN LONG ETHUSDT" in text and "net PnL" not in text            # short headlines, details in cards
+    assert "SECRET" not in json.dumps(bodies)
+
+
+def test_dashboard_button_only_when_configured(monkeypatch):
+    from tb.alerts import build_card
+    monkeypatch.delenv("TB_DASHBOARD_URL", raising=False)
+    assert all("buttonList" not in w for w in build_card("t", "s", [("a", 1, None)])["card"]["sections"][0]["widgets"])
+    monkeypatch.setenv("TB_DASHBOARD_URL", "http://mac-pro.example.ts.net:8787/")
+    w = build_card("t", "s", [("a", 1, None)])["card"]["sections"][0]["widgets"][-1]
+    assert w["buttonList"]["buttons"][0]["onClick"]["openLink"]["url"] == "http://mac-pro.example.ts.net:8787/"
 
 
 def test_worker_survives_notifier_exception():
