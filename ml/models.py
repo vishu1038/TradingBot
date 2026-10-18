@@ -27,14 +27,14 @@ class Head(nn.Module):
 
 
 class CNN(nn.Module):
-    def __init__(self, n_feat: int, channels=64, dilations=(1, 2, 4, 8, 16), kernel=3, hidden=64, dropout=0.1):
+    def __init__(self, n_feat: int, channels=64, dilations=(1, 2, 4, 8, 16), kernel=3, hidden=64, dropout=0.1, n_out=2):
         super().__init__()
         self.kernel, self.dilations = kernel, list(dilations)
         self.inp = nn.Conv1d(n_feat, channels, 1)
         self.blocks = nn.ModuleList([nn.Conv1d(channels, channels, kernel, dilation=d) for d in self.dilations])
         self.drop = nn.Dropout(dropout)
         self.head1 = nn.Linear(3 * channels, hidden)
-        self.head2 = nn.Linear(hidden, 2)
+        self.head2 = nn.Linear(hidden, n_out)
 
     def forward(self, x):                                  # [B,T,F]
         h = self.inp(x.transpose(1, 2))
@@ -46,13 +46,13 @@ class CNN(nn.Module):
 
 
 class GRU(nn.Module):
-    def __init__(self, n_feat: int, hidden=64, layers=1, dropout=0.1, head_hidden=64):
+    def __init__(self, n_feat: int, hidden=64, layers=1, dropout=0.1, head_hidden=64, n_out=2):
         super().__init__()
         self.gru = nn.GRU(n_feat, hidden, num_layers=layers, batch_first=True,
                           dropout=dropout if layers > 1 else 0.0)
         self.drop = nn.Dropout(dropout)
         self.head1 = nn.Linear(2 * hidden, head_hidden)
-        self.head2 = nn.Linear(head_hidden, 2)
+        self.head2 = nn.Linear(head_hidden, n_out)
 
     def forward(self, x):
         out, _ = self.gru(x)
@@ -85,7 +85,8 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, n_feat: int, window=64, d_model=48, heads=4, layers=2, ff=96, dropout=0.1, head_hidden=64):
+    def __init__(self, n_feat: int, window=64, d_model=48, heads=4, layers=2, ff=96, dropout=0.1, head_hidden=64,
+                 n_out=2):
         super().__init__()
         self.embed = nn.Linear(n_feat, d_model)
         self.pos = nn.Parameter(torch.zeros(window, d_model))
@@ -94,7 +95,7 @@ class Transformer(nn.Module):
         self.lnf = nn.LayerNorm(d_model)
         self.drop = nn.Dropout(dropout)
         self.head1 = nn.Linear(2 * d_model, head_hidden)
-        self.head2 = nn.Linear(head_hidden, 2)
+        self.head2 = nn.Linear(head_hidden, n_out)
 
     def forward(self, x):
         h = self.embed(x) + self.pos[None, : x.shape[1]]

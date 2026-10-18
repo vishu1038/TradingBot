@@ -1,10 +1,13 @@
-// Entry point: boot the data layer, mount top bar + nav, route between views.
+// Entry point: boot the data layer, mount top bar + nav + palette, route between pages, keyboard shortcuts.
 import { api } from './api.js';
 import { store } from './state.js';
 import { startSync } from './sync.js';
 import { mountTopbar } from './topbar.js';
+import { mountPalette } from './palette.js';
+import { infoDialog } from './dialog.js';
 import * as sound from './sound.js';
 import * as fx from './fx.js';
+import * as A from './actions.js';
 import * as live from './views/live.js';
 import * as markets from './views/markets.js';
 import * as bots from './views/bots.js';
@@ -14,20 +17,21 @@ import * as settings from './views/settings.js';
 
 const ICON = {
   live: '<path d="M2 12h5l3-8 4 16 3-8h5"/>',
-  markets: '<path d="M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z"/>',
-  bots: '<path d="M5 8h14v11H5zM12 4v4M9 13h.01M15 13h.01M9 16h6"/>',
-  trades: '<path d="M4 6h16M4 12h16M4 18h10"/>',
-  lab: '<path d="M9 3h6M10 3v6L4 20h16L14 9V3M7 15h10"/>',
   settings: '<path d="M4 7h8M16 7h4M4 17h4M12 17h8"/><circle cx="14" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
+  markets: '<path d="M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z"/>',
+  trades: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  bots: '<path d="M5 8h14v11H5zM12 4v4M9 13h.01M15 13h.01M9 16h6"/>',
+  lab: '<path d="M9 3h6M10 3v6L4 20h16L14 9V3M7 15h10"/>',
 };
 
+// page 1 = main, page 2 = bot settings, then the extra tabs
 const VIEWS = [
-  { id: 'live', label: 'LIVE', mod: live },
-  { id: 'markets', label: 'MARKETS', mod: markets },
-  { id: 'bots', label: 'BOTS', mod: bots },
-  { id: 'trades', label: 'TRADES', mod: trades },
-  { id: 'lab', label: 'LAB', mod: lab },
-  { id: 'settings', label: 'SETTINGS', mod: settings },
+  { id: 'live', label: 'LIVE', short: 'Live', mod: live },
+  { id: 'settings', label: 'SETTINGS', short: 'Settings', mod: settings },
+  { id: 'markets', label: 'MARKETS', short: 'Markets', mod: markets },
+  { id: 'trades', label: 'HISTORY', short: 'History', mod: trades },
+  { id: 'bots', label: 'BOTS', short: 'Bots', mod: bots },
+  { id: 'lab', label: 'LAB', short: 'Lab', mod: lab },
 ];
 
 let unmount = null;
@@ -39,16 +43,25 @@ function renderNav() {
     VIEWS.map(
       (v, i) => `<button type="button" class="nav-item" data-view="${v.id}" title="${v.label} (${i + 1})">
         <svg viewBox="0 0 24 24" aria-hidden="true">${ICON[v.id]}</svg><span class="nav-l">${v.label}</span><span class="nav-key">${i + 1}</span></button>`
-    ).join('') + `<div class="nav-foot">═══════════<br><b>5m</b> candles<br>keys <b>1-6</b></div>`;
+    ).join('') +
+    `<div class="nav-foot"><span class="deco">╰──────────╯</span><br><b>/</b> commands · <b>?</b> keys<br><b>j k</b> coins</div>`;
   nav.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-view]');
+    if (b) store.set('view', b.dataset.view);
+  });
+  const tabs = document.getElementById('tabbar');
+  tabs.innerHTML = VIEWS.map(
+    (v) => `<button type="button" class="tab-item" data-view="${v.id}" aria-label="${v.label}"><svg viewBox="0 0 24 24" aria-hidden="true">${ICON[v.id]}</svg><span>${v.short}</span></button>`
+  ).join('');
+  tabs.addEventListener('click', (e) => {
     const b = e.target.closest('[data-view]');
     if (b) store.set('view', b.dataset.view);
   });
 }
 
-function show(id) {
+function show(id, force = false) {
   const v = VIEWS.find((x) => x.id === id) || VIEWS[0];
-  if (current === v.id) return;
+  if (current === v.id && !force) return;
   if (unmount) {
     try {
       unmount();
@@ -62,7 +75,7 @@ function show(id) {
   root.innerHTML = '';
   root.className = `view-${v.id}`;
   root.scrollTop = 0;
-  document.querySelectorAll('.nav-item').forEach((n) => n.classList.toggle('active', n.dataset.view === v.id));
+  document.querySelectorAll('[data-view]').forEach((n) => n.classList.toggle('active', n.dataset.view === v.id));
   try {
     unmount = v.mod.mount(root);
   } catch (e) {
@@ -70,7 +83,7 @@ function show(id) {
     root.innerHTML = `<div class="empty neg">view "${v.id}" crashed: see console</div>`;
   }
   try {
-    history.replaceState(null, '', `#/${v.id}`);
+    history.replaceState(null, '', `${location.search}#/${v.id}`);
   } catch (_) {
     /* file:// or sandboxed */
   }
@@ -82,6 +95,27 @@ function initialView() {
   return VIEWS.some((v) => v.id === h) ? h : 'live';
 }
 
+const HELP = [
+  ['1 … 6', 'pages: Live, Bot settings, Markets, History, Bots, Lab'],
+  ['/', 'command palette (/kill /history /lab /coin SOL /pause WIF …)'],
+  ['j / k', 'next / previous coin'],
+  ['[ / ]', 'flip the hero card'],
+  ['s', 'start / stop new entries'],
+  ['x', 'close the selected coin’s position'],
+  ['p', 'pause / resume the selected coin'],
+  ['r', 'force a universe refresh'],
+  ['Shift + K', 'KILL switch (asks to confirm)'],
+  ['m', 'sound on / off'],
+  ['?', 'this help'],
+];
+
+function showHelp() {
+  infoDialog({
+    title: 'KEYBOARD',
+    html: `<div class="help">${HELP.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div>`,
+  });
+}
+
 function bindKeys() {
   window.addEventListener('keydown', (e) => {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -89,9 +123,25 @@ function bindKeys() {
     if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
     if (!document.getElementById('modal-host').hidden) return;
     const n = parseInt(e.key, 10);
-    if (n >= 1 && n <= VIEWS.length) {
+    if (n >= 1 && n <= VIEWS.length && !e.shiftKey) {
       store.set('view', VIEWS[n - 1].id);
-      e.preventDefault();
+      return e.preventDefault();
+    }
+    const sym = store.get('symbol');
+    switch (e.key) {
+      case '/': e.preventDefault(); return store.emit('palette', '/');
+      case '?': e.preventDefault(); return showHelp();
+      case 'j': A.cycleSymbol(1); return e.preventDefault();
+      case 'k': A.cycleSymbol(-1); return e.preventDefault();
+      case '[': return store.emit('hero_flip', -1);
+      case ']': return store.emit('hero_flip', 1);
+      case 's': return A.toggleRun();
+      case 'x': return A.closeSymbol(sym);
+      case 'p': return A.togglePause(sym);
+      case 'r': return A.refreshUniverse();
+      case 'K': return A.killAll();
+      case 'm': sound.setEnabled(!sound.isEnabled()); return fx.toast(`sound ${sound.isEnabled() ? 'on' : 'off'}`, 'info', 1500);
+      default: return undefined;
     }
   });
 }
@@ -101,9 +151,12 @@ async function boot() {
   renderNav();
   sound.unlockOnGesture();
   mountTopbar(document.getElementById('topbar'));
+  mountPalette(document.getElementById('palette-host'));
+  store.on('help', showHelp);
   bindKeys();
   store.set('view', initialView());
   store.on('change:view', (id) => show(id));
+  store.on('relayout', () => show(current, true));
   try {
     msg.textContent = 'probing API…';
     const r = await api.init();

@@ -6,8 +6,12 @@ Artifact (``models/{name}.npz`` + ``models/{name}.json``)::
            arch ("cnn"|"gru"|"transformer"), arch_cfg {...}, feature_names, window,
            norm {mean[F], std[F], clip}, calibration {long:{...}, short:{...}},
            thresholds {long, short}, exit_cfg, metrics {...}
-    npz  : the torch ``state_dict`` of the network as float32 arrays (key names == torch names)
+    npz  : the torch ``state_dict`` of the network as float32 arrays (key names == torch names).  For an
+           ensemble (``json.ensemble = N > 1``) member k's arrays are stored as ``e{k}/<torch name>`` and the
+           logits of the members are averaged before calibration.
 
+The network may have extra multi-task outputs (``arch_cfg.n_out > 2``: volatility / excursion / time-to-hit
+auxiliary heads, training-time only); inference uses output columns 0 and 1 = ``[long, short]`` logits.
 Heads are two logits ``[long, short]``; ``prob = calibrate(sigmoid(logit))``.  Calibration is fitted
 on validation data only and is part of the artifact so the live drift detector (realised win rate
 vs mean predicted probability) is comparing like with like.
@@ -194,7 +198,7 @@ def ece(p: np.ndarray, y: np.ndarray, n_bins: int = 10) -> float:
 # --------------------------------------------------------------------------------------------
 def _head(h, W):
     h = silu(h @ W["head1.weight"].T + W["head1.bias"])
-    return h @ W["head2.weight"].T + W["head2.bias"]
+    return h @ W["head2.weight"].T + W["head2.bias"]          # [B, n_out]; columns 0/1 = long/short logits
 
 
 def forward_cnn(W: dict, cfg: dict, x: np.ndarray) -> np.ndarray:
@@ -285,8 +289,19 @@ class NpScorer:
         if self.arch not in FORWARD:
             raise ValueError(f"unknown arch {self.arch!r}")
         self.arch_cfg = meta["arch_cfg"]
-        self.W = {k: np.asarray(v, dtype="float32") for k, v in weights.items()}
+        self.n_members = int(meta.get("ensemble", 1) or 1)
+        W32 = {k: np.asarray(v, dtype="float32") for k, v in weights.items()}
+        if self.n_members > 1:
+            self.members = [{k.split("/", 1)[1]: v for k, v in W32.items() if k.startswith(f"e{m}/")}
+                            for m in range(self.n_members)]
+            if not all(self.members):
+                raise ValueError("ensemble weights missing for some member")
+        else:
+            self.members = [W32]
+        self.W = self.members[0]
         self.feature_groups = list(meta.get("feature_groups", []))
+        if "depth" in self.feature_groups:
+            from . import features_depth  # noqa: F401  (registers the group)
         self.feature_names = list(meta.get("feature_names", feature_names(self.feature_groups)))
         if self.feature_names != feature_names(self.feature_groups):
             raise ValueError("model feature_names differ from tb.features (retrain, or register the model's "
@@ -307,7 +322,12 @@ class NpScorer:
     def logits_raw_windows(self, x_raw: np.ndarray) -> np.ndarray:
         """Raw (unnormalised) feature windows [B, T, F] -> uncalibrated logits [B, 2]."""
         z = normalize(x_raw, self.mean, self.std, self.clip)
-        return forward(self.arch, self.W, self.arch_cfg, z)
+        return self._logits(z)
+
+    def _logits(self, z: np.ndarray) -> np.ndarray:
+        """Ensemble-averaged raw [long, short] logits for normalised windows [B, T, F]."""
+        lg = sum(forward(self.arch, W, self.arch_cfg, z)[:, :2] for W in self.members) / len(self.members)
+        return lg
 
     def predict_windows(self, x_raw: np.ndarray) -> np.ndarray:
         """Raw feature windows [B, T, F] -> calibrated probabilities [B, 2] (long, short)."""
@@ -334,14 +354,14 @@ class NpScorer:
         w = self._window(feats)
         z = normalize(w, self.mean, self.std, self.clip)
         if not with_reasons:
-            lg = forward(self.arch, self.W, self.arch_cfg, z[None])[0]
+            lg = self._logits(z[None])[0]
             return Score(float(self._cal("long", lg[0])), float(self._cal("short", lg[1])), [])
         # batch = the window itself + one copy per feature with that feature occluded (set to the
         # normalised median, 0) across the whole window.
         batch = np.repeat(z[None], self._F + 1, axis=0)
         for j in range(self._F):
             batch[j + 1, :, j] = 0.0
-        lg = forward(self.arch, self.W, self.arch_cfg, batch)
+        lg = self._logits(batch)
         p_long = float(self._cal("long", lg[0, 0]))
         p_short = float(self._cal("short", lg[0, 1]))
         side = 0 if p_long >= p_short else 1

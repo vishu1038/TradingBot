@@ -79,9 +79,9 @@ function tileColor(chg) {
 export function mount(root) {
   root.innerHTML = `
     <div class="page">
-      <div class="card span2"><h3>UNIVERSE <span class="why-sub" id="uni-sub"></span></h3><div class="tbl-wrap"><table class="tbl sortable" id="uni-tbl"></table></div></div>
-      <div class="card"><h3>HEATMAP <span class="why-sub">size = volume (sqrt), colour = 24h %</span></h3><div class="heatmap" id="heatmap"></div></div>
-      <div class="card"><h3>DATA FAULTS <span class="why-sub">debounced: 3 to mature, 5 good cycles to clear</span></h3><div id="faults"></div></div>
+      <div class="card span2 ac-cyan"><h3>UNIVERSE <span class="why-sub" id="uni-sub"></span></h3><div class="tbl-wrap"><table class="tbl sortable" id="uni-tbl"></table></div></div>
+      <div class="card ac-pink"><h3>HEATMAP <span class="why-sub">size = volume (sqrt), colour = 24h %</span></h3><div class="heatmap" id="heatmap"></div></div>
+      <div class="card ac-amber"><h3>DATA FAULTS <span class="why-sub">debounced: 3 to mature, 5 good cycles to clear</span></h3><div id="faults"></div></div>
     </div>`;
   const $ = (id) => root.querySelector(`#${id}`);
   const offs = [];
@@ -145,6 +145,7 @@ export function mount(root) {
   }
 
   function renderFaults() {
+    if (!$('faults')) return;
     const sf = safetyOf(store.get('status'));
     $('faults').innerHTML = sf.present ? faultsTable(sf.faults, (t) => fmtAgo(t, store.serverNow())) : '<div class="empty">no safety data from /api/status yet</div>';
   }
@@ -176,7 +177,8 @@ export function mount(root) {
   const tAll = throttle(renderAll, 1000);
   offs.push(store.on('change:universe', tAll));
   offs.push(store.on('tick', tAll));
-  offs.push(store.on('change:status', throttle(renderFaults, 1000)));
+  const tFaults = throttle(renderFaults, 1000);
+  offs.push(store.on('change:status', tFaults));
   const offRes = observeResize($('heatmap'), () => renderHeat());
   renderAll();
   renderFaults();
@@ -184,6 +186,7 @@ export function mount(root) {
   return () => {
     offs.forEach((o) => o());
     tAll.cancel();
+    tFaults.cancel();
     offRes();
   };
 }

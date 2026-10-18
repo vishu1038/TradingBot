@@ -169,3 +169,23 @@ def drift_firing(p_taken, wins, n: int = 30) -> dict:
     return dict(windows=int(len(z)), frac_z_lt_m2=float((z < -2).mean()), frac_z_lt_m3=float((z < -3).mean()),
                 mean_z=float(z.mean()),
                 mean_gap=float(np.mean(wins) - np.mean(p_taken)))
+
+
+# --------------------------------------------------------------------------------------------
+# the one-line baseline: trade whenever ATR% is in the top q of its training distribution
+# --------------------------------------------------------------------------------------------
+ATR_QUANTS = (0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
+
+
+class AtrRule:
+    """score = empirical CDF of atr_pct under the TRAIN distribution; thresholds are CDF quantiles, so the
+    same trading_table / choose_threshold code evaluates it exactly like the network."""
+
+    def __init__(self, train_atr: np.ndarray):
+        self.ref = np.sort(np.asarray(train_atr, "float64"))
+
+    def score(self, atr_pct: np.ndarray) -> np.ndarray:
+        return np.searchsorted(self.ref, np.asarray(atr_pct, "float64"), side="right") / max(len(self.ref), 1)
+
+    def atr_at(self, q: float) -> float:
+        return float(self.ref[min(int(q * len(self.ref)), len(self.ref) - 1)]) if len(self.ref) else float("nan")

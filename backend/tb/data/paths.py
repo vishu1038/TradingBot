@@ -41,3 +41,11 @@ def metrics_path(symbol: str, root: Path | None = None) -> Path:
 
 def funding_path(symbol: str, root: Path | None = None) -> Path:
     return (root or archive_root()) / "funding" / f"{symbol}.parquet"
+
+
+def depth_path(symbol: str, root: Path | None = None) -> Path:
+    return (root or archive_root()) / "depth" / f"{symbol}.parquet"
+
+
+def depth_meta_path(symbol: str, root: Path | None = None) -> Path:
+    return (root or archive_root()) / "depth_meta" / f"{symbol}.json"

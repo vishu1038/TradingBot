@@ -126,7 +126,7 @@ PAPER_ONLY_MARKER = "PAPER TEST ONLY"
 
 
 def is_paper_only(entry: ModelEntry) -> bool:
-    """Models whose JSON ``note`` contains 'PAPER TEST ONLY' must never run outside paper_local."""
+    """Models whose JSON ``note`` contains 'PAPER TEST ONLY' must never run with real money (live mode); testnet/demo is allowed (user, 2026-10-18)."""
     return PAPER_ONLY_MARKER.lower() in str(entry.meta.get("note", "")).lower()
 
 

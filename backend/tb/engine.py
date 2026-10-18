@@ -255,7 +255,7 @@ class Engine:
         self._models_sig = sig
         entries = scan_models(self.models_path, self.registry.overrides)
         champ = next((e for e in entries if e.status == "champion"), None)
-        if champ and not self.paper and is_paper_only(champ):
+        if champ and self.mode == "live" and is_paper_only(champ):
             log.error("REFUSING to load champion %s in %s mode: its note says 'PAPER TEST ONLY'; running NullScorer",
                       champ.name, self.mode)
             self.scorer, self.model_info = NullScorer(), None
@@ -273,7 +273,7 @@ class Engine:
             if n not in wanted:
                 del self.challengers[n]
         for n, e in wanted.items():
-            if not self.paper and is_paper_only(e):
+            if self.mode == "live" and is_paper_only(e):
                 log.error("REFUSING to load challenger %s in %s mode ('PAPER TEST ONLY')", n, self.mode)
                 continue
             if n not in self.challengers:
@@ -295,7 +295,7 @@ class Engine:
             return f"unknown model {model!r}"
         if e.status == "champion":
             return "already the champion"
-        if not self.paper and is_paper_only(e):
+        if self.mode == "live" and is_paper_only(e):
             return f"{model!r} is marked 'PAPER TEST ONLY' and cannot be promoted in {self.mode} mode"
         champ = self.model_info.name if self.model_info else None
         chal_trades = self.store.get_shadow_trades(model)

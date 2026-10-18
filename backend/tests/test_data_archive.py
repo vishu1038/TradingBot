@@ -224,3 +224,26 @@ def test_default_symbols_are_unique_usdt_perps():
     syms = archive.DEFAULT_SYMBOLS
     assert len(syms) == len(set(syms)) >= 25 and all(s.endswith("USDT") for s in syms)
     assert "1000PEPEUSDT" in syms and "BTCUSDT" in syms
+
+
+def test_universe_symbols_filters_perp_usdt_trading_and_age(monkeypatch):
+    def ob(sym, onboard, quote="USDT", ctype="PERPETUAL", status="TRADING"):
+        return {"symbol": sym, "quoteAsset": quote, "contractType": ctype, "status": status,
+                "onboardDate": archive.to_ms(onboard)}
+
+    syms = [ob("OLDUSDT", dt.date(2023, 1, 1)),
+            ob("EDGEUSDT", dt.date(2024, 10, 31)),             # inside the 24-month month -> included
+            ob("NEWUSDT", dt.date(2024, 11, 1)),               # too young
+            ob("USDCUSDT", dt.date(2023, 1, 1), quote="USDC"),
+            ob("QUARTERUSDT", dt.date(2023, 1, 1), ctype="CURRENT_QUARTER"),
+            ob("DEADUSDT", dt.date(2023, 1, 1), status="SETTLING")]
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"symbols": syms}
+
+    class S:
+        def get(self, *a, **k): return R()
+
+    monkeypatch.setattr(archive, "_session", lambda: S())
+    assert archive.universe_symbols(24, dt.date(2026, 10, 18)) == ["EDGEUSDT", "OLDUSDT"]

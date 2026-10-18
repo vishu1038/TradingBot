@@ -1,17 +1,17 @@
-"""Dataset builder: archive parquet -> features (fp16) + trade labels/outcomes for every bar.
+"""Dataset builder: archive parquet -> features + trade labels + auxiliary targets, stored as memmaps on disk.
 
-Layout of a built ``Dataset`` (all rows of all symbols concatenated, symbol blocks contiguous and
-time-ordered; each symbol block starts after the feature warm-up so every stored row is valid):
+Everything is concatenated over symbols (each symbol block contiguous, time ordered, starting after the
+feature warm-up) and cached under ``var/ml_cache/<key>/`` as .npy so it can be opened with
+``mmap_mode="r"`` - the matrix for 229 symbols x 24 months is several GB and must never be loaded whole.
 
-    X        float16 [N, F]     raw (unnormalised) features
-    t        int64   [N]        bar open_time (ms)
-    sym      int16   [N]        symbol id (index into ``symbols``)
-    pos      int32   [N]        row position inside the symbol block (windows need pos >= WINDOW-1)
-    lab[k]   float32 [N]        k in {fixed_long, fixed_short, atr_long, atr_short}: 1 / 0 / NaN
-    pnl[k]   float32 [N]        net USD per trade for the same k
-    off[k]   int32   [N]        bars until the trade closed (for de-overlapping)
+    X     float16 [N, F]    raw (unnormalised) features
+    t     int64   [N]       bar open_time (ms)          sym int16 [N] symbol id    pos int32 [N] row in block
+    lab   int8    [K, N]    1 TP first / 0 SL-first-or-timeout / -1 n.a.      (K = len(MODES) * 2 label keys)
+    pnl   float16 [K, N]    net USD per trade           off uint16 [K, N] bars until the trade closed (0 = n.a.)
+    aux   float16 [3, N]    fvol, up_exc, dn_exc (tb.labels.aux_targets), NaN where n.a.
 
-Cached under ``var/ml_cache/<key>/`` as .npy files so big arrays can be np.memmap'ed.
+Label/aux storage is column-major ([K, N]) so one label column is one contiguous read.  Access goes through
+``ds.lab[key]`` etc.: ``col[rows]`` returns float32 (lab: NaN for n.a.) / int32 (off).
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,22 +31,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from tb import features as ft  # noqa: E402
-from tb.labels import full_cfg, simulate_trades  # noqa: E402
+from tb.labels import AUX_NAMES, aux_targets, full_cfg, simulate_trades  # noqa: E402
 
-# Label horizon: the live template has no time stop (a trade runs to TP/SL), so labels must look far enough
-# ahead that "timeout" is rare for the 5/10 USD fixed exit (3.1 % / 6.25 % barriers).  With the contract's
-# default of 288 bars (24 h) ~70 % of fixed-exit trades time out and the label degenerates into a
-# volatility detector.  4 days keeps timeouts small; the walk-forward purge gap is horizon + window.
+# Label horizon: the live template has no time stop, so labels must look far enough ahead that "timeout" is
+# rare for the 5/10 USD fixed exit (3.1 % / 6.25 % barriers).  With the contract's default of 288 bars (24 h)
+# ~70 % of fixed-exit trades time out and the label degenerates into a volatility detector.  4 days keeps
+# timeouts ~10 %; the walk-forward purge gap is horizon + window.
 HORIZON = 1152
 # exit configurations ("modes"): name -> overrides of tb.labels.DEFAULT_EXIT_CFG
 EXIT_SETS = {
     "fixed": {"exit_mode": "fixed"},                                     # TP +5 USD / SL -10 USD
-    "atr": {"exit_mode": "atr", "tp_atr": 1.5, "sl_atr": 1.0},           # template default
+    "atr": {"exit_mode": "atr", "tp_atr": 1.5, "sl_atr": 1.0},           # template default (break-even unreachable)
     "atr32": {"exit_mode": "atr", "tp_atr": 3.0, "sl_atr": 2.0},
     "atr63": {"exit_mode": "atr", "tp_atr": 6.0, "sl_atr": 3.0},
 }
-MODES = tuple(EXIT_SETS)
+DEFAULT_MODES = ("fixed", "atr32", "atr63")
 SIDES = ("long", "short")
+MODES = DEFAULT_MODES
 KEYS = [f"{m}_{s}" for m in MODES for s in SIDES]
 
 
@@ -91,6 +93,39 @@ def list_symbols(root: Path | None = None) -> list[str]:
     return sorted(p.stem for p in (root / "klines" / "5m").glob("*.parquet"))
 
 
+# --------------------------------------------------------------------------------------------
+class Col:
+    """One column of a [K, N] memmap; ``col[rows]`` -> float32 (lab/pnl/aux) or int32 (off)."""
+
+    def __init__(self, arr, j: int, kind: str):
+        self.arr, self.j, self.kind = arr, j, kind
+
+    def __len__(self):
+        return self.arr.shape[1]
+
+    def __getitem__(self, sel):
+        v = np.asarray(self.arr[self.j][sel])
+        if self.kind == "lab":
+            out = v.astype("float32")
+            out[v < 0] = np.nan
+            return out
+        if self.kind == "off":
+            return v.astype("int32")
+        return v.astype("float32")
+
+    def valid(self, sel=slice(None)) -> np.ndarray:
+        """bool: label available (lab >= 0)."""
+        return np.asarray(self.arr[self.j][sel]) >= 0
+
+
+class _Cols:
+    def __init__(self, arr, names, kind):
+        self.arr, self.names, self.kind = arr, list(names), kind
+
+    def __getitem__(self, key: str) -> Col:
+        return Col(self.arr, self.names.index(key), self.kind)
+
+
 @dataclass
 class Dataset:
     symbols: list[str]
@@ -98,142 +133,188 @@ class Dataset:
     t: np.ndarray
     sym: np.ndarray
     pos: np.ndarray
-    lab: dict[str, np.ndarray]
-    pnl: dict[str, np.ndarray]
-    off: dict[str, np.ndarray]
+    lab: _Cols
+    pnl: _Cols
+    off: _Cols
+    aux: _Cols
     meta: dict = field(default_factory=dict)
 
     def __len__(self):
         return len(self.t)
 
     @property
-    def sample_ok(self) -> np.ndarray:
-        """rows that can be the last bar of a full WINDOW inside their symbol block."""
-        return self.pos >= ft.WINDOW - 1
+    def n_feat(self) -> int:
+        return int(self.X.shape[1])
+
+    @property
+    def feature_names(self) -> list[str]:
+        return list(self.meta.get("feature_names", ft.FEATURE_NAMES))
+
+    @property
+    def groups(self) -> list[str]:
+        return list(self.meta.get("groups", []))
+
+    def sample_ok_at(self, rows) -> np.ndarray:
+        return np.asarray(self.pos[rows]) >= ft.WINDOW - 1
+
+    def any_label(self, mode: str, rows) -> np.ndarray:
+        return self.lab[f"{mode}_long"].valid(rows) | self.lab[f"{mode}_short"].valid(rows)
 
 
-def _cache_key(symbols, root, cfgs, horizon) -> str:
+# --------------------------------------------------------------------------------------------
+def _cache_key(symbols, root, cfgs, horizon, groups) -> str:
     h = hashlib.sha1()
-    h.update(json.dumps([symbols, str(root), cfgs, horizon, ft.FEATURE_NAMES, ft.WARMUP], sort_keys=True,
-                        default=str).encode())
+    h.update(json.dumps([symbols, str(root), cfgs, horizon, ft.feature_names(groups) if groups else ft.FEATURE_NAMES,
+                         list(groups), ft.WARMUP, list(AUX_NAMES), list(MODES)], sort_keys=True, default=str).encode())
     for s in symbols:
-        for sub in (f"klines/5m/{s}.parquet", f"metrics/{s}.parquet", f"funding/{s}.parquet"):
+        for sub in (f"klines/5m/{s}.parquet", f"metrics/{s}.parquet", f"funding/{s}.parquet", f"depth/{s}.parquet"):
             p = Path(root) / sub
-            h.update(f"{sub}:{p.stat().st_size if p.exists() else -1}:{int(p.stat().st_mtime) if p.exists() else 0}".encode())
+            if sub.startswith("depth") and "depth" not in groups:
+                continue
+            h.update(f"{sub}:{p.stat().st_size if p.exists() else -1}".encode())
     return h.hexdigest()[:16]
 
 
 def _build_one(job) -> dict:
-    """Features + labels for one symbol (runs in a worker process; numpy/pandas only, no torch)."""
-    sym, root, cfgs, horizon = job
+    """Features + labels for one symbol (runs in a worker process; numpy/pandas only, no torch).  Saves the
+    result as an .npz part file and returns its small header."""
+    sym, root, cfgs, horizon, groups, part_path = job
     root = Path(root)
     kl, m, f = load_symbol(sym, root)
     btc = load_symbol("BTCUSDT", root)[0] if (root / "klines" / "5m" / "BTCUSDT.parquet").exists() else None
     kl = ft.regularize(kl)
     if len(kl) < ft.WARMUP + 2 * ft.WINDOW + horizon:
-        return dict(name=sym, skip=True, bars=len(kl), t=np.zeros(0))
-    x = ft.build_features(kl, m, f, btc)
-    lab, pnl, off = {}, {}, {}
+        return dict(name=sym, skip=True, bars=len(kl), n=0)
+    extra = {}
+    if "depth" in groups:
+        from tb import features_depth  # noqa: F401  (registers the group)
+        extra["depth"] = _read(root / "depth" / f"{sym}.parquet")
+    x = ft.build_features(kl, m, f, btc, groups=list(groups), extra_data=extra)
+    lab, pnl, off = [], [], []
     for mode in MODES:
         for side in SIDES:
             sim = simulate_trades(kl, side, cfgs[mode], horizon)
-            lab[f"{mode}_{side}"] = sim["label"]
-            pnl[f"{mode}_{side}"] = sim["pnl_usd"]
-            off[f"{mode}_{side}"] = sim["exit_off"]
+            lab.append(np.where(np.isnan(sim["label"]), -1, sim["label"]).astype("int8"))
+            pnl.append(sim["pnl_usd"].astype("float16"))
+            off.append(sim["exit_off"].astype("uint16"))
+    ax = aux_targets(kl)
+    aux = np.stack([ax[k] for k in AUX_NAMES]).astype("float16")
     sl = slice(ft.WARMUP, None)
     n = len(kl) - ft.WARMUP
-    return dict(name=sym, no_metrics=m is None, X=x[sl].astype("float16"), t=kl["open_time"].to_numpy("int64")[sl],
-                pos=np.arange(n, dtype="int32"), lab={k: v[sl] for k, v in lab.items()},
-                pnl={k: v[sl] for k, v in pnl.items()}, off={k: v[sl] for k, v in off.items()})
+    np.savez(part_path, X=x[sl].astype("float16"), t=kl["open_time"].to_numpy("int64")[sl],
+             lab=np.stack(lab)[:, sl], pnl=np.stack(pnl)[:, sl], off=np.stack(off)[:, sl], aux=aux[:, sl])
+    return dict(name=sym, skip=False, n=n, no_metrics=m is None,
+                has_depth=("depth" in extra and extra["depth"] is not None))
+
+
+def _assemble(headers: list[dict], part_dir: Path, cdir: Path, meta: dict, log=print) -> None:
+    """Concatenate part files into memmapped .npy files in ``cdir`` (one pass, bounded RAM)."""
+    ok = [h for h in headers if not h["skip"]]
+    total = sum(h["n"] for h in ok)
+    nf = len(meta["feature_names"])
+    K = len(KEYS)
+    cdir.mkdir(parents=True, exist_ok=True)
+    mm = np.lib.format.open_memmap
+    X = mm(cdir / "X.npy", "w+", np.float16, (total, nf))
+    t = mm(cdir / "t.npy", "w+", np.int64, (total,))
+    sym = mm(cdir / "sym.npy", "w+", np.int16, (total,))
+    pos = mm(cdir / "pos.npy", "w+", np.int32, (total,))
+    lab = mm(cdir / "lab.npy", "w+", np.int8, (K, total))
+    pnl = mm(cdir / "pnl.npy", "w+", np.float16, (K, total))
+    off = mm(cdir / "off.npy", "w+", np.uint16, (K, total))
+    aux = mm(cdir / "aux.npy", "w+", np.float16, (len(AUX_NAMES), total))
+    r = 0
+    for si, h in enumerate(ok):
+        with np.load(part_dir / f"{h['name']}.npz") as z:
+            n = h["n"]
+            X[r:r + n] = z["X"]
+            t[r:r + n] = z["t"]
+            sym[r:r + n] = si
+            pos[r:r + n] = np.arange(n, dtype="int32")
+            lab[:, r:r + n] = z["lab"]
+            pnl[:, r:r + n] = z["pnl"]
+            off[:, r:r + n] = z["off"]
+            aux[:, r:r + n] = z["aux"]
+        r += n
+    for a in (X, t, sym, pos, lab, pnl, off, aux):
+        a.flush()
+    meta = dict(meta, symbols=[h["name"] for h in ok], rows=int(total),
+                symbols_without_metrics=[h["name"] for h in ok if h.get("no_metrics")],
+                symbols_without_depth=[h["name"] for h in ok if "depth" in meta["groups"] and not h.get("has_depth")],
+                skipped=[h["name"] for h in headers if h["skip"]], keys=KEYS, aux_names=list(AUX_NAMES),
+                built_at=int(time.time()))
+    (cdir / "meta.json").write_text(json.dumps(meta, default=str))
+    log(f"[dataset] assembled {total} rows x {nf} features, {len(ok)} symbols -> {cdir}")
+
+
+def load_cached(cdir: Path) -> Dataset:
+    meta = json.loads((cdir / "meta.json").read_text())
+    ld = lambda n: np.load(cdir / f"{n}.npy", mmap_mode="r")  # noqa: E731
+    lab, pnl, off, aux = ld("lab"), ld("pnl"), ld("off"), ld("aux")
+    keys = meta["keys"]
+    return Dataset(symbols=meta["symbols"], X=ld("X"), t=ld("t"), sym=ld("sym"), pos=ld("pos"),
+                   lab=_Cols(lab, keys, "lab"), pnl=_Cols(pnl, keys, "pnl"), off=_Cols(off, keys, "off"),
+                   aux=_Cols(aux, meta["aux_names"], "aux"), meta=meta)
 
 
 def build_dataset(symbols: list[str] | None = None, root: Path | None = None, exit_cfgs: dict | None = None,
-                  horizon: int = HORIZON, use_cache: bool = True, mmap: bool = False, log=print) -> Dataset:
+                  horizon: int = HORIZON, use_cache: bool = True, groups=(), log=print, workers: int | None = None
+                  ) -> Dataset:
     root = Path(root or archive_root())
     symbols = symbols or list_symbols(root)
+    groups = tuple(groups)
     cfgs = {m: dict(full_cfg({**EXIT_SETS[m], **(exit_cfgs or {}).get(m, {})})) for m in MODES}
-    key = _cache_key(symbols, root, cfgs, horizon)
+    key = _cache_key(symbols, root, cfgs, horizon, groups)
     cdir = var_dir() / "ml_cache" / key
     if use_cache and (cdir / "meta.json").exists():
         log(f"[dataset] cache hit {cdir}")
-        return load_cached(cdir, mmap=mmap)
-
+        return load_cached(cdir)
+    if "depth" in groups:
+        from tb import features_depth  # noqa: F401
     t0 = time.time()
-    jobs = [(s_, str(root), cfgs, horizon) for s_ in symbols]
-    parts_raw = []
-    workers = int(os.environ.get("TB_DS_WORKERS", min(3, max(1, (os.cpu_count() or 2) - 2))))
+    part_dir = var_dir() / "ml_cache" / f"parts-{key}"
+    part_dir.mkdir(parents=True, exist_ok=True)
+    jobs = [(s_, str(root), cfgs, horizon, groups, str(part_dir / f"{s_}.npz")) for s_ in symbols]
+    workers = workers or int(os.environ.get("TB_DS_WORKERS", min(3, max(1, (os.cpu_count() or 2) - 2))))
+    headers = []
     if workers > 1 and len(jobs) > 1:
         import concurrent.futures as cf
         import multiprocessing as mp
         with cf.ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as ex:
-            for r in ex.map(_build_one, jobs):
-                parts_raw.append(r)
-                log(f"[dataset] {r['name']}: {len(r['t'])} rows ({time.time() - t0:.0f}s)")
+            for i, h in enumerate(ex.map(_build_one, jobs)):
+                headers.append(h)
+                if i % 10 == 0 or i == len(jobs) - 1:
+                    log(f"[dataset] {i + 1}/{len(jobs)} {h['name']} ({time.time() - t0:.0f}s)")
     else:
-        for j in jobs:
-            r = _build_one(j)
-            parts_raw.append(r)
-            log(f"[dataset] {r['name']}: {len(r['t'])} rows ({time.time() - t0:.0f}s)")
-    parts, no_metrics = [], []
-    for r in parts_raw:
-        if r.get("skip"):
-            log(f"[dataset] skip {r['name']}: only {r['bars']} bars")
-            continue
-        if r["no_metrics"]:
-            no_metrics.append(r["name"])
-        r["sym"] = np.full(len(r["t"]), len(parts), dtype="int16")
-        parts.append(r)
-    names = [p["name"] for p in parts]
-    cat = lambda k: np.concatenate([p[k] for p in parts])  # noqa: E731
-    ds = Dataset(
-        symbols=names, X=cat("X"), t=cat("t"), sym=cat("sym"), pos=cat("pos"),
-        lab={k: np.concatenate([p["lab"][k] for p in parts]) for k in KEYS},
-        pnl={k: np.concatenate([p["pnl"][k] for p in parts]) for k in KEYS},
-        off={k: np.concatenate([p["off"][k] for p in parts]) for k in KEYS},
-        meta=dict(exit_cfgs=cfgs, horizon=horizon, feature_names=ft.FEATURE_NAMES, window=ft.WINDOW,
-                  warmup=ft.WARMUP, symbols_without_metrics=no_metrics, built_at=int(time.time())))
-    if no_metrics:
-        log(f"[dataset] WARNING: no metrics archive for {len(no_metrics)} symbols (derivative features = 0): "
-            f"{no_metrics[:6]}...")
-    if use_cache:
-        save_cached(ds, cdir)
-    log(f"[dataset] built {len(ds)} rows x {ft.F} features for {len(names)} symbols in {time.time() - t0:.0f}s")
+        for i, j in enumerate(jobs):
+            headers.append(_build_one(j))
+            if i % 10 == 0 or i == len(jobs) - 1:
+                log(f"[dataset] {i + 1}/{len(jobs)} {headers[-1]['name']} ({time.time() - t0:.0f}s)")
+    meta = dict(exit_cfgs=cfgs, horizon=horizon, feature_names=ft.feature_names(groups), groups=list(groups),
+                window=ft.WINDOW, warmup=ft.WARMUP)
+    _assemble(headers, part_dir, cdir, meta, log)
+    for p in part_dir.glob("*.npz"):
+        p.unlink()
+    part_dir.rmdir()
+    ds = load_cached(cdir)
+    if ds.meta["symbols_without_metrics"]:
+        log(f"[dataset] WARNING: no metrics archive for {len(ds.meta['symbols_without_metrics'])} symbols")
+    if "depth" in groups:
+        log(f"[dataset] {len(ds.meta['symbols_without_depth'])} symbols without depth data (flag has_depth = 0)")
+    log(f"[dataset] built in {time.time() - t0:.0f}s")
     return ds
-
-
-def save_cached(ds: Dataset, cdir: Path) -> None:
-    cdir.mkdir(parents=True, exist_ok=True)
-    for name in ("X", "t", "sym", "pos"):
-        np.save(cdir / f"{name}.npy", getattr(ds, name))
-    for k in KEYS:
-        np.save(cdir / f"lab_{k}.npy", ds.lab[k])
-        np.save(cdir / f"pnl_{k}.npy", ds.pnl[k])
-        np.save(cdir / f"off_{k}.npy", ds.off[k])
-    meta = dict(ds.meta, symbols=ds.symbols)
-    (cdir / "meta.json").write_text(json.dumps(meta, default=str))
-
-
-def load_cached(cdir: Path, mmap: bool = False) -> Dataset:
-    mm = "r" if mmap else None
-    meta = json.loads((cdir / "meta.json").read_text())
-    ld = lambda n: np.load(cdir / f"{n}.npy", mmap_mode=mm)  # noqa: E731
-    return Dataset(symbols=meta.pop("symbols"), X=ld("X"), t=np.load(cdir / "t.npy"), sym=np.load(cdir / "sym.npy"),
-                   pos=np.load(cdir / "pos.npy"), lab={k: np.load(cdir / f"lab_{k}.npy") for k in KEYS},
-                   pnl={k: np.load(cdir / f"pnl_{k}.npy") for k in KEYS},
-                   off={k: np.load(cdir / f"off_{k}.npy") for k in KEYS}, meta=meta)
 
 
 def free_memory_bytes() -> int:
     try:
         import subprocess
         out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
-        page = 4096
         vals = {}
         for line in out.splitlines():
             if ":" in line and "page size" not in line:
                 k, v = line.split(":")
                 vals[k.strip()] = int(v.strip().rstrip("."))
-        return (vals.get("Pages free", 0) + vals.get("Pages inactive", 0) + vals.get("Pages speculative", 0)) * page
+        return (vals.get("Pages free", 0) + vals.get("Pages inactive", 0) + vals.get("Pages speculative", 0)) * 4096
     except Exception:
         return 4 << 30
 
@@ -243,31 +324,40 @@ def ram_budget_bytes() -> int:
     return int(min(8 << 30, 0.5 * free_memory_bytes()))
 
 
-def synthetic_dataset(n_symbols=4, n=6000, seed=0, planted_edge=0.0, exit_cfgs=None, horizon=HORIZON) -> Dataset:
-    """Dataset built from ml/synth.py frames (no archive needed), for smoke tests."""
+def synthetic_dataset(n_symbols=4, n=6000, seed=0, planted_edge=0.0, exit_cfgs=None, horizon=HORIZON,
+                      groups=(), depth_cov=1.0) -> Dataset:
+    """Dataset from ml/synth.py frames (no archive needed), for smoke tests.  Written to a temp cache dir."""
     sys.path.insert(0, str(ROOT / "ml"))
-    from synth import make_market, make_symbol
+    from synth import make_depth, make_market, make_symbol
+    groups = tuple(groups)
+    if "depth" in groups:
+        from tb import features_depth  # noqa: F401
     cfgs = {m: dict(full_cfg({**EXIT_SETS[m], **(exit_cfgs or {}).get(m, {})})) for m in MODES}
+    cdir = Path(tempfile.mkdtemp(prefix="tb_synth_ds_"))
+    part_dir = cdir / "parts"
+    part_dir.mkdir()
     btc, _, _ = make_symbol(n, seed=1000, start_price=30000.0)
     mk = make_market(n)
-    parts = []
+    headers = []
     for i in range(n_symbols):
         kl, m, f = make_symbol(n, seed=seed + i, market=mk, planted_edge=planted_edge)
-        x = ft.build_features(kl, m, f, btc)
-        sl = slice(ft.WARMUP, None)
-        k = len(kl) - ft.WARMUP
-        lab, pnl, off = {}, {}, {}
+        extra = {"depth": make_depth(kl, seed + i, cov=depth_cov)} if "depth" in groups else {}
+        x = ft.build_features(kl, m, f, btc, groups=list(groups), extra_data=extra)
+        lab, pnl, off = [], [], []
         for mode in MODES:
             for side in SIDES:
                 sim = simulate_trades(kl, side, cfgs[mode], horizon)
-                lab[f"{mode}_{side}"], pnl[f"{mode}_{side}"], off[f"{mode}_{side}"] = (
-                    sim["label"][sl], sim["pnl_usd"][sl], sim["exit_off"][sl])
-        parts.append(dict(X=x[sl].astype("float16"), t=kl["open_time"].to_numpy()[sl],
-                          sym=np.full(k, i, "int16"), pos=np.arange(k, dtype="int32"), lab=lab, pnl=pnl, off=off))
-    cat = lambda k_: np.concatenate([p[k_] for p in parts])  # noqa: E731
-    return Dataset(symbols=[f"SYN{i}USDT" for i in range(n_symbols)], X=cat("X"), t=cat("t"), sym=cat("sym"),
-                   pos=cat("pos"), lab={k_: np.concatenate([p["lab"][k_] for p in parts]) for k_ in KEYS},
-                   pnl={k_: np.concatenate([p["pnl"][k_] for p in parts]) for k_ in KEYS},
-                   off={k_: np.concatenate([p["off"][k_] for p in parts]) for k_ in KEYS},
-                   meta=dict(exit_cfgs=cfgs, horizon=horizon, feature_names=ft.FEATURE_NAMES, window=ft.WINDOW,
-                             warmup=ft.WARMUP, synthetic=True))
+                lab.append(np.where(np.isnan(sim["label"]), -1, sim["label"]).astype("int8"))
+                pnl.append(sim["pnl_usd"].astype("float16"))
+                off.append(sim["exit_off"].astype("uint16"))
+        ax = aux_targets(kl)
+        sl = slice(ft.WARMUP, None)
+        name = f"SYN{i}USDT"
+        np.savez(part_dir / f"{name}.npz", X=x[sl].astype("float16"), t=kl["open_time"].to_numpy("int64")[sl],
+                 lab=np.stack(lab)[:, sl], pnl=np.stack(pnl)[:, sl], off=np.stack(off)[:, sl],
+                 aux=np.stack([ax[k] for k in AUX_NAMES]).astype("float16")[:, sl])
+        headers.append(dict(name=name, skip=False, n=len(kl) - ft.WARMUP, no_metrics=False, has_depth=bool(extra)))
+    meta = dict(exit_cfgs=cfgs, horizon=horizon, feature_names=ft.feature_names(groups), groups=list(groups),
+                window=ft.WINDOW, warmup=ft.WARMUP, synthetic=True)
+    _assemble(headers, part_dir, cdir, meta, lambda *a: None)
+    return load_cached(cdir)

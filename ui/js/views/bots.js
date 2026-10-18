@@ -39,13 +39,13 @@ function curveSvg(dd, limit, mult) {
 export function mount(root) {
   root.innerHTML = `
     <div class="page bots">
-      <div class="card span2"><h3>EQUITY <span class="why-sub" id="eq-sub"></span></h3><div class="line-chart tall" id="eq-chart"></div></div>
-      <div class="card"><h3>STATS</h3><div id="bot-tiles"></div></div>
-      <div class="card"><h3>DRAWDOWN</h3><div class="line-chart" id="dd-chart"></div></div>
-      <div class="card"><h3>MODEL</h3><div id="model-card"></div></div>
-      <div class="card"><h3>RISK GOVERNOR <span class="why-sub">drawdown derating + drift</span></h3><div id="risk-card"></div></div>
-      <div class="card span2"><h3>SHADOW MODELS <span class="why-sub">challengers score every bar; promote needs ≥ 50 shadow trades + higher expectancy + no drift alarm</span></h3><div id="shadow-card"></div></div>
-      <div class="card"><h3>CONTROLS</h3><div id="ctl-card"></div></div>
+      <div class="card span2 ac-coral"><h3>EQUITY <span class="why-sub" id="eq-sub"></span></h3><div class="line-chart tall" id="eq-chart"></div></div>
+      <div class="card ac-violet"><h3>STATS</h3><div id="bot-tiles"></div></div>
+      <div class="card ac-cyan"><h3>DRAWDOWN</h3><div class="line-chart" id="dd-chart"></div></div>
+      <div class="card ac-pink"><h3>MODEL</h3><div id="model-card"></div></div>
+      <div class="card ac-amber"><h3>RISK GOVERNOR <span class="why-sub">drawdown derating + drift</span></h3><div id="risk-card"></div></div>
+      <div class="card span2 ac-sky"><h3>SHADOW MODELS <span class="why-sub">challengers score every bar; promote needs ≥ 50 shadow trades + higher expectancy + no drift alarm</span></h3><div id="shadow-card"></div></div>
+      <div class="card ac-teal"><h3>CONTROLS</h3><div id="ctl-card"></div></div>
     </div>`;
   const $ = (id) => root.querySelector(`#${id}`);
   const offs = [];

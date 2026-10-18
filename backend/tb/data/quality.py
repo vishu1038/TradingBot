@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from . import loader
-from .paths import BAR_MS, archive_root
+from .paths import BAR_MS, archive_root, depth_meta_path
 
 MAX_RET_FLOOR = 0.15
 ATR_MULT = 8.0
@@ -137,6 +137,32 @@ def quality_report(symbol: str, root: Path | None = None, now_ms: int | None = N
         rep["funding_abs_max"] = float(fu["funding_rate"].abs().max())
     else:
         rep["funding_rows"] = 0
+    # depth (order book) sanity
+    dp = loader.load_depth(symbol, root)
+    rep["depth_rows"] = int(len(dp))
+    if len(dp):
+        dt_ = dp["open_time"].to_numpy()
+        lo, hi = int(dt_[0]), int(dt_[-1])
+        in_range = int(((t >= lo) & (t <= hi)).sum())
+        rep["depth_first"], rep["depth_last"] = lo, hi
+        rep["depth_coverage"] = float(len(dp) / max(1, in_range))      # share of klines bars (in range) with a snapshot
+        dd = np.diff(dt_)
+        rep["depth_gaps_over_1h"] = int((dd > 12 * BAR_MS).sum())
+        rep["depth_unsorted_or_duplicate"] = int((dd <= 0).sum())
+        rep["depth_low_snap_bars"] = int((dp["snap_count"] < 3).sum())        # normal bar holds ~10 snapshots
+        bn, an = dp["bid_notional_1"].to_numpy("float64"), dp["ask_notional_1"].to_numpy("float64")
+        rep["depth_nonpositive_rows"] = int((np.nan_to_num(bn, nan=1.0) <= 0).sum() + (np.nan_to_num(an, nan=1.0) <= 0).sum())
+        rep["depth_missing_1pct_rows"] = int((np.isnan(bn) | np.isnan(an)).sum())
+        # nested bands must be monotone: notional within 5 % >= within 1 % (same side)
+        b5, a5 = dp["bid_notional_5"].to_numpy("float64"), dp["ask_notional_5"].to_numpy("float64")
+        with np.errstate(invalid="ignore"):
+            rep["depth_nonmonotone_rows"] = int(((b5 < bn * 0.999) | (a5 < an * 0.999)).sum())
+        meta = depth_meta_path(symbol, root)
+        if meta.exists():
+            import json
+            m = json.loads(meta.read_text())
+            rep["depth_missing_days"] = len(m.get("missing_days", []))
+            rep["depth_has_02_band"] = m.get("has_02_band")
     rep["ok"] = bool(rep["unsorted_or_duplicate"] == 0 and rep["bad_ohlc"] == 0
                      and rep["big_move"] == 0 and rep["gaps"] == 0)
     return rep

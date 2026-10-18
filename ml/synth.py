@@ -65,3 +65,27 @@ def make_symbol(n: int = 3000, seed: int = 0, start_price: float = 100.0, t0: in
 def make_market(n: int, seed: int = 99) -> np.ndarray:
     rng = np.random.default_rng(seed)
     return 0.001 * rng.standard_normal(n)
+
+
+def make_depth(kl: pd.DataFrame, seed: int = 0, cov: float = 1.0) -> pd.DataFrame:
+    """Wide 5m order-book depth frame (cumulative bid/ask notional at 0.2/1/2/3/4/5 %); ``cov`` < 1 drops
+    that fraction of buckets in a few contiguous holes."""
+    rng = np.random.default_rng(seed + 777)
+    t = kl["open_time"].to_numpy("int64")
+    base = 1e6 * np.exp(np.cumsum(0.01 * rng.standard_normal(len(t))))
+    rows = {}
+    for s in ("bid", "ask"):
+        cum = np.cumsum(np.stack([base * (0.3 + 0.2 * k) * np.exp(0.2 * rng.standard_normal(len(t))) for k in range(6)], axis=1), axis=1)
+        for k, b in enumerate((0.2, 1, 2, 3, 4, 5)):
+            rows[f"{s}_{b:g}"] = cum[:, k]
+    df = pd.DataFrame({"open_time": t, **rows})
+    if cov < 1.0:
+        keep = np.ones(len(t), bool)
+        n_drop = int((1 - cov) * len(t))
+        while n_drop > 0:
+            L = min(n_drop, int(rng.integers(50, 600)))
+            s0 = int(rng.integers(0, len(t) - L))
+            keep[s0:s0 + L] = False
+            n_drop -= L
+        df = df[keep].reset_index(drop=True)
+    return df

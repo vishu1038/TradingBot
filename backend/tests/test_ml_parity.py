@@ -55,3 +55,21 @@ def test_numpy_matches_mps_large_weights(arch):
     got = mnp.forward(arch, M.export_state(net), cfg, x)
     scale = max(1.0, np.abs(want).max())
     assert np.abs(got - want).max() <= 1e-4 * scale
+
+
+@pytest.mark.parametrize("arch", ["cnn", "gru", "transformer"])
+def test_numpy_matches_mps_multitask_head(arch):
+    """Auxiliary-head nets (n_out = 7): all seven outputs agree, and the scorer uses columns 0/1 only."""
+    torch.manual_seed(2)
+    net, cfg = M.build(arch, ft.F, ft.WINDOW, {"n_out": 7})
+    net = net.to("mps").eval()
+    with torch.no_grad():
+        for name, p in net.named_parameters():
+            if "ln" not in name:
+                p.add_(0.05 * torch.randn_like(p))
+    x = np.random.default_rng(8).standard_normal((20, ft.WINDOW, ft.F)).astype("float32")
+    with torch.no_grad():
+        want = net(torch.from_numpy(x).to("mps")).to("cpu").numpy().astype("float64")
+    got = mnp.forward(arch, M.export_state(net), cfg, x)
+    assert got.shape == want.shape == (20, 7)
+    assert np.abs(got - want).max() <= 1e-4

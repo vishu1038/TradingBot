@@ -36,8 +36,35 @@ async function loadSymbol(sym) {
   }
   if (s) {
     store.get('signals')[sym] = s;
+    if (s.length) store.get('brain')[sym] = s[s.length - 1];
     store.emit('signals_loaded', { symbol: sym });
   }
+}
+
+/** Order book is best-effort: a 404 (backend without /api/orderbook yet) is a normal state, not an error. */
+export async function loadOrderbook(sym) {
+  if (!sym) return;
+  try {
+    const ob = await api.orderbook(sym);
+    if (ob && Array.isArray(ob.bands)) {
+      store.get('orderbook')[sym] = ob;
+      store.get('orderbookState')[sym] = 'ok';
+    } else store.get('orderbookState')[sym] = 'unavailable';
+  } catch (_) {
+    store.get('orderbookState')[sym] = 'unavailable';
+  }
+  store.emit('orderbook', { symbol: sym });
+}
+
+/** Latest model signal for every universe symbol (feeds the symbol bar probs + hero "bot brain"). */
+export async function loadBrain() {
+  const syms = store.get('universe').map((u) => u.symbol);
+  const res = await Promise.all(syms.map((s) => safe(api.signals(s, 2), `signals ${s}`)));
+  const brain = store.get('brain');
+  res.forEach((r, i) => {
+    if (r && r.length) brain[syms[i]] = r[r.length - 1];
+  });
+  store.emit('brain', null);
 }
 
 export function selectSymbol(sym) {
@@ -45,6 +72,7 @@ export function selectSymbol(sym) {
   store.set('symbol', sym);
   store.set('selectedPosition', null);
   loadSymbol(sym);
+  loadOrderbook(sym);
 }
 
 const refetchTrades = debounce(async () => {
@@ -77,6 +105,8 @@ function upsertCandle(sym, c) {
 }
 
 function upsertSignal(s) {
+  store.get('brain')[s.symbol] = s;
+  store.emit('brain', s.symbol);
   const arr = store.get('signals')[s.symbol];
   if (!arr) return;
   const last = arr[arr.length - 1];
@@ -185,6 +215,7 @@ function handle(m) {
     case 'kill': {
       const st = store.get('status');
       if (st) store.set('status', { ...st, kill: d });
+      store.emit('kill', d);
       if (d && d.tripped) {
         fx.flash('kill');
         sound.play('kill');
@@ -192,6 +223,13 @@ function handle(m) {
       }
       break;
     }
+    case 'orderbook':
+      if (d && d.symbol && Array.isArray(d.bands)) {
+        store.get('orderbook')[d.symbol] = d;
+        store.get('orderbookState')[d.symbol] = 'ok';
+        store.emit('orderbook', { symbol: d.symbol });
+      }
+      break;
     case 'shadow_trade':
       store.emit('shadow_trade', d);
       refetchShadow();
@@ -249,6 +287,8 @@ export async function startSync() {
     store.set('symbol', first);
   }
   await loadSymbol(store.get('symbol'));
+  loadOrderbook(store.get('symbol'));
+  loadBrain();
 
   wsHandle = api.connect(handle, (s) => store.patch('conn', { ws: s }));
 
@@ -273,6 +313,8 @@ export async function startSync() {
   }, 6000);
   poll(refetchTrades, 30000);
   poll(refetchShadow, 15000);
+  poll(loadBrain, 20000);
+  poll(() => loadOrderbook(store.get('symbol')), 8000);
   poll(async () => {
     const e = await safe(api.equity(2000), 'equity');
     if (e) store.set('equity', e);

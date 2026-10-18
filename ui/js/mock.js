@@ -122,6 +122,7 @@ export class MockServer {
     this.challenger = { model: 'cnn1d-5m@0.4.0-rc', name: 'cnn1d-5m (mock)', version: '0.4.0-rc', trades: [] };
     this.retired = [{ model: 'cnn1d-5m@0.2.9', n_trades: 212, win_rate: 0.47, expectancy: -0.03, pnl: -6.4 }];
     this.faults = [];
+    this.paused = new Set();
     this.flattenUntil = 0;
     this.lastSafetyKey = '';
 
@@ -513,6 +514,8 @@ export class MockServer {
     const dir = p.side === 'long' ? 1 : -1;
     const gross = (price - p.entry_price) * p.qty * dir;
     const fees = this.settings.fee_taker * p.qty * (p.entry_price + price);
+    // funding is a COST (positive = paid): longs pay when the rate is positive
+    const funding = +(p.notional * this.syms[p.symbol].fund * ((this.now - p.opened_at) / 28800) * dir).toFixed(4);
     const trade = {
       id: p.id,
       symbol: p.symbol,
@@ -522,9 +525,9 @@ export class MockServer {
       qty: p.qty,
       opened_at: p.opened_at,
       closed_at: this.now,
-      pnl: +(gross - fees).toFixed(4), // NET of fees (see ui/README note: pnl is what the UI sums)
+      pnl: +(gross - fees - funding).toFixed(4), // NET realised: gross - fees - funding (contract)
       fees: +fees.toFixed(4),
-      funding: 0,
+      funding,
       exit_reason: reason,
       prob: p.prob,
     };
@@ -621,6 +624,8 @@ export class MockServer {
         threshold_short: st.prob_threshold_short,
       },
       universe_updated_at: this.lastUniverseAt,
+      paused_symbols: [...this.paused],
+      live_armed: this.mode === 'live',
       safety: this._safety(),
     };
   }
@@ -839,6 +844,7 @@ export class MockServer {
       else exit = entry + dir * sz.risk * (sp.u * 1.2 - 0.6);
       const gross = (exit - entry) * sz.qty * dir;
       const fees = this.settings.fee_taker * sz.qty * (entry + exit);
+      const funding = +(sz.notional * S.fund * (((sp.dur) / 28800)) * dir).toFixed(4);
       return {
         symbol: sp.sym,
         side: sp.side,
@@ -847,9 +853,9 @@ export class MockServer {
         qty: sz.qty,
         opened_at: sp.ot + 2,
         closed_at: Math.min(sp.ot + sp.dur, bucket(this.now) - BAR),
-        pnl: +(gross - fees).toFixed(4),
+        pnl: +(gross - fees - funding).toFixed(4),
         fees: +fees.toFixed(4),
-        funding: 0,
+        funding,
         exit_reason: sp.reason,
         prob: sp.prob,
       };
@@ -1060,6 +1066,11 @@ export class MockServer {
     if (this.tickN % 2 === 0) this.out.push({ type: 'status', data: this._status() });
     this._emitSafetyIfChanged();
     if (this.tickN % 40 === 0) this._reRank();
+    // order books: one universe symbol per tick, round robin (each refreshed every ~8 ticks)
+    if (this.universeSyms.length) {
+      const sym = this.universeSyms[this.tickN % this.universeSyms.length];
+      this.out.push({ type: 'orderbook', data: this._orderbook(sym) });
+    }
     if (this.tickN % 17 === 0) this._ambientLog();
     return this.out;
   }
@@ -1079,6 +1090,10 @@ export class MockServer {
       const safety = this._safety();
       if (safety.state !== 'NORMAL') {
         this._log('INFO', `[guard] entry ${sym} blocked: safety ${safety.state}`);
+        continue;
+      }
+      if (this.paused.has(sym)) {
+        this._log('INFO', `[engine] entry ${sym} skipped: coin paused`);
         continue;
       }
       if (this._symbolExcluded(sym)) {
@@ -1127,6 +1142,47 @@ export class MockServer {
     for (const p of this.positions.slice()) this._closePosition(p, this.syms[p.symbol].price, 'kill');
     this.out.push({ type: 'kill', data: { ...this.kill } });
     this.out.push({ type: 'status', data: this._status() });
+  }
+
+  // ----------------------------------------------------------- order book
+  /** Realistic book: cumulative notional per band grows ~ pct^0.85, imbalance random-walks per symbol. */
+  _orderbook(sym) {
+    const S = this.syms[sym];
+    const B = (S.book = S.book || { imb: 0, liq: S.qv * 0.0016 * (0.7 + this.rand() * 0.6), seed: this.rand() });
+    B.imb = clamp(0.92 * B.imb + 0.09 * this.gauss(), -0.55, 0.55);
+    const mid = S.price;
+    const spread = mid * (0.00004 + 0.00006 * this.rand());
+    const mk = (side) => {
+      const k = side === 'bid' ? 1 + B.imb : 1 - B.imb;
+      let prev = 0;
+      return [0.2, 1, 2, 3, 4, 5].map((pct) => {
+        const base = B.liq * Math.pow(pct / 5, 0.85) * k * (0.9 + 0.2 * this.rand());
+        const notional = Math.max(prev * 1.02, base);
+        prev = notional;
+        return { notional, depth: notional / mid };
+      });
+    };
+    const bid = mk('bid');
+    const ask = mk('ask');
+    const bands = [0.2, 1, 2, 3, 4, 5].map((pct, i) => ({
+      pct,
+      bid_depth: +bid[i].depth.toPrecision(6),
+      bid_notional: Math.round(bid[i].notional),
+      ask_depth: +ask[i].depth.toPrecision(6),
+      ask_notional: Math.round(ask[i].notional),
+    }));
+    const tick = Math.max(mid * 0.00002, 1e-9);
+    const ladder = (dir, k) => {
+      const out = [];
+      let px = mid + dir * spread / 2;
+      for (let i = 0; i < 20; i++) {
+        const qty = (B.liq / mid) * 0.004 * k * (0.3 + this.rand() * 1.4) * (1 + (i % 5 === 0 ? 1.2 : 0));
+        out.push([+px.toPrecision(7), +qty.toPrecision(5)]);
+        px += dir * tick * (1 + Math.floor(this.rand() * 4));
+      }
+      return out;
+    };
+    return { symbol: sym, t: Math.floor(this.now), mid, spread, bands, bids: ladder(-1, 1 + B.imb), asks: ladder(1, 1 - B.imb) };
   }
 
   // ------------------------------------------------------------------ REST
@@ -1198,6 +1254,11 @@ export class MockServer {
       }
       case 'POST /api/control':
         return ok(this._control(body || {}));
+      case 'GET /api/orderbook': {
+        const S = this.syms[query.symbol];
+        if (!S) return { status: 404, body: { error: `unknown symbol ${query.symbol}` } };
+        return ok(this._orderbook(query.symbol));
+      }
       case 'GET /api/shadow':
         return ok(this._shadowRows());
       case 'GET /api/lab/reports':
@@ -1207,7 +1268,7 @@ export class MockServer {
     }
   }
 
-  _control({ action, position_id, model }) {
+  _control({ action, position_id, model, symbol }) {
     this.out = [];
     switch (action) {
       case 'start':
@@ -1244,6 +1305,32 @@ export class MockServer {
         if (!r.ok) return r;
         break;
       }
+      case 'pause_symbol':
+      case 'unpause_symbol': {
+        if (!symbol || !this.syms[symbol]) return { ok: false, error: `unknown symbol ${symbol}` };
+        if (action === 'pause_symbol') this.paused.add(symbol);
+        else this.paused.delete(symbol);
+        this._log('INFO', `[engine] ${symbol} ${action === 'pause_symbol' ? 'PAUSED: no new entries (open trade keeps running)' : 'unpaused'}`);
+        break;
+      }
+      case 'refresh_universe':
+        this._reRank();
+        this._log('INFO', '[engine] universe refresh forced from UI');
+        break;
+      case 'arm_live': {
+        // mock-only demo of the LIVE-mode card; the real backend has no such action yet
+        this.modeBefore = this.mode;
+        this.mode = 'live';
+        this.killBefore = this.settings.kill_dd_pct;
+        this.settings.kill_dd_pct = 25;
+        this._log('WARN', '[engine] LIVE MODE ARMED (mock): kill limit 25%, first 20 trades at size x0.5');
+        break;
+      }
+      case 'disarm_live':
+        this.mode = this.modeBefore || 'paper_local';
+        if (this.killBefore) this.settings.kill_dd_pct = this.killBefore;
+        this._log('INFO', '[engine] live mode disarmed');
+        break;
       case 'close_all':
         for (const p of this.positions.slice()) this._closePosition(p, this.syms[p.symbol].price, 'manual');
         break;

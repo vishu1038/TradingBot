@@ -5,7 +5,7 @@ import { createLineChart } from '../charts.js';
 import { esc, fmtDateTime, fmtSummaryValue, titleCase, fmtUsd, isNum } from '../format.js';
 
 export function mount(root) {
-  root.innerHTML = `<div class="page lab"><div class="card"><h3>LAB REPORTS</h3><div id="lab-body" class="empty">loading /api/lab/reports…</div></div></div>`;
+  root.innerHTML = `<div class="page lab"><div class="card ac-pink"><h3>LAB REPORTS</h3><div id="lab-body" class="empty">loading /api/lab/reports…</div></div></div>`;
   const body = root.querySelector('#lab-body');
   let charts = [];
   let dead = false;

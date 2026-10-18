@@ -21,6 +21,10 @@ const data = {
   settings: null,
   labReports: [],
   shadow: [],
+  orderbook: {}, // symbol -> {symbol,t,mid,spread,bands,bids,asks}
+  orderbookState: {}, // symbol -> 'ok' | 'unavailable'
+  brain: {}, // symbol -> latest signal (any symbol in the universe)
+  pausedLocal: [], // symbols paused through this UI (merged with status.paused_symbols)
   candles: {}, // symbol -> [{t,o,h,l,c,v}]
   signals: {}, // symbol -> [{t,symbol,prob_long,...}]
   ticks: {}, // symbol -> {price, prev, t}

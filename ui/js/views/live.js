@@ -1,62 +1,132 @@
-// LIVE view: symbol strip, candle chart (+volume, EMAs, probability pane, position lines), right-hand
-// stats panel (market, bot, positions, WHY) and a log tail.
+// PAGE 1 (LIVE): symbols bar, hero (rotating), fixed main chart, live trades, depth / bot / market panels.
+//   desktop  (>=1280 px): hero + log | chart | live trades on the left; depth, bot, market on the right
+//   handheld (<1280 px) : hero + chart on top, then a swipeable carousel Depth -> Bot -> Market -> Trades
 import { store } from '../state.js';
-import { api } from '../api.js';
 import { selectSymbol } from '../sync.js';
 import { createPriceChart } from '../charts.js';
-import { confirmDialog } from '../dialog.js';
 import * as fx from '../fx.js';
-import {
-  esc, fmtPrice, fmtUsd, fmtPct, fmtFunding, fmtClock, fmtNum, shortSym, signClass, throttle, winRatePct, isNum, fmtDuration,
-} from '../format.js';
-import { tile, kv, sidePill, reasonBars, slTpBar, symLabel, safetyOf, derateGauge } from '../components.js';
+import { esc, fmtPrice, fmtPct, fmtClock, shortSym, signClass, throttle, isNum } from '../format.js';
+import { coinColor } from '../theme.js';
+import { probPill } from '../components.js';
+import { barSymbols, refreshUniverse, pausedSet } from '../actions.js';
+import { createHero } from '../widgets/hero.js';
+import { createDepth } from '../widgets/depth.js';
+import { createBotPanel, createMarketPanel } from '../widgets/panels.js';
+import { createLiveTrades } from '../widgets/livetrades.js';
 
-const TREND = { up: ['▲ UP', 'pos'], down: ['▼ DOWN', 'neg'], flat: ['▬ FLAT', 'flat'] };
+export const HANDHELD_MQ = '(max-width: 1279px)';
+const PANELS = [
+  ['depth', 'DEPTH'],
+  ['bot', 'BOT'],
+  ['market', 'MARKET'],
+  ['trades', 'TRADES'],
+];
 
 export function mount(root) {
-  root.innerHTML = `
-    <div class="live">
-      <section class="live-main">
-        <div class="sym-strip" id="sym-strip" role="tablist" aria-label="Universe"></div>
-        <div class="chart-stack">
-          <div class="chart-price">
-            <div class="chart-legend" id="legend"></div>
-            <div class="chart-el" id="price-el"></div>
-            <button class="chart-reset" id="chart-reset" title="Reset zoom">[ fit ]</button>
-          </div>
-          <div class="chart-prob">
-            <div class="chart-tag">MODEL P(long) <span class="dim">dashed = entry threshold</span></div>
-            <div class="chart-el" id="prob-el"></div>
-          </div>
-        </div>
-        <div class="logstrip card" id="logstrip" aria-live="off"></div>
-      </section>
-      <aside class="live-side">
-        <div class="card"><h3>MARKET</h3><div id="card-market"></div></div>
-        <div class="card"><h3>BOT</h3><div id="card-bot"></div></div>
-        <div class="card"><h3>OPEN POSITIONS <span class="count" id="pos-count"></span></h3><div id="card-pos"></div></div>
-        <div class="card"><h3>WHY <span class="why-sub" id="why-sub"></span></h3><div id="card-why"></div></div>
-      </aside>
+  const mq = window.matchMedia(HANDHELD_MQ);
+  const handheld = mq.matches;
+  const offs = [];
+  const parts = []; // widgets to destroy
+
+  const hero = createHero();
+  const depth = createDepth();
+  const bot = createBotPanel();
+  const market = createMarketPanel();
+  const trades = createLiveTrades();
+  parts.push(hero, depth, bot, market, trades);
+
+  // ------------------------------------------------------------ chart card
+  const chartCard = document.createElement('div');
+  chartCard.className = 'card chartcard ac-teal';
+  chartCard.innerHTML = `
+    <h3>CHART <span class="why-sub" id="c-sub"></span></h3>
+    <div class="chart-stack">
+      <div class="chart-price">
+        <div class="chart-legend" id="legend"></div>
+        <div class="chart-el" id="price-el"></div>
+        <button class="chart-reset" id="chart-reset" title="Reset zoom">fit</button>
+      </div>
+      <div class="chart-prob">
+        <div class="chart-tag">MODEL P(long) <span class="dim">dashed = entry threshold</span></div>
+        <div class="chart-el" id="prob-el"></div>
+      </div>
     </div>`;
 
-  const $ = (id) => root.querySelector(`#${id}`);
-  const strip = $('sym-strip');
-  const logEl = $('logstrip');
+  // ------------------------------------------------------------ log card
+  const logCard = document.createElement('div');
+  logCard.className = 'card logcard ac-sky';
+  logCard.innerHTML = '<h3>LOG <span class="why-sub"><span class="deco" data-spin>◆</span> engine</span></h3><div class="log-scroll" id="log-scroll"></div>';
+
+  // ------------------------------------------------------------ symbol bar
+  const symbar = document.createElement('div');
+  symbar.className = 'symbar';
+
+  // ------------------------------------------------------------ layout
+  const wrap = document.createElement('div');
+  wrap.className = `live ${handheld ? 'live-hand' : 'live-desk'}`;
+  if (!handheld) {
+    const left = document.createElement('div');
+    left.className = 'live-left';
+    const row1 = document.createElement('div');
+    row1.className = 'live-row1';
+    row1.append(hero.el, logCard);
+    left.append(row1, chartCard, trades.el);
+    const right = document.createElement('div');
+    right.className = 'live-right';
+    right.append(depth.el, bot.el, market.el);
+    wrap.append(symbar, left, right);
+  } else {
+    const top = document.createElement('div');
+    top.className = 'live-top';
+    top.append(hero.el, chartCard);
+    const panels = document.createElement('div');
+    panels.className = 'live-panels';
+    const tabs = document.createElement('div');
+    tabs.className = 'car-tabs';
+    tabs.setAttribute('role', 'tablist');
+    tabs.innerHTML = PANELS.map(([id, label], i) => `<button type="button" role="tab" class="car-tab ${i === 0 ? 'on' : ''}" data-p="${i}">${label}</button>`).join('');
+    const track = document.createElement('div');
+    track.className = 'car-track';
+    const els = { depth: depth.el, bot: bot.el, market: market.el, trades: trades.el };
+    for (const [id] of PANELS) {
+      const slot = document.createElement('div');
+      slot.className = 'car-panel';
+      slot.dataset.id = id;
+      slot.append(els[id]);
+      track.append(slot);
+    }
+    panels.append(tabs, track);
+    wrap.append(symbar, top, panels);
+
+    const setTab = (i) => tabs.querySelectorAll('.car-tab').forEach((t, k) => t.classList.toggle('on', k === i));
+    tabs.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-p]');
+      if (!b) return;
+      const i = Number(b.dataset.p);
+      const slot = track.children[i];
+      track.scrollTo({ left: slot.offsetLeft - track.offsetLeft, behavior: 'smooth' });
+      setTab(i);
+    });
+    let raf = 0;
+    track.addEventListener('scroll', () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const w = track.children[0].getBoundingClientRect().width + 10;
+        setTab(Math.round(track.scrollLeft / w));
+      });
+    }, { passive: true });
+  }
+  root.append(wrap);
+  const $ = (sel) => wrap.querySelector(sel);
+
+  // ------------------------------------------------------------ chart wiring
   let chart = null;
   let loadedSymbol = null;
-  const offs = [];
-
-  // ------------------------------------------------------------------ chart
   function ensureChart() {
     if (chart || typeof LightweightCharts === 'undefined') return;
-    chart = createPriceChart($('price-el'), $('prob-el'), $('legend'));
+    chart = createPriceChart($('#price-el'), $('#prob-el'), $('#legend'));
   }
-
-  function symPositions() {
-    const sym = store.get('symbol');
-    return store.get('positions').filter((p) => p.symbol === sym);
-  }
-
+  const symPositions = () => store.get('positions').filter((p) => p.symbol === store.get('symbol'));
   function refreshOverlays() {
     if (!chart) return;
     const sym = store.get('symbol');
@@ -66,235 +136,114 @@ export function mount(root) {
     const thr = store.get('status')?.model?.threshold_long;
     if (isNum(thr)) chart.setThreshold(thr);
   }
-
+  function renderChartTitle() {
+    const sym = store.get('symbol');
+    $('#c-sub').innerHTML = sym ? `· <b style="color:${coinColor(sym)}">${esc(sym)}</b> <span class="dim">5m</span>` : '';
+  }
   function loadChart() {
     ensureChart();
     const sym = store.get('symbol');
     const cs = store.get('candles')[sym];
+    renderChartTitle();
     if (!chart || !sym || !cs) return;
     chart.setData(sym, cs, store.get('signals')[sym] || []);
     loadedSymbol = sym;
     refreshOverlays();
   }
-
   offs.push(store.on('candles_loaded', ({ symbol }) => symbol === store.get('symbol') && loadChart()));
   offs.push(store.on('signals_loaded', ({ symbol }) => symbol === store.get('symbol') && loadChart()));
   offs.push(store.on('candle', ({ symbol, candle }) => chart && symbol === loadedSymbol && symbol === store.get('symbol') && chart.updateCandle(candle)));
   offs.push(store.on('signal', ({ signal }) => chart && signal.symbol === loadedSymbol && chart.updateSignal(signal)));
   offs.push(store.on('change:symbol', () => {
     renderStrip();
-    renderSide();
+    renderChartTitle();
     if (store.get('candles')[store.get('symbol')]) loadChart();
   }));
-  const overlayThrottled = throttle(refreshOverlays, 400);
-  offs.push(store.on('change:positions', overlayThrottled));
-  offs.push(store.on('position_updated', overlayThrottled));
-  offs.push(store.on('change:trades', overlayThrottled));
-  offs.push(store.on('change:status', overlayThrottled));
-  root.querySelector('#chart-reset').addEventListener('click', () => chart && chart.resetView());
+  const overlayT = throttle(refreshOverlays, 400);
+  for (const t of ['change:positions', 'position_updated', 'change:trades', 'change:status']) offs.push(store.on(t, overlayT));
+  $('#chart-reset').addEventListener('click', () => chart && chart.resetView());
 
-  // ------------------------------------------------------------- symbol strip
-  function stripSymbols() {
-    const uni = store.get('universe').map((u) => u.symbol);
-    const extra = store.get('positions').map((p) => p.symbol).filter((s) => !uni.includes(s));
-    const sel = store.get('symbol');
-    if (sel && !uni.includes(sel) && !extra.includes(sel)) extra.push(sel);
-    return { uni, extra: [...new Set(extra)] };
-  }
-
+  // ------------------------------------------------------------ symbol bar
   function renderStrip() {
-    const { uni, extra } = stripSymbols();
+    const list = barSymbols();
     const rows = new Map(store.get('universe').map((u) => [u.symbol, u]));
     const ticks = store.get('ticks');
+    const brain = store.get('brain');
     const sel = store.get('symbol');
-    const open = new Set(store.get('positions').map((p) => p.symbol));
-    const chip = (sym, off) => {
+    const held = new Set(store.get('positions').map((p) => p.symbol));
+    const paused = pausedSet();
+    const inUni = new Set(rows.keys());
+    const chip = (sym) => {
       const u = rows.get(sym);
       const tk = ticks[sym];
       const price = tk ? tk.price : u?.last_price;
       let chg = u?.change_24h_pct;
-      if (u && tk && isNum(u.last_price) && u.last_price > 0 && isNum(chg)) {
-        const ref = u.last_price / (1 + chg / 100);
-        chg = (tk.price / ref - 1) * 100;
-      }
+      if (u && tk && isNum(u.last_price) && u.last_price > 0 && isNum(chg)) chg = (tk.price / (u.last_price / (1 + chg / 100)) - 1) * 100;
       const dir = tk && tk.price > tk.prev ? 'up' : tk && tk.price < tk.prev ? 'dn' : '';
-      return `<button type="button" role="tab" aria-selected="${sym === sel}" class="chip ${sym === sel ? 'sel' : ''} ${off ? 'off' : ''}" data-sym="${esc(sym)}">
-        <span class="chip-top">${open.has(sym) ? '<i class="chip-pos"></i>' : ''}<b>${esc(shortSym(sym))}</b></span>
+      const p = brain[sym]?.prob_long;
+      return `<button type="button" role="tab" aria-selected="${sym === sel}" class="chip ${sym === sel ? 'sel' : ''} ${inUni.has(sym) ? '' : 'off'} ${paused.has(sym) ? 'paused' : ''}" data-sym="${esc(sym)}" style="--cc:${coinColor(sym)}">
+        <span class="chip-top"><i class="coin-dot"></i><b>${esc(shortSym(sym))}</b>${held.has(sym) ? '<em class="held" title="bot holds this coin">●</em>' : ''}${paused.has(sym) ? '<em class="pz" title="paused">⏸</em>' : ''}</span>
         <span class="chip-px ${dir}">${fmtPrice(price)}</span>
-        <span class="chip-ch ${signClass(chg)}">${fmtPct(chg, 2)}</span>
+        <span class="chip-row"><span class="chip-ch ${signClass(chg)}">${fmtPct(chg, 1)}</span>${probPill(p)}</span>
       </button>`;
     };
-    strip.innerHTML = uni.map((s) => chip(s, false)).join('') + extra.map((s) => chip(s, true)).join('');
+    symbar.innerHTML = `<div class="symbar-scroll" role="tablist" aria-label="Hot coins">${list.map(chip).join('')}</div>
+      <button type="button" class="refresh-btn" id="sb-refresh" title="Force universe refresh (r)" aria-label="Refresh universe"><span class="deco">⟳</span></button>`;
+    // keep the selected chip in view (handhelds scroll horizontally)
+    const selEl = symbar.querySelector('.chip.sel');
+    if (selEl && symbar.__lastSel !== sel) {
+      symbar.__lastSel = sel;
+      const sc = symbar.querySelector('.symbar-scroll');
+      sc.scrollLeft = Math.max(0, selEl.offsetLeft - sc.clientWidth / 2 + selEl.clientWidth / 2);
+    }
   }
-  strip.addEventListener('click', (e) => {
+  symbar.addEventListener('click', async (e) => {
     const b = e.target.closest('[data-sym]');
-    if (b) selectSymbol(b.dataset.sym);
+    if (b) return selectSymbol(b.dataset.sym);
+    const r = e.target.closest('#sb-refresh');
+    if (r) {
+      r.classList.add('spinning');
+      await refreshUniverse();
+      setTimeout(() => r.classList.remove('spinning'), 600);
+    }
+    return undefined;
   });
+  const stripT = throttle(renderStrip, 500);
+  for (const t of ['tick', 'change:universe', 'change:positions', 'brain', 'change:pausedLocal', 'change:status']) offs.push(store.on(t, stripT));
 
-  // ----------------------------------------------------------------- side cards
-  function renderMarket() {
-    const m = store.get('market');
-    if (!m) return ($('card-market').innerHTML = '<div class="empty">waiting for /api/market…</div>');
-    const [tl, tc] = TREND[m.btc_trend] || TREND.flat;
-    $('card-market').innerHTML = `
-      <div class="mk-btc"><span class="mk-btc-l">BTC</span><span class="mk-btc-p">${fmtPrice(m.btc_price)}</span>
-        <span class="${signClass(m.btc_change_24h_pct)}">${fmtPct(m.btc_change_24h_pct)}</span><span class="${tc} mk-trend">${tl}</span></div>
-      <div class="kv-grid">
-        ${kv('volatility (ATR%)', fmtPct(m.market_volatility_pct, 2, false))}
-        ${kv('avg funding', `<span class="${signClass(m.avg_funding_rate)}">${fmtFunding(m.avg_funding_rate)}</span>`)}
-        ${kv('long/short ratio', fmtNum(m.long_short_ratio, 2))}
-      </div>`;
-  }
-
-  function renderBot() {
-    const s = store.get('status');
-    if (!s) return ($('card-bot').innerHTML = '<div class="empty">waiting for /api/status…</div>');
-    const wr = winRatePct(s.win_rate);
-    const sf = safetyOf(s);
-    const m = s.model || {};
-    const drift = sf.drift;
-    $('card-bot').innerHTML = `
-      <div class="tiles">
-        ${tile('EQUITY', fmtUsd(s.equity), signClass(s.equity - s.start_equity))}
-        ${tile('WIN RATE', wr == null ? '–' : `${wr.toFixed(1)}%`, wr != null && wr >= 50 ? 'pos' : 'neg')}
-        ${tile('TRADES TODAY', esc(s.trades_today))}
-        ${tile('OPEN / MAX', `${esc(s.open_positions)} / ${esc(s.max_positions)}`)}
-      </div>
-      <div class="kv-grid">
-        ${kv('realized', `<span class="${signClass(s.realized_pnl)}">${fmtUsd(s.realized_pnl, 2, true)}</span>`)}
-        ${kv('unrealized', `<span class="${signClass(s.unrealized_pnl)}">${fmtUsd(s.unrealized_pnl, 2, true)}</span>`)}
-        ${kv('size multiplier', `<span class="${sf.derate >= 0.99 ? 'pos' : sf.derate >= 0.5 ? 'warn' : 'neg'}">x${sf.derate.toFixed(2)}</span>`)}
-        ${
-          drift
-            ? kv('drift z (n=' + esc(drift.n) + ')', `<span class="${drift.z < -3 ? 'neg' : drift.z < -2 ? 'warn' : 'pos'}">${isNum(drift.z) ? drift.z.toFixed(2) : '–'}</span> <span class="dim">size x${isNum(drift.mult) ? drift.mult.toFixed(2) : '–'}</span>`)
-            : kv('drift', '<span class="dim">n/a</span>')
-        }
-        ${kv('model', `${esc(m.name || '–')} <span class="dim">v${esc(m.version || '–')}</span>`)}
-        ${kv('thresholds', `L ${isNum(m.threshold_long) ? m.threshold_long.toFixed(2) : '–'} / S ${isNum(m.threshold_short) ? m.threshold_short.toFixed(2) : '–'}`)}
-      </div>`;
-  }
-
-  function renderPositions() {
-    const ps = store.get('positions');
-    $('pos-count').textContent = ps.length ? `(${ps.length})` : '';
-    const selId = store.get('selectedPosition');
-    if (!ps.length) return ($('card-pos').innerHTML = '<div class="empty">flat. waiting for a signal ≥ threshold</div>');
-    const now = store.serverNow();
-    $('card-pos').innerHTML = ps
-      .map(
-        (p) => `<div class="pos-row ${p.id === selId ? 'sel' : ''} ${p.symbol === store.get('symbol') ? 'cur' : ''}" data-pid="${esc(p.id)}" data-sym="${esc(p.symbol)}">
-        <div class="pos-top">${symLabel(p.symbol)} ${sidePill(p.side)}<span class="dim pos-age">${fmtDuration(now - p.opened_at)}</span>
-          <span class="pos-pnl ${signClass(p.upnl)}">${fmtUsd(p.upnl, 2, true)}</span>
-          <button type="button" class="btn btn-mini btn-kill" data-close="${esc(p.id)}" title="Close at market">CLOSE</button></div>
-        <div class="pos-mid dim">${fmtPrice(p.entry_price)} <span class="arrow">→</span> <span class="${signClass(p.upnl)}">${fmtPrice(p.mark_price)}</span>
-          <span class="pos-lv">${esc(p.leverage)}x · $${fmtNum(p.notional, 0)}</span>${p.trail_active ? '<span class="trail-tag">TRAIL</span>' : ''}</div>
-        ${slTpBar(p)}
-      </div>`
-      )
-      .join('');
-  }
-
-  function renderWhy() {
-    const ps = store.get('positions');
-    const selId = store.get('selectedPosition');
-    const sym = store.get('symbol');
-    let reasons = null;
-    let sub = '';
-    const p = ps.find((x) => x.id === selId) || ps.find((x) => x.symbol === sym);
-    if (p && p.reasons && p.reasons.length) {
-      reasons = p.reasons;
-      sub = `${shortSym(p.symbol)} ${p.side.toUpperCase()} · prob ${isNum(p.prob) ? p.prob.toFixed(2) : '–'}`;
-    } else {
-      const sigs = store.get('signals')[sym] || [];
-      const s = [...sigs].reverse().find((x) => x.reasons && x.reasons.length);
-      if (s) {
-        reasons = s.reasons;
-        sub = `${shortSym(sym)} signal · p_long ${s.prob_long.toFixed(2)}`;
-      }
-    }
-    $('why-sub').textContent = sub ? `· ${sub}` : '';
-    $('card-why').innerHTML = reasonBars(reasons);
-  }
-
-  $('card-pos').addEventListener('click', async (e) => {
-    const closeBtn = e.target.closest('[data-close]');
-    if (closeBtn) {
-      e.stopPropagation();
-      const id = closeBtn.dataset.close;
-      const p = store.get('positions').find((x) => String(x.id) === id);
-      const ok = await confirmDialog({
-        title: 'CLOSE POSITION',
-        message: `Close ${p ? `${shortSym(p.symbol)} ${p.side.toUpperCase()}` : `#${id}`} at market now?`,
-        confirmText: 'CLOSE NOW',
-        danger: true,
-      });
-      if (!ok) return;
-      try {
-        await api.control('close_position', { position_id: p ? p.id : Number(id) });
-      } catch (err) {
-        fx.toast(`close failed: ${err.message}`, 'loss', 5000);
-      }
-      return;
-    }
-    const row = e.target.closest('[data-pid]');
-    if (row) {
-      const p = store.get('positions').find((x) => String(x.id) === row.dataset.pid);
-      if (p) {
-        store.set('selectedPosition', p.id);
-        if (p.symbol !== store.get('symbol')) selectSymbol(p.symbol);
-        renderSide();
-      }
-    }
+  // ------------------------------------------------------------ log (typed lines)
+  const lvl = (l) => String(l || 'INFO').toLowerCase().replace(/[^a-z]/g, '').replace('warning', 'warn');
+  const logHtml = (e) => `<div class="log lv-${lvl(e.level)}"><span class="log-t">${fmtClock(e.t)}</span><span class="log-l">${esc(String(e.level || '').replace('WARNING', 'WARN').slice(0, 5))}</span><span class="log-m"></span></div>`;
+  const logEl = logCard.querySelector('#log-scroll');
+  store.get('logs').slice(-60).forEach((e) => {
+    logEl.insertAdjacentHTML('beforeend', logHtml(e));
+    logEl.lastElementChild.querySelector('.log-m').textContent = e.msg;
   });
-
-  const renderSide = () => {
-    renderMarket();
-    renderBot();
-    renderPositions();
-    renderWhy();
-  };
-  const renderSideT = throttle(renderSide, 250);
-  const renderStripT = throttle(renderStrip, 500);
-  for (const k of ['status', 'market', 'positions', 'signals_loaded']) offs.push(store.on(k === 'signals_loaded' ? k : `change:${k}`, renderSideT));
-  offs.push(store.on('position_updated', renderSideT));
-  offs.push(store.on('signal', renderSideT));
-  offs.push(store.on('tick', renderStripT));
-  offs.push(store.on('change:universe', renderStripT));
-  offs.push(store.on('change:positions', renderStripT));
-
-  // ------------------------------------------------------------------- log tail
-  const lvl = (l) => String(l || 'INFO').toLowerCase().replace(/[^a-z]/g, '');
-  const logLine = (e) => `<div class="log lv-${lvl(e.level)}"><span class="log-t">${fmtClock(e.t)}</span><span class="log-l">${esc(String(e.level || '').slice(0, 5))}</span><span class="log-m">${esc(e.msg)}</span></div>`;
-  function renderLogs() {
-    logEl.innerHTML = `<h3>LOG</h3><div class="log-scroll" id="log-scroll">${store.get('logs').slice(-60).map(logLine).join('')}</div>`;
-    const sc = logEl.querySelector('#log-scroll');
-    sc.scrollTop = sc.scrollHeight;
-  }
+  logEl.scrollTop = logEl.scrollHeight;
   offs.push(store.on('log', ({ entry }) => {
-    const sc = logEl.querySelector('#log-scroll');
-    if (!sc) return;
-    const atBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
-    sc.insertAdjacentHTML('beforeend', logLine(entry));
-    while (sc.childElementCount > 80) sc.firstElementChild.remove();
-    if (atBottom) sc.scrollTop = sc.scrollHeight;
+    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+    logEl.insertAdjacentHTML('beforeend', logHtml(entry));
+    fx.typeInto(logEl.lastElementChild.querySelector('.log-m'), String(entry.msg));
+    while (logEl.childElementCount > 80) logEl.firstElementChild.remove();
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
   }));
 
-  // ----------------------------------------------------------------------- init
+  // ------------------------------------------------------------ init
   renderStrip();
-  renderSide();
-  renderLogs();
+  renderChartTitle();
   if (store.get('symbol') && store.get('candles')[store.get('symbol')]) loadChart();
   else ensureChart();
 
-  // keep the "age" fields ticking without WS traffic
-  const ageTimer = setInterval(renderPositions, 5000);
+  // crossing the breakpoint rebuilds the page in the other layout
+  const onMq = () => store.emit('relayout', null);
+  mq.addEventListener('change', onMq);
 
   return () => {
-    clearInterval(ageTimer);
+    mq.removeEventListener('change', onMq);
     offs.forEach((o) => o());
-    overlayThrottled.cancel();
-    renderSideT.cancel();
-    renderStripT.cancel();
+    overlayT.cancel();
+    stripT.cancel();
+    parts.forEach((p) => p.destroy());
     if (chart) chart.destroy();
     chart = null;
   };

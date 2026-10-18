@@ -248,7 +248,7 @@ def test_api_control_and_universe_paused_flag(api):
     assert u == {"ETHUSDT": True, "BTCUSDT": False}
 
 
-def test_paper_test_only_model_refused_outside_paper(store, tmp_path, monkeypatch):
+def test_paper_test_only_model_refused_in_live(store, tmp_path, monkeypatch):
     import json
 
     import tb.engine as E
@@ -263,14 +263,15 @@ def test_paper_test_only_model_refused_outside_paper(store, tmp_path, monkeypatc
     monkeypatch.setattr(E, "load_model", lambda e: (FixedScorer(0.9), S.ModelInfo(e.name, "1", None, 0.7, 0.8, e.status)))
     paper, _ = mk_engine(store, tmp_path)
     assert paper.model_info.name == "ptest" and not isinstance(paper.scorer, S.NullScorer)
-    for mode in ("binance_demo", "live"):
-        eng, _ = mk_engine(store, tmp_path, mode=mode)
-        assert isinstance(eng.scorer, S.NullScorer) and eng.model_info is None, mode
-        assert set(eng.challengers) == {"ok"}                        # unmarked models still load
+    demo, _ = mk_engine(store, tmp_path, mode="binance_demo")   # testnet/demo = fake money: allowed
+    assert demo.model_info.name == "ptest" and not isinstance(demo.scorer, S.NullScorer)
+    eng, _ = mk_engine(store, tmp_path, mode="live")             # real money: refused
+    assert isinstance(eng.scorer, S.NullScorer) and eng.model_info is None
+    assert set(eng.challengers) == {"ok"}                        # unmarked models still load
     # a paper-only challenger is not loaded either, and cannot be promoted
     (d / "ptest.json").write_text(json.dumps({"name": "ptest", "status": "challenger", "note": "paper test only"}))
     (d / "ok.json").write_text(json.dumps({"name": "ok", "status": "champion"}))
-    eng, _ = mk_engine(store, tmp_path, mode="binance_demo")
+    eng, _ = mk_engine(store, tmp_path, mode="live")
     assert eng.model_info.name == "ok" and "ptest" not in eng.challengers
     assert "PAPER TEST ONLY" in run(eng.handle_command("promote_model", {"model": "ptest"}))
 

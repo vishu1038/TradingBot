@@ -31,7 +31,7 @@ import requests
 
 from . import frames
 from .paths import (BAR_MS, DAY_MS, FUNDING_COLS, KLINE_COLS, METRIC_COLS, archive_root,
-                    funding_path, kline_path, metrics_path)
+                    depth_path, funding_path, kline_path, metrics_path)
 
 BASE = "https://data.binance.vision/data/futures/um"
 MAX_UNCOMPRESSED = 300 * 1024 * 1024  # zip-bomb guard
@@ -42,7 +42,7 @@ DEFAULT_SYMBOLS = [
     "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "SEIUSDT", "TIAUSDT", "FETUSDT", "ORDIUSDT",
     "WLDUSDT", "1000BONKUSDT",
 ]
-KINDS = ("klines", "metrics", "funding")
+KINDS = ("klines", "metrics", "funding", "depth")
 
 _print_lock = threading.Lock()
 
@@ -362,7 +362,9 @@ def universe_symbols(min_age_months: int = 24, today: dt.date | None = None) -> 
     """Every USDT-quoted PERPETUAL with status TRADING whose onboardDate is at least
     `min_age_months` months old, from fapi exchangeInfo (sorted)."""
     today = today or utc_today()
-    cutoff = to_ms(add_months(month_start(today), -min_age_months).replace(day=min(today.day, 28)))
+    # month granularity: listed on or before the END of the month `min_age_months` ago, so every symbol
+    # that has data for (nearly) the whole window is included (229 on 2026-10-18)
+    cutoff = to_ms(add_months(month_start(today), -min_age_months + 1)) - 1
     r = _session().get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=30)
     r.raise_for_status()
     out = []
@@ -376,6 +378,13 @@ def universe_symbols(min_age_months: int = 24, today: dt.date | None = None) -> 
 _JOBS = {"klines": download_klines, "metrics": download_metrics, "funding": download_funding}
 
 
+def _job(kind: str):
+    if kind == "depth":                      # lazy: depth.py imports this module
+        from . import depth
+        return depth.download_depth
+    return _JOBS[kind]
+
+
 def download_all(symbols: list[str], kinds: list[str], months: int = 12, workers: int = 6,
                  root: Path | None = None, verify: bool = True) -> dict:
     """Run (symbol, kind) jobs on a thread pool. Returns {(symbol, kind): Stats | Exception-string}."""
@@ -386,7 +395,7 @@ def download_all(symbols: list[str], kinds: list[str], months: int = 12, workers
     log(f"archive: {len(symbols)} symbols x {kinds} x {months} months -> {root}  ({len(jobs)} jobs, "
         f"{workers} workers)")
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_JOBS[k], s, months, root, verify): (s, k) for s, k in jobs}
+        futs = {ex.submit(_job(k), s, months, root, verify): (s, k) for s, k in jobs}
         for n, f in enumerate(as_completed(futs), 1):
             s, k = futs[f]
             try:
@@ -408,7 +417,8 @@ def summarize(symbols: list[str], root: Path | None = None) -> pd.DataFrame:
     for s in symbols:
         for kind, path, col, step in (("klines", kline_path(s, root), "open_time", BAR_MS),
                                       ("metrics", metrics_path(s, root), "create_time", BAR_MS),
-                                      ("funding", funding_path(s, root), "calc_time", None)):
+                                      ("funding", funding_path(s, root), "calc_time", None),
+                                      ("depth", depth_path(s, root), "open_time", BAR_MS)):
             if not path.exists():
                 rows.append(dict(symbol=s, kind=kind, rows=0))
                 continue

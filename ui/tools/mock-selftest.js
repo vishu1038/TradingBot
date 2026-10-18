@@ -96,6 +96,26 @@ out(`promote_model -> ${JSON.stringify(pr)}`);
 check('promote returns ok or a reason', pr.ok === true || typeof pr.error === 'string');
 if (pr.ok) check('rollback restores champion', m.request('POST', '/api/control', {}, { action: 'rollback_model', model: chal.model }).body.ok === true);
 check('promote of unknown model refused', m.request('POST', '/api/control', {}, { action: 'promote_model', model: 'nope' }).body.ok === false);
+// ---- order book contract: bands at 0.2/1/2/3/4/5 %, cumulative (monotonic), top-20 ladder
+const ob = get('/api/orderbook', { symbol: sym });
+need(ob, ['symbol', 't', 'mid', 'spread', 'bands', 'bids', 'asks'], 'orderbook');
+need(ob.bands[0], ['pct', 'bid_depth', 'bid_notional', 'ask_depth', 'ask_notional'], 'orderbook band');
+check('orderbook bands pct', JSON.stringify(ob.bands.map((b) => b.pct)) === '[0.2,1,2,3,4,5]');
+check('orderbook bands cumulative', ob.bands.every((b, i) => i === 0 || (b.bid_notional >= ob.bands[i - 1].bid_notional && b.ask_notional >= ob.bands[i - 1].ask_notional)));
+check('orderbook ladder 20/20 sorted', ob.bids.length === 20 && ob.asks.length === 20 && ob.bids.every((r, i) => i === 0 || r[0] < ob.bids[i - 1][0]) && ob.asks.every((r, i) => i === 0 || r[0] > ob.asks[i - 1][0]) && ob.bids[0][0] < ob.mid && ob.asks[0][0] > ob.mid);
+check('orderbook unknown symbol 404', m.request('GET', '/api/orderbook', { symbol: 'NOPEUSDT' }).status === 404);
+check('orderbook WS messages emitted', (types.orderbook || 0) >= 100, String(types.orderbook));
+// ---- pause / unpause / refresh / live arm controls
+check('pause_symbol', m.request('POST', '/api/control', {}, { action: 'pause_symbol', symbol: sym }).body.ok === true && get('/api/status').paused_symbols.includes(sym));
+check('pause needs a known symbol', m.request('POST', '/api/control', {}, { action: 'pause_symbol', symbol: 'NOPEUSDT' }).body.ok === false);
+check('unpause_symbol', m.request('POST', '/api/control', {}, { action: 'unpause_symbol', symbol: sym }).body.ok === true && !get('/api/status').paused_symbols.includes(sym));
+check('refresh_universe', m.request('POST', '/api/control', {}, { action: 'refresh_universe' }).body.ok === true);
+check('arm_live / disarm_live', m.request('POST', '/api/control', {}, { action: 'arm_live' }).body.ok === true && get('/api/status').mode === 'live' && m.request('POST', '/api/control', {}, { action: 'disarm_live' }).body.ok === true && get('/api/status').mode === 'paper_local');
+// ---- PnL convention: net = gross - fees - funding; fees >= 0; win_rate is a 0-1 fraction
+const allT = get('/api/trades', { limit: '500' });
+check('trades.pnl is net of fees+funding', allT.every((t) => { const g = (t.exit_price - t.entry_price) * t.qty * (t.side === 'long' ? 1 : -1); return Math.abs(g - t.fees - t.funding - t.pnl) < 0.02 + 1e-4 * Math.abs(g); }));
+check('fees >= 0', allT.every((t) => t.fees >= 0));
+check('win_rate is a 0-1 fraction', get('/api/status').win_rate >= 0 && get('/api/status').win_rate <= 1);
 check('control close_all', m.request('POST', '/api/control', {}, { action: 'close_all' }).body.ok === true && m.positions.length === 0);
 check('control kill', m.request('POST', '/api/control', {}, { action: 'kill' }).body.ok === true && m.kill.tripped);
 check('start refused while tripped', m.request('POST', '/api/control', {}, { action: 'start' }).body.ok === false);

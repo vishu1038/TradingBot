@@ -48,7 +48,7 @@ export function summarize(trades) {
 export function mount(root) {
   root.innerHTML = `
     <div class="page trades">
-      <div class="card"><h3>FILTERS</h3>
+      <div class="card ac-violet"><h3>FILTERS</h3>
         <div class="filters">
           <label>symbol <select id="f-symbol"></select></label>
           <label>side <select id="f-side"><option value="">all</option><option value="long">long</option><option value="short">short</option></select></label>
@@ -56,8 +56,8 @@ export function mount(root) {
           <button type="button" class="btn btn-mini" id="f-clear">CLEAR</button>
         </div>
       </div>
-      <div class="card"><h3>SUMMARY <span class="why-sub" id="sum-sub"></span></h3><div id="summary"></div></div>
-      <div class="card"><h3>HISTORY</h3><div class="tbl-wrap tall"><table class="tbl sortable" id="tr-tbl"></table></div></div>
+      <div class="card ac-amber"><h3>SUMMARY <span class="why-sub" id="sum-sub"></span></h3><div id="summary"></div></div>
+      <div class="card ac-coral"><h3>HISTORY</h3><div class="tbl-wrap tall"><table class="tbl sortable" id="tr-tbl"></table></div></div>
     </div>`;
   const $ = (id) => root.querySelector(`#${id}`);
   const offs = [];

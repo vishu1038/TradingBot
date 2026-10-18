@@ -76,12 +76,27 @@ export const api = {
     if (p.get('mock') === '1') {
       startMockBackend('forced by ?mock=1');
     } else {
-      try {
-        const h = await fetchJson(`${base}/api/health`, {}, 1500);
-        if (!h || h.ok === false) throw new ApiError('health not ok');
-      } catch (e) {
-        startMockBackend(`${base}/api/health unreachable (${e.message})`);
+      // candidates: ?api=, the origin serving this page (tb-api serves ui/ at /), then the default port
+      const cands = [];
+      if (override) cands.push(base);
+      else {
+        if (typeof location !== 'undefined' && /^https?:$/.test(location.protocol)) cands.push(location.origin);
+        cands.push(DEFAULT_BASE);
       }
+      let lastErr = null;
+      let found = false;
+      for (const c of [...new Set(cands)]) {
+        try {
+          const h = await fetchJson(`${c}/api/health`, {}, 1500);
+          if (!h || h.ok === false) throw new ApiError('health not ok');
+          base = c;
+          found = true;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!found) startMockBackend(`${base}/api/health unreachable (${lastErr ? lastErr.message : 'no answer'})`);
     }
     return { mock: !!mock, base, reason: mockReason };
   },
@@ -107,6 +122,7 @@ export const api = {
   status: () => api.request('GET', '/api/status'),
   market: () => api.request('GET', '/api/market'),
   universe: () => api.request('GET', '/api/universe'),
+  orderbook: (symbol) => api.request('GET', '/api/orderbook', { symbol }),
   candles: (symbol, limit = 500, tf = '5m') => api.request('GET', '/api/candles', { symbol, tf, limit }),
   signals: (symbol, limit = 500) => api.request('GET', '/api/signals', { symbol, limit }),
   positions: () => api.request('GET', '/api/positions'),

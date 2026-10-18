@@ -4,6 +4,7 @@
 // Everything here resizes with its container through ResizeObserver.
 
 import { esc, fmtPrice, pricePrecision, isNum, fmtNum } from './format.js';
+import { probColor } from './theme.js';
 
 const LW = () => globalThis.LightweightCharts;
 const BAR = 300;
@@ -52,7 +53,7 @@ function baseOptions(P, { timeVisible = true, showTime = true } = {}) {
     layout: {
       background: { type: 'solid', color: P.bg },
       textColor: P.text,
-      fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+      fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
       fontSize: 11,
     },
     grid: { vertLines: { color: P.grid }, horzLines: { color: P.grid } },
@@ -267,7 +268,7 @@ export function createPriceChart(priceEl, probEl, legendEl) {
   function probData() {
     return candles.map((c) => {
       const s = sigByT.get(c.t);
-      return s ? { time: c.t, value: s.prob_long } : { time: c.t };
+      return s ? { time: c.t, value: s.prob_long, color: probColor(s.prob_long) } : { time: c.t };
     });
   }
   function probShortData() {
@@ -331,7 +332,7 @@ export function createPriceChart(priceEl, probEl, legendEl) {
       sigByT.set(s.t, s);
       if (!idxByT.has(s.t)) return;
       if (s.t === candles[candles.length - 1].t) {
-        probLong.update({ time: s.t, value: s.prob_long });
+        probLong.update({ time: s.t, value: s.prob_long, color: probColor(s.prob_long) });
         probShort.update({ time: s.t, value: s.prob_short });
       } else {
         // the final signal of a just-closed bar arrives after the next bar started: update() cannot
@@ -376,7 +377,7 @@ export function createPriceChart(priceEl, probEl, legendEl) {
       for (const t of trades) {
         const a = snap(t.opened_at);
         const long = t.side === 'long';
-        if (inRange(a)) ms.push({ time: a, position: long ? 'belowBar' : 'aboveBar', color: long ? P.lime : P.magenta, shape: long ? 'arrowUp' : 'arrowDown', text: '' });
+        if (inRange(a)) ms.push({ time: a, position: long ? 'belowBar' : 'aboveBar', color: long ? P.cyan : P.magenta, shape: long ? 'arrowUp' : 'arrowDown', text: '' });
         const b = snap(t.closed_at);
         if (inRange(b)) ms.push({ time: b, position: long ? 'aboveBar' : 'belowBar', color: t.pnl >= 0 ? P.up : P.down, shape: 'circle', text: '' });
       }

@@ -1,5 +1,6 @@
 // Small HTML-string components shared by views. Every dynamic value goes through esc().
 import { esc, fmtUsd, fmtPct, signClass, isNum, clamp, shortSym } from './format.js';
+import { coinColor, probColor } from './theme.js';
 
 export function tile(label, value, cls = '', sub = '') {
   return `<div class="tile"><div class="tile-l">${esc(label)}</div><div class="tile-v ${cls}">${value}</div>${sub ? `<div class="tile-s">${sub}</div>` : ''}</div>`;
@@ -57,7 +58,37 @@ export function slTpBar(p) {
 }
 
 export function symLabel(sym) {
-  return `<span class="sym">${esc(shortSym(sym))}</span>`;
+  return `<span class="sym" style="--cc:${coinColor(sym)}"><i class="coin-dot"></i>${esc(shortSym(sym))}</span>`;
+}
+
+/** Probability pill on the cool -> hot gradient. */
+export function probPill(p) {
+  if (!isNum(p)) return '<span class="prob dim">–</span>';
+  return `<span class="prob" style="--pc:${probColor(p)}">${p.toFixed(2)}</span>`;
+}
+
+/** Drawdown derating multiplier (same curve as backend risk.derate_multiplier). */
+export function derateAt(ddPct, killPct) {
+  const f = killPct > 0 ? Math.max(0, ddPct) / killPct : 0;
+  if (f <= 0.4) return 1;
+  if (f <= 0.8) return 1 - ((f - 0.4) / 0.4) * 0.5;
+  if (f < 1) return 0.5 * (1 - (f - 0.8) / 0.2);
+  return 0;
+}
+
+/** Tiny inline SVG line/area chart. values: numbers. */
+export function sparkline(values, { w = 160, h = 44, color = '#4fe3ff', fill = true } = {}) {
+  const v = values.filter(isNum);
+  if (v.length < 2) return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none"></svg>`;
+  const lo = Math.min(...v);
+  const hi = Math.max(...v);
+  const span = hi - lo || 1;
+  const pts = v.map((x, i) => `${((i / (v.length - 1)) * w).toFixed(1)},${(h - 3 - ((x - lo) / span) * (h - 6)).toFixed(1)}`);
+  const line = pts.join(' ');
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" width="100%" height="${h}" preserveAspectRatio="none" aria-hidden="true">
+    ${fill ? `<polygon points="0,${h} ${line} ${w},${h}" fill="${color}" opacity="0.16"/>` : ''}
+    <polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.8" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+  </svg>`;
 }
 
 /** Mini donut-less "gauge" used by the derate indicator: SVG semicircle. mult 0..1 */

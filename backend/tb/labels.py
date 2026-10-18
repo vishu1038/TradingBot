@@ -205,3 +205,49 @@ def breakeven_from_cfg(exit_cfg: dict | None = None, typical_atr_pct: float = 0.
     w = gw - 2 * fee * notional
     lo = gl + 2 * fee * notional + stop_slip * notional
     return float(lo / (w + lo))
+
+
+# --------------------------------------------------------------------------------------------
+# auxiliary (multi-task) targets - all use only data AFTER the signal bar close, like the labels
+# --------------------------------------------------------------------------------------------
+AUX_NAMES = ("fvol", "up_exc", "dn_exc")
+AUX_VOL_BARS = 36           # forward realised-volatility window (3 h)
+AUX_EXC_BARS = 288          # excursion window (24 h)
+
+
+def aux_targets(kl: pd.DataFrame, vol_bars: int = AUX_VOL_BARS, exc_bars: int = AUX_EXC_BARS) -> dict[str, np.ndarray]:
+    """Per signal bar i (float32, NaN where the future or the ATR is missing):
+
+    fvol    ln( sqrt(mean(r_t^2, t=i+1..i+vol_bars)) / (ATR14_i / close_i) )   forward realised vol vs current ATR%
+    up_exc  ln(1 + max(high[i+1..i+exc_bars] - open[i+1], 0) / ATR14_i)        max favourable excursion of a long
+    dn_exc  ln(1 + max(open[i+1] - min(low[i+1..i+exc_bars]), 0) / ATR14_i)    max adverse excursion of a long
+                                                                               (= the favourable one of a short)
+    r_t = ln(close_t / close_{t-1}).  The excursion window is anchored at the entry bar (open[i+1])."""
+    n = len(kl)
+    o = kl["open"].to_numpy("float64")
+    hi = kl["high"].to_numpy("float64")
+    lo = kl["low"].to_numpy("float64")
+    cl = kl["close"].to_numpy("float64")
+    a = _atr(hi, lo, cl, 14)
+    out = {k: np.full(n, np.nan, dtype="float32") for k in AUX_NAMES}
+    if n < 2:
+        return out
+    r = np.diff(np.log(cl), prepend=np.nan)
+    r2 = np.nan_to_num(r * r)
+    cs = np.concatenate([[0.0], np.cumsum(r2)])               # cs[k] = sum r2[:k]
+    i = np.arange(n)
+    ok = i + vol_bars < n
+    fwd = np.full(n, np.nan)
+    fwd[ok] = (cs[i[ok] + vol_bars + 1] - cs[i[ok] + 1]) / vol_bars     # r2[i+1 .. i+vol_bars]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["fvol"][:] = np.log(np.sqrt(np.maximum(fwd, 1e-18)) / (a / cl))
+        s_hi = pd.Series(hi[::-1]).rolling(exc_bars, min_periods=exc_bars).max().to_numpy()[::-1]   # max hi[j..j+exc-1]
+        s_lo = pd.Series(lo[::-1]).rolling(exc_bars, min_periods=exc_bars).min().to_numpy()[::-1]
+        fmax = np.concatenate([s_hi[1:], [np.nan]])           # window starting at i+1
+        fmin = np.concatenate([s_lo[1:], [np.nan]])
+        ent = np.concatenate([o[1:], [np.nan]])
+        out["up_exc"][:] = np.log1p(np.maximum(fmax - ent, 0.0) / a)
+        out["dn_exc"][:] = np.log1p(np.maximum(ent - fmin, 0.0) / a)
+    for k in AUX_NAMES:
+        out[k][~np.isfinite(out[k])] = np.nan
+    return out

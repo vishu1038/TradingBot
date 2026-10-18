@@ -7,13 +7,14 @@ import numpy as np
 import pandas as pd
 
 from . import frames
-from .paths import (BAR_MS, archive_root, funding_path, kline_path, metrics_path)
+from .paths import (BAR_MS, archive_root, depth_path, funding_path, kline_path, metrics_path)
 
 
 def symbols_available(root: Path | None = None, kind: str = "klines") -> list[str]:
     """Symbols with a parquet file of `kind` (klines | metrics | funding), sorted."""
     root = root or archive_root()
-    d = {"klines": root / "klines" / "5m", "metrics": root / "metrics", "funding": root / "funding"}[kind]
+    d = {"klines": root / "klines" / "5m", "metrics": root / "metrics", "funding": root / "funding",
+         "depth": root / "depth"}[kind]
     if not d.is_dir():
         return []
     return sorted(p.stem for p in d.glob("*.parquet"))
@@ -32,6 +33,32 @@ def load(symbol: str, root: Path | None = None) -> tuple[pd.DataFrame, pd.DataFr
     me = frames.read_parquet(metrics_path(symbol, root), frames.empty_metrics)
     fu = frames.read_parquet(funding_path(symbol, root), frames.empty_funding)
     return kl, me, fu
+
+
+def load_depth(symbol: str, root: Path | None = None) -> pd.DataFrame:
+    """Aggregated 5m order-book depth frame (see tb.data.depth); empty typed frame if the symbol has none.
+    Only bars that had >= 1 snapshot have a row; use `align_depth` to put it on the kline index."""
+    from .depth import empty_depth
+    return frames.read_parquet(depth_path(symbol, root), empty_depth)
+
+
+def align_depth(kl: pd.DataFrame, depth: pd.DataFrame, max_ffill_bars: int = 0) -> pd.DataFrame:
+    """Depth columns reindexed to the kline rows (exact open_time match; NaN where the bar had no
+    snapshot).  Row i is the book as of the CLOSE of bar i (last snapshot <= close), so it is usable for a
+    decision taken at that bar's close and not earlier.  `max_ffill_bars` > 0 carries the last row forward
+    at most that many bars.  Adds `has_depth` (1.0 where a real row backs the bar, else 0.0)."""
+    cols = [c for c in depth.columns if c != "open_time"]
+    if len(depth) == 0:
+        out = pd.DataFrame({c: np.full(len(kl), np.nan, dtype="float32") for c in cols})
+        out["has_depth"] = 0.0
+        return out
+    d = depth.drop_duplicates("open_time").set_index("open_time")
+    out = d.reindex(kl["open_time"].to_numpy()).reset_index(drop=True)
+    has = out["snap_count"].notna().to_numpy()
+    if max_ffill_bars > 0:
+        out = out.ffill(limit=max_ffill_bars)
+    out["has_depth"] = has.astype("float64")
+    return out
 
 
 def clean_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
