@@ -356,6 +356,7 @@ class Engine:
         self.store.kv_set("start_equity", self.start_equity)
         self.store.kv_set("peak_equity", self.peak_equity)
         self.store.kv_set(cap.BASIS_KEY, self.cfg.capital_usd)
+        self.store.kv_set(cap.SINCE_KEY, int(self.clock()))   # equity chart restarts on the new basis
         if self.kill.get("tripped") and str(self.kill.get("reason", "")).startswith("drawdown"):
             log.warning("clearing a drawdown kill measured on the old equity basis")
             self.kill = {"tripped": False, "reason": "", "t": None}
