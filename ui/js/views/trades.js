@@ -19,8 +19,8 @@ const COLS = [
   ['exit_price', 'exit', (t) => fmtPrice(t.exit_price)],
   ['qty', 'qty', (t) => fmtQty(t.qty)],
   ['pnl', 'PnL', (t) => `<span class="${signClass(t.pnl)} strong">${fmtUsd(t.pnl, 2, true)}</span>`],
-  ['fees', 'fees', (t) => `<span class="dim">${fmtUsd(t.fees, 3)}</span>`],
-  ['funding', 'funding', (t) => `<span class="dim">${fmtUsd(t.funding, 3, true)}</span>`],
+  ['fees', 'fees (cost)', (t) => `<span class="dim">${fmtUsd(t.fees, 3)}</span>`],
+  ['funding', 'funding (cost)', (t) => `<span class="dim">${fmtUsd(t.funding, 3, true)}</span>`],
   ['exit_reason', 'reason', (t) => exitPill(t.exit_reason)],
   ['prob', 'prob', (t) => (isNum(t.prob) ? t.prob.toFixed(2) : '–')],
   ['dur', 'held', (t) => fmtDuration(t.closed_at - t.opened_at)],
@@ -88,8 +88,8 @@ export function mount(root) {
     $('summary').innerHTML = `<div class="tiles t7">
       ${tile('TRADES', esc(s.n))}
       ${tile('WIN RATE', s.winRate == null ? '–' : `${s.winRate.toFixed(1)}%`, s.winRate >= 50 ? 'pos' : 'neg')}
-      ${tile('TOTAL PNL', fmtUsd(s.total, 2, true), signClass(s.total))}
-      ${tile('FEES', fmtUsd(s.fees, 2), 'dim')}
+      ${tile('NET PNL', fmtUsd(s.total, 2, true), signClass(s.total))}
+      ${tile('FEES PAID', fmtUsd(s.fees, 2), 'dim')}
       ${tile('AVG WIN', s.avgWin == null ? '–' : fmtUsd(s.avgWin, 2, true), 'pos')}
       ${tile('AVG LOSS', s.avgLoss == null ? '–' : fmtUsd(s.avgLoss, 2, true), 'neg')}
       ${tile('PROFIT FACTOR', s.pf == null ? '–' : fmtNum(s.pf, 2), s.pf >= 1 ? 'pos' : 'neg')}
