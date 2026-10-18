@@ -1,6 +1,5 @@
 import logging
 import tkinter as tk
-import logging
 
 from connectors.bitmex import BitmexClient
 from connectors.binance_futures import BinanceFuturesClient
@@ -33,7 +32,10 @@ class Root(tk.Tk):
         self._right_frame = tk.Frame(self, bg=BG_COLOR)
         self._right_frame.pack(side=tk.LEFT)
 
-        self._watchlist_frame = Watchlist(self.binance.contracts, self.bitmex.contracts,
+        # Either connector may be None if it failed to initialize (e.g. missing keys); an
+        # empty contract list means the watchlist simply won't accept that exchange's symbols.
+        self._watchlist_frame = Watchlist(self.binance.contracts if self.binance else {},
+                                          self.bitmex.contracts if self.bitmex else {},
                                           self._left_frame, bg=BG_COLOR)
         self._watchlist_frame.pack(side=tk.TOP)
 
@@ -76,15 +78,13 @@ class Root(tk.Tk):
 
         # Logs
 
-        for log in self.bitmex.logs:
-            if not log['displayed']:
-                self._logging_frame.add_log(log['log'])
-                log['displayed'] = True
-
-        for log in self.binance.logs:
-            if not log['displayed']:
-                self._logging_frame.add_log(log['log'])
-                log['displayed'] = True
+        for client in (self.bitmex, self.binance):
+            if client is None:
+                continue
+            for log in client.logs:
+                if not log['displayed']:
+                    self._logging_frame.add_log(log['log'])
+                    log['displayed'] = True
 
         # WatchList Prices
 

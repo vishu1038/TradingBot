@@ -10,7 +10,7 @@ class TradesWatch(tk.Frame):
 
         self.body_widgets = dict()
 
-        self._headers = ["time", "exchange", "strategy", "side", "quantity", "status", "pnl"]
+        self._headers = ["time", "symbol", "exchange", "strategy", "side", "quantity", "status", "pnl"]
 
         self._table_frame = tk.Frame(self, bg=BG_COLOR)
         self._table_frame.pack(side=tk.TOP)

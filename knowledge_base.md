@@ -289,7 +289,6 @@ Phases 0–2 are scaffolded and runnable. Status:
 | Warm-started (incremental) CEM training | `learning/train.py` (`init_theta`) | ✅ |
 | Multi-core training offload (process pool, fixes GUI GIL starvation) | `run_live.py` (`--train-workers`) | ✅ |
 | MLP policy (tanh hidden layer) replacing bare linear map | `learning/train.py` (`MLPPolicy`), `strategies/rl_strategy.py` | ✅ |
-| Optional Claude advisory overlay via local `claude` CLI (no API key) | `advisors/claude_cli_advisor.py` (`--claude-advisor`) | ✅ |
 | Validated edge on REAL data (walk-forward) | — | ⬜ needs market access |
 | Live paper run on testnet | — | ⬜ needs exchange-reachable network + keys |
 
@@ -405,23 +404,9 @@ real value at the edges:
 - Use the **Anthropic Python SDK** with the latest model (e.g. `claude-opus-4-8` for analysis,
   `claude-haiku-4-5` for cheap high-frequency sentiment scoring).
 
-**Implemented — Claude advisor with no API key (`advisors/claude_cli_advisor.py`).** Because
-this environment has the authenticated `claude` Code CLI (subscription auth) but **no Anthropic
-API key**, the advisor shells out headlessly instead of using the SDK:
-`claude -p "<prompt>" --output-format json --system-prompt "<advisor persona>"
---exclude-dynamic-system-prompt-sections --model opus`, and reads the answer from the JSON
-envelope's `result` field. Two CLI gotchas were essential: (1) `claude -p` by default runs the
-full Claude Code *coding agent*, so `--system-prompt` must **replace** that framing with a terse
-JSON-only advisor persona or it just offers to help with your project; (2) on Windows you must
-invoke `claude.cmd` — `shutil.which("claude")` returns an extensionless shim `subprocess` can't
-exec. `ClaudeAdvisor` runs a **slow** background thread (default every 300 s — each call is
-~3-10 s of latency and counts against subscription usage; this is a *macro* overlay, not a
-per-tick signal) producing `{bias∈[-1,1], confidence∈[0,1], veto, rationale}` per symbol. Every
-failure mode (CLI missing, timeout, non-zero exit, unparseable output) degrades to NEUTRAL so it
-can never block the trading loop. `AdvisedStrategy` wraps the base strategy and lets the advice
-only **gate** signals — veto → flat, or suppress entries that fight a confident directional bias
-— it never invents trades, so the deterministic engine + `RiskManager` stay authoritative.
-Default **OFF**; enable with `--claude-advisor` (tune `--advisor-interval`, `--advisor-model`).
+**Removed — Claude CLI trade advisor.** An earlier version shelled out to the `claude` CLI
+to veto/bias trades. It was dropped: LLM answers are non-deterministic and slow, so the overlay
+could not be backtested or judged by the promotion gate, which every trading signal must pass.
 
 ### D. Hybrid / ensemble *(realistic production shape)*
 - **ML signal (B-A) → RL or rules for sizing/risk → LLM for sentiment feature + alerts.** Each

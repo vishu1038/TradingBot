@@ -12,9 +12,9 @@ pandas
 scikit-learn
 joblib
 
-# Gradient-boosted tree models for the supervised-ML strategy.
-# LightGBM is the default; either works with strategies/ml_strategy.py.
-lightgbm
+# Optional: faster gradient-boosted trees for the supervised-ML strategy.
+# strategies/ml_strategy.py falls back to scikit-learn when LightGBM isn't installed.
+# lightgbm
 # xgboost            # uncomment to use XGBoost instead of LightGBM
 
 # --- Optional, recommended later ---

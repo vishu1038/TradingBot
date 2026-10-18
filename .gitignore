@@ -29,3 +29,7 @@ models/*.zip
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# IDE / assistant session notes
+.idea/
+.claude/

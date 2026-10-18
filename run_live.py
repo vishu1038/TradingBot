@@ -206,23 +206,6 @@ def select_active_universe(real_client, *, size: int = 8, min_quote_volume: floa
         return [s.strip().upper() for s in DEFAULT_SYMBOLS.split(",")][:size]
 
 
-def build_training_df(use_live: bool, real_client, symbol: str, timeframe: str,
-                      n_bars: int = 5000):
-    """OHLCV frame to train the RL policy on: live history if reachable, else synthetic."""
-    if use_live and real_client is not None:
-        try:
-            df = fetch_history(real_client, symbol, timeframe, n_bars)
-            if df is not None and len(df) >= 500:
-                logger.info("Training data: %d live %s %s candles.",
-                            len(df), symbol, timeframe)
-                return df
-            logger.warning("Live history too short (%s candles); training on synthetic.",
-                           0 if df is None else len(df))
-        except Exception as e:
-            logger.warning("Could not fetch live history (%s); training on synthetic.", e)
-    return make_synthetic_ohlcv(n=max(3000, n_bars))
-
-
 class MultiEngineController:
     """Fans start/stop/readiness across N per-symbol engines and publishes aggregate state.
 
@@ -386,7 +369,7 @@ class ContinuousTrainer:
 
     def __init__(self, engines, event_bus, fetch_df, *, iterations: int,
                  population: int, train_bars: int, interval: float,
-                 workers: int = 0, swap_into_engine: bool = True, advisor=None,
+                 workers: int = 0, swap_into_engine: bool = True,
                  churn_penalty: float = 0.0):
         self.engines = engines
         self.event_bus = event_bus
@@ -405,7 +388,6 @@ class ContinuousTrainer:
         self.workers = int(workers) if workers and workers > 0 else \
             max(1, min(n_sym, (_os.cpu_count() or 2) - 1))
         self.swap_into_engine = swap_into_engine
-        self.advisor = advisor              # optional ClaudeAdvisor: wraps the swapped strategy
         self._theta: typing.Dict[str, typing.Any] = {}   # symbol -> last flat policy
         self._stop = threading.Event()
         self._thread: typing.Optional[threading.Thread] = None
@@ -466,11 +448,7 @@ class ContinuousTrainer:
             return
         self._theta[sym] = res.get("theta")
         if self.swap_into_engine and res.get("policy") and sym in self.engines:
-            strat = RLStrategy(policy=res["policy"])
-            if self.advisor is not None:    # optional Claude advisory overlay (gates trades)
-                from advisors.claude_cli_advisor import AdvisedStrategy
-                strat = AdvisedStrategy(strat, self.advisor, sym)
-            self.engines[sym].strategy = strat
+            self.engines[sym].strategy = RLStrategy(policy=res["policy"])
         best = res.get("best_reward", 0.0)
         logger.info("[trainer] %s cycle %d: best=%+.5f — RL policy hot-swapped (%s).",
                     sym, self.cycle, best, source)
@@ -733,14 +711,6 @@ def main() -> None:
     ap.add_argument("--train-workers", type=int, default=0,
                     help="parallel training PROCESSES (0 = auto: min(#symbols, cpu-1)). "
                          "Offloads CEM off the main process so the dashboard stays responsive.")
-    # --- optional Claude CLI advisor (no API key — uses the local `claude` subscription) ---
-    ap.add_argument("--claude-advisor", action="store_true",
-                    help="enable a SLOW Claude advisory overlay via the `claude` CLI that can "
-                         "veto/bias trades (advisory only; needs the claude CLI on PATH)")
-    ap.add_argument("--advisor-interval", type=float, default=300.0,
-                    help="seconds between Claude advisory refreshes per symbol")
-    ap.add_argument("--advisor-model", default="opus",
-                    help="model for the Claude advisor (CLI alias, e.g. opus/sonnet/haiku)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s :: %(message)s")
@@ -844,30 +814,20 @@ def main() -> None:
     controller = MultiEngineController(engines, GLOBAL_BUS, args.capital)
 
     # Per-symbol training-data provider: a long live history (paged from the exchange) when
-    # reachable, else a stable synthetic frame for that symbol. Shared by the manual "Train
-    # RL" button and the continuous retraining loop.
+    # live, else a stable synthetic frame matching that symbol's replay feed. Shared by the
+    # manual "Train RL" button and the continuous retraining loop. A live engine is never
+    # trained on synthetic data: if history is unavailable it returns None and training skips.
     def fetch_training_df(symbol: str):
-        if use_live and real_client is not None:
+        if use_live:
             df = fetch_history(real_client, symbol, args.timeframe, args.history)
             if df is not None and len(df) >= 300:
                 return df
-            logger.warning("[trainer] %s: live history unavailable; using synthetic.", symbol)
+            logger.warning("[trainer] %s: live history unavailable; skipping training.", symbol)
+            return None
         i = symbols.index(symbol) if symbol in symbols else 0
         start_px = _REPLAY_START_PRICE.get(symbol, 100.0 * (i + 1))
         return make_synthetic_ohlcv(n=max(3000, args.history), seed=7 + i,
                                     start_price=start_px)
-
-    # Optional Claude advisory overlay (off unless --claude-advisor). Uses the local `claude`
-    # CLI (no API key). Advisory only: it can veto/bias the engine's trades, never place them.
-    advisor = None
-    if args.claude_advisor:
-        from advisors.claude_cli_advisor import ClaudeAdvisor, available as _claude_ok
-        if _claude_ok():
-            advisor = ClaudeAdvisor(list(engines.keys()), fetch_training_df, GLOBAL_BUS,
-                                    interval=args.advisor_interval, timeframe=args.timeframe,
-                                    model=args.advisor_model)
-        else:
-            logger.warning("--claude-advisor requested but `claude` CLI not on PATH; skipping.")
 
     # Always-on background learner: keeps each symbol's RL policy adapting to fresh data and
     # hot-swaps it into the live engine. Disable with --no-continuous.
@@ -877,7 +837,7 @@ def main() -> None:
             engines, GLOBAL_BUS, fetch_training_df,
             iterations=args.train_iterations, population=args.train_population,
             train_bars=args.train_bars, interval=args.train_interval,
-            workers=args.train_workers, advisor=advisor,
+            workers=args.train_workers,
             churn_penalty=args.churn_penalty,
         )
 
@@ -888,6 +848,8 @@ def main() -> None:
 
     def start_training():
         df = fetch_training_df(train_symbol)
+        if df is None:
+            return {"ok": False, "error": f"no live history for {train_symbol}"}
         logger.info("Manual training: RL policy on %s (%d bars, %s)...", train_symbol,
                     len(df), "live data" if use_live else "synthetic feed")
         init_theta = trainer._theta.get(train_symbol) if trainer is not None else None
@@ -916,8 +878,6 @@ def main() -> None:
     ctx = AppContext(event_bus=GLOBAL_BUS, engine=controller, start_training=start_training)
     server = DashboardServer(ctx, host=args.host, port=args.port)
     server.start()
-    if advisor is not None:
-        advisor.start()
     if trainer is not None:
         trainer.start()
     if universe_mgr is not None:
@@ -952,8 +912,6 @@ def main() -> None:
     except KeyboardInterrupt:
         if universe_mgr is not None:
             universe_mgr.stop()
-        if advisor is not None:
-            advisor.stop()
         if trainer is not None:
             trainer.stop()
         controller.stop()
