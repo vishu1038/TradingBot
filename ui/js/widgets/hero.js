@@ -52,7 +52,7 @@ export function createHero() {
         <span class="chipx ${hb[1]}">${esc(hb[0])}</span>
         <span class="chipx vio">DD ${fmtNum(s.drawdown_pct || 0, 2)}%</span>
         <span class="chipx amb">SIZE x${fmtNum(sf.derate, 2)}</span>
-        <span class="chipx sky">${esc(s.open_positions)}/${esc(s.max_positions)} OPEN</span>
+        <span class="chipx sky">${s.max_positions == null ? esc(s.open_positions) : `${esc(s.open_positions)}/${esc(s.max_positions)}`} OPEN</span>
         <span class="chipx pnk">WIN ${wr == null ? '–' : wr.toFixed(0) + '%'}</span>
       </div>`;
   }

@@ -54,8 +54,11 @@ const FEATURES = [
 
 export const DEFAULT_SETTINGS = () => ({
   slice_margin_usd: 20,
-  leverage: 8,
-  max_positions: 5,
+  max_leverage: 20, // leverage is chosen automatically per trade (stop distance), capped here
+  max_positions: null, // optional hard cap; concurrency is limited by total leverage + maintenance margin
+  max_total_leverage: 20,
+  max_margin_ratio: 0.5,
+  max_open_risk_pct: 20,
   exit_mode: 'atr',
   tp_usd: 5,
   sl_usd: 10,
@@ -76,8 +79,11 @@ export const DEFAULT_SETTINGS = () => ({
 // [path, min, max, integer?]
 const SETTINGS_RULES = [
   ['slice_margin_usd', 1, 10000],
-  ['leverage', 1, 50, true],
-  ['max_positions', 1, 20, true],
+  ['max_leverage', 1, 125, true],
+  ['max_positions', 1, 20, true, true],
+  ['max_total_leverage', 0.5, 50],
+  ['max_margin_ratio', 0.01, 1],
+  ['max_open_risk_pct', 0.5, 100],
   ['tp_usd', 0.01, 10000],
   ['sl_usd', 0.01, 10000],
   ['tp_atr', 0.1, 20],
@@ -436,7 +442,7 @@ export class MockServer {
   // ------------------------------------------------------------- positions
   _sizePosition(entry, atr, side, mult = 1) {
     const st = this.settings;
-    const notionalCap = st.slice_margin_usd * st.leverage;
+    const notionalCap = st.slice_margin_usd * 8; // base notional per trade; leverage itself is derived below
     const dir = side === 'long' ? 1 : -1;
     let tpDist;
     let slDist;
@@ -454,7 +460,8 @@ export class MockServer {
     return {
       qty,
       notional: qty * entry,
-      margin: (qty * entry) / st.leverage,
+      margin: (qty * entry) / Math.max(1, Math.min(st.max_leverage, Math.round(0.1 / (Math.abs(slDist) / entry)))),
+      leverage: Math.max(1, Math.min(st.max_leverage, Math.round(0.1 / (Math.abs(slDist) / entry)))),
       tp_price: entry + dir * tpDist,
       sl_price: entry - dir * slDist,
       risk: slDist,
@@ -471,7 +478,7 @@ export class MockServer {
       entry_price: entry,
       qty: sz.qty,
       notional: sz.notional,
-      leverage: this.settings.leverage,
+      leverage: sz.leverage,
       margin: sz.margin,
       sl_price: sz.sl_price,
       tp_price: sz.tp_price,
@@ -613,6 +620,12 @@ export class MockServer {
       drawdown_pct: +dd.toFixed(3),
       open_positions: this.positions.length,
       max_positions: this._maxPositions(),
+      total_leverage: +this._totalLeverage().toFixed(3),
+      max_total_leverage: st.max_total_leverage,
+      margin_ratio: +this._marginRatio().toFixed(3),
+      max_margin_ratio: st.max_margin_ratio,
+      open_risk_pct: +this._openRisk().toFixed(3),
+      max_open_risk_pct: st.max_open_risk_pct,
       trades_today: today.length,
       win_rate: this.trades.length ? +(wins / this.trades.length).toFixed(4) : 0,
       kill: { ...this.kill },
@@ -801,7 +814,25 @@ export class MockServer {
 
   _maxPositions() {
     const st = this.settings;
-    return Math.max(0, Math.min(st.max_positions, Math.floor(this._equity() / st.slice_margin_usd)));
+    return st.max_positions == null ? null : Math.max(0, Math.min(st.max_positions, Math.floor(this._equity() / st.slice_margin_usd)));
+  }
+
+  /** sum(notional) / equity */
+  _totalLeverage() {
+    const eq = this._equity();
+    return eq > 0 ? this.positions.reduce((a, p) => a + p.notional, 0) / eq : 0;
+  }
+
+  /** maintenance margin (0.5 % of notional) / equity, as a fraction (0.5 = 50 %) */
+  _marginRatio() {
+    const eq = this._equity();
+    return eq > 0 ? this.positions.reduce((a, p) => a + p.notional * 0.005, 0) / eq : 0;
+  }
+
+  /** loss if every open position hits its stop, % of equity */
+  _openRisk() {
+    const eq = this._equity();
+    return eq > 0 ? (this.positions.reduce((a, p) => a + p._risk * p.qty, 0) / eq) * 100 : 0;
   }
 
   // ---------------------------------------------------------------- seeding
@@ -1102,8 +1133,13 @@ export class MockServer {
       }
       if (this.positions.some((p) => p.symbol === sym)) continue;
       if ((this.cooldown[sym] || 0) > this.tickN) continue;
-      if (this.positions.length >= cfgMax) {
+      if (cfgMax != null && this.positions.length >= cfgMax) {
         this._log('INFO', `[risk] skip ${sym}: ${this.positions.length}/${cfgMax} slots used`);
+        continue;
+      }
+      const addLev = (this.settings.slice_margin_usd * 8) / Math.max(1, this._equity());
+      if (this._totalLeverage() + addLev > this.settings.max_total_leverage) {
+        this._log('INFO', `[risk] skip ${sym}: total leverage ${this._totalLeverage().toFixed(1)}x + ${addLev.toFixed(1)}x > ${this.settings.max_total_leverage}x`);
         continue;
       }
       this._openPosition(S, sig.action, sig);
@@ -1204,8 +1240,9 @@ export class MockServer {
   // ------------------------------------------------------------------ REST
   _validateSettings(patch) {
     const merged = this._deepMerge(JSON.parse(JSON.stringify(this.settings)), patch);
-    for (const [path, lo, hi, int] of SETTINGS_RULES) {
+    for (const [path, lo, hi, int, optional] of SETTINGS_RULES) {
       const v = path.split('.').reduce((o, k) => (o == null ? o : o[k]), merged);
+      if (optional && v === null) continue;
       if (typeof v !== 'number' || !Number.isFinite(v)) return `${path}: must be a number`;
       if (v < lo || v > hi) return `${path}: must be between ${lo} and ${hi}`;
       if (int && !Number.isInteger(v)) return `${path}: must be an integer`;

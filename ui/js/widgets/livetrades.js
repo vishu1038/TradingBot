@@ -1,6 +1,6 @@
 // LIVE TRADES: the bot's open positions (live uPnL, TP/SL progress, close [x]) + recently closed trades.
 import { store } from '../state.js';
-import { esc, fmtPrice, fmtUsd, fmtDuration, fmtDateTime, signClass, throttle, shortSym } from '../format.js';
+import { isNum, esc, fmtPrice, fmtUsd, fmtDuration, fmtDateTime, signClass, throttle, shortSym } from '../format.js';
 import { symLabel, sidePill, exitPill, slTpBar } from '../components.js';
 import { closePosition } from '../actions.js';
 import { selectSymbol } from '../sync.js';
@@ -21,7 +21,7 @@ export function createLiveTrades() {
     const open = ps
       .map(
         (p) => `<tr class="lt-open ${p.symbol === sel ? 'cur' : ''}" data-sym="${esc(p.symbol)}">
-          <td>${symLabel(p.symbol)} ${sidePill(p.side)}</td>
+          <td>${symLabel(p.symbol)} ${sidePill(p.side)} <span class="lev" title="leverage chosen for this trade">${isNum(p.leverage) ? `${esc(p.leverage)}×` : ''}</span></td>
           <td class="r hide-s">${fmtPrice(p.entry_price)}</td>
           <td class="r">${fmtPrice(p.mark_price)}</td>
           <td class="lt-bar hide-s">${slTpBar(p)}</td>

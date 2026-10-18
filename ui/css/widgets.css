@@ -133,6 +133,18 @@
 .l-mid { display: flex; justify-content: space-between; align-items: baseline; padding: 4px 6px; margin: 3px 0; border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); font-size: 13px; }
 
 /* ------------------------------------------------------------------ BOT / MARKET panels */
+.lev { font-size: 10.5px; font-weight: 700; color: var(--violet); border: 1px solid color-mix(in srgb, var(--violet) 50%, transparent); border-radius: 999px; padding: 0 6px; margin-left: 2px; }
+.lev:empty { display: none; }
+.auto-pill { justify-self: end; color: var(--cyan); border: 1px solid var(--cyan); border-radius: 999px; padding: 2px 14px; font-weight: 700; letter-spacing: 0.08em; }
+.lim { margin: 2px 0 7px; }
+.lim-top { display: flex; justify-content: space-between; font-size: 12px; }
+.lim-top span:first-child { color: var(--text-dim); }
+.lim-bar { height: 7px; border-radius: 4px; background: #11111a; overflow: hidden; margin-top: 3px; }
+.lim-bar i { display: block; height: 100%; border-radius: 4px; background: linear-gradient(90deg, #2a86b8, var(--teal)); transition: width 0.4s; }
+.lim.warn i { background: linear-gradient(90deg, var(--yellow), var(--amber)); }
+.lim.warn .lim-top b { color: var(--amber); }
+.lim.crit i { background: var(--red); box-shadow: 0 0 8px var(--red); }
+.lim.crit .lim-top b { color: var(--red); }
 .ctl-label { font-size: 9.5px; letter-spacing: 0.16em; color: var(--text-dim); margin: 10px 0 6px; }
 .ctl-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; align-items: center; }
 .ctl-coin { font-size: 13px; margin-right: 2px; }

@@ -14,8 +14,13 @@ const SECTIONS = [
     title: 'POSITION SIZING',
     fields: [
       { k: 'slice_margin_usd', label: 'slice margin (USD)', type: 'num', min: 1, max: 10000, step: 1, hint: 'isolated margin per position; notional = margin x leverage' },
-      { k: 'leverage', label: 'leverage', type: 'int', min: 1, max: 50, step: 1 },
-      { k: 'max_positions', label: 'max positions', type: 'int', min: 1, max: 20, step: 1, hint: 'capped by floor(equity / slice margin)' },
+      { k: 'leverage', label: 'leverage per trade', type: 'int', min: 1, max: 125, step: 1, ifPresent: true, hint: 'legacy fixed leverage; the engine now picks leverage per trade' },
+      { k: '__lev_auto', label: 'leverage per trade', type: 'info', whenAbsent: 'leverage', text: 'auto', hint: 'chosen per trade from the stop distance, capped by max leverage' },
+      { k: 'max_leverage', label: 'max leverage (×)', type: 'int', min: 1, max: 125, step: 1, ifPresent: true, hint: 'upper cap for the automatic per-trade leverage' },
+      { k: 'max_total_leverage', label: 'max total leverage (×)', type: 'num', min: 0.5, max: 125, step: 0.5, ifPresent: true, hint: 'sum of open notionals / equity; limits concurrent trades' },
+      { k: 'max_margin_ratio', label: 'max maintenance margin ratio', type: 'num', min: 0.01, max: 1, step: 0.01, ifPresent: true, hint: 'maintenance margin / equity as a fraction (0.50 = 50 %); new entries stop at this level' },
+      { k: 'max_open_risk_pct', label: 'max open risk (% of equity)', type: 'num', min: 0.5, max: 100, step: 0.5, ifPresent: true, hint: 'loss if every open trade hits its stop; new entries stop at this level' },
+      { k: 'max_positions', label: 'max positions (optional)', type: 'int', min: 1, max: 20, step: 1, optional: true, hint: 'leave empty for no hard cap (leverage and margin limit the count)' },
     ],
   },
   {
@@ -67,6 +72,8 @@ function setPath(o, path, v) {
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 export function validateField(f, v) {
+  if (v === undefined && f.ifPresent) return null; // older backend does not have this setting
+  if (v === null && f.optional) return null;
   if (f.type === 'bool') return typeof v === 'boolean' ? null : 'must be on/off';
   if (f.type === 'select') return f.options.includes(v) ? null : `must be one of ${f.options.join(', ')}`;
   if (!isNum(v)) return 'must be a number';
@@ -76,7 +83,7 @@ export function validateField(f, v) {
 }
 
 export function mount(root) {
-  const ALL = SECTIONS.flatMap((s) => s.fields);
+  const ALL = SECTIONS.flatMap((s) => s.fields).filter((f) => f.type !== 'info');
   // the sound toggle lives in this browser (localStorage); show its effective value as the baseline
   const localize = (st) => (st ? { ...clone(st), sound: sound.isEnabled() } : st);
   let server = localize(store.get('settings'));
@@ -98,9 +105,10 @@ export function mount(root) {
   function inputHtml(f) {
     const v = getPath(draft, f.k);
     const id = `f-${f.k.replace(/\./g, '-')}`;
+    if (f.type === 'info') return `<span class="auto-pill">${esc(f.text)}</span>`;
     if (f.type === 'bool') return `<label class="switch"><input type="checkbox" id="${id}" data-k="${f.k}" ${v ? 'checked' : ''}><span class="slider"></span><span class="sw-t">${v ? 'ON' : 'OFF'}</span></label>`;
     if (f.type === 'select') return `<select id="${id}" data-k="${f.k}">${f.options.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
-    return `<input type="number" id="${id}" data-k="${f.k}" value="${esc(v)}" min="${f.min}" max="${f.max}" step="${f.step}" inputmode="decimal">`;
+    return `<input type="number" id="${id}" data-k="${f.k}" value="${esc(v ?? '')}" ${f.optional ? 'placeholder="no cap"' : ''} min="${f.min}" max="${f.max}" step="${f.step}" inputmode="decimal">`;
   }
 
   function render() {
@@ -117,6 +125,7 @@ export function mount(root) {
       <div class="settings-grid">
         ${SECTIONS.map(
           (s) => `<fieldset><legend>${esc(s.title)}</legend>${s.fields
+            .filter((f) => !(f.ifPresent && getPath(server, f.k) === undefined) && !(f.whenAbsent && getPath(server, f.whenAbsent) !== undefined))
             .map((f) => {
               const inactive = f.when && f.when !== mode;
               return `<div class="field ${inactive ? 'inactive' : ''} ${errors[f.k] ? 'invalid' : ''} ${dirty.includes(f.k) ? 'dirty' : ''}">
@@ -143,7 +152,7 @@ export function mount(root) {
     let v;
     if (f.type === 'bool') v = e.target.checked;
     else if (f.type === 'select') v = e.target.value;
-    else v = e.target.value === '' ? NaN : Number(e.target.value);
+    else v = e.target.value === '' ? (f.optional ? null : NaN) : Number(e.target.value);
     setPath(draft, k, v);
     errors[k] = validateField(f, v);
     if (f.type === 'bool' && k === 'sound') sound.setEnabled(v);
@@ -192,7 +201,7 @@ export function mount(root) {
     btn.textContent = 'SAVING…';
     try {
       const saved = await api.saveSettings(patch);
-      const fresh = saved && typeof saved === 'object' && 'leverage' in saved ? saved : await api.settings();
+      const fresh = saved && typeof saved === 'object' && 'slice_margin_usd' in saved ? saved : await api.settings();
       store.set('settings', fresh);
       server = localize(fresh);
       draft = clone(server);

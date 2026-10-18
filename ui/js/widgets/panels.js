@@ -9,6 +9,21 @@ import { toggleRun, closeSymbol, togglePause, refreshUniverse, pausedSet, positi
 
 const TREND = { up: ['▲ UP', 'pos'], down: ['▼ DOWN', 'neg'], flat: ['▬ FLAT', 'flat'] };
 
+/** margin ratio may come as a fraction (0.5 = 50 %) or already in percent: show percent either way. */
+function frac(v, lim) {
+  return isNum(lim) && lim <= 1 ? [isNum(v) ? v * 100 : v, lim * 100] : [v, lim];
+}
+
+/** Limit gauge: teal < 80 % of the limit, amber from 80 %, red at the limit. Absent fields (older backend) render nothing. */
+function gauge(label, value, limit, fmt, unit) {
+  if (!isNum(value) || !isNum(limit) || limit <= 0) return '';
+  const f = value / limit;
+  const cls = f >= 1 ? 'crit' : f > 0.8 ? 'warn' : 'ok';
+  return `<div class="lim ${cls}" title="${esc(label)} ${fmt(value)}${unit} of ${fmt(limit)}${unit} limit">
+    <div class="lim-top"><span>${esc(label)}</span><b>${fmt(value)} <span class="dim">/ ${fmt(limit)}${unit}</span></b></div>
+    <div class="lim-bar"><i style="width:${Math.min(100, f * 100).toFixed(1)}%"></i></div></div>`;
+}
+
 export function createBotPanel() {
   const el = document.createElement('div');
   el.className = 'card botpanel ac-violet';
@@ -34,10 +49,13 @@ export function createBotPanel() {
     body.innerHTML = `
       <div class="tiles">
         ${tile('WIN', wr == null ? '–' : `${wr.toFixed(1)}%`, wr == null ? '' : wr >= 50 ? 'pos' : 'neg')}
-        ${tile('OPEN', `${esc(s.open_positions)}/${esc(s.max_positions)}`, 'c-sky')}
+        ${tile('OPEN', s.max_positions == null ? `${esc(s.open_positions)} open` : `${esc(s.open_positions)}/${esc(s.max_positions)}`, 'c-sky')}
         ${tile('TODAY', esc(s.trades_today), 'c-pink')}
         ${tile('SIZE', `x${fmtNum(sf.derate, 2)}`, sf.derate >= 0.99 ? 'c-amber' : sf.derate >= 0.5 ? 'warn' : 'neg')}
       </div>
+      ${gauge('Leverage', s.total_leverage, s.max_total_leverage, (v) => v.toFixed(1), '×')}
+      ${gauge('Maint. margin', frac(s.margin_ratio, s.max_margin_ratio)[0], frac(s.margin_ratio, s.max_margin_ratio)[1], (v) => v.toFixed(1), ' %')}
+      ${gauge('Open risk', s.open_risk_pct, s.max_open_risk_pct, (v) => v.toFixed(1), ' %')}
       <div class="kv-grid">
         ${kv('model', `${esc(m.name || '–')} <span class="dim">v${esc(m.version || '–')}</span>`)}
         ${kv('thresholds', `L ${isNum(m.threshold_long) ? m.threshold_long.toFixed(2) : '–'} <span class="dim">/</span> S ${isNum(m.threshold_short) ? m.threshold_short.toFixed(2) : '–'}`)}
