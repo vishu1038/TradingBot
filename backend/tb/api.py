@@ -48,6 +48,15 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
     app.add_middleware(CORSMiddleware, allow_origin_regex=LOCAL_ORIGIN, allow_methods=["*"], allow_headers=["*"])
     app.state.store = store
 
+    @app.middleware("http")
+    async def no_stale_ui(request, call_next):
+        # The UI is unbundled ES modules; without this Safari keeps old modules after a UI update
+        # and mixes versions. no-cache = always revalidate (ETag makes it a cheap 304).
+        resp = await call_next(request)
+        if not request.url.path.startswith("/api"):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     # ------------------------------------------------------------------ builders
     def heartbeat_age() -> tuple[float | None, dict | None]:
         hb = store.heartbeat()
