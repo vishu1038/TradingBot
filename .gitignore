@@ -33,3 +33,10 @@ Thumbs.db
 # IDE / assistant session notes
 .idea/
 .claude/
+
+# v2 runtime
+.venv-ml/
+var/
+data/archive/
+models/
+node_modules/
