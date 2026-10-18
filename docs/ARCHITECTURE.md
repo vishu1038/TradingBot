@@ -26,6 +26,41 @@ fixed-risk template. Mostly long; shorts only on a stricter threshold.
 - Model inference in the engine is **pure numpy** (weights exported from torch to `.npz`), so the
   backend runs anywhere (Mac, VPS, Pi) without torch.
 
+## UI layout & style (user-approved 2026-10-18)
+**Style: hybrid.** Terminal chrome — black background, box-drawn panel frames with `╭─ TITLE ─╮`
+headers, monospace numbers/logs, `/` command palette, ASCII spinners, typed-out log lines,
+rainbow logo — plus modern foreground controls (pill buttons, toggles, sliders, smooth gauges,
+glowing cards, charts) sized for touch. **Lots of colour** (Claude Code multicolour): each panel
+its own accent (coral, violet, cyan, lime, amber, pink…), each coin a fixed colour everywhere,
+probabilities on a cool→hot gradient; profit green / loss red reserved for money only.
+**Effects:** "loud but readable" default (flash + glitch on TP/SL/kill only) + a calm↔degen
+slider in Settings; respect prefers-reduced-motion. **Keyboard-first** on desktop (shortcuts for
+every action, j/k between coins, `/` palette: /kill /history /lab /coin SOL /pause WIF …).
+
+**Page 1 (main):**
+- Top bar (always visible, every page): logo, mode pill, safety lamp, equity + PnL, drawdown +
+  derate gauge, START/STOP, **KILL**, `/` palette.
+- Symbols bar: each hot coin = price, 24h %, model prob, ● if the bot holds it; ⟳ force refresh.
+- Left column: **Hero card** (small, top-left) rotating every 30 s through 4 cards — PnL+health,
+  open trades (uPnL + TP/SL progress bars), mini chart, bot brain (per-coin prob vs threshold) —
+  with a progress bar; **pauses on hover/touch**; **events jump to their card** (TP/SL → open
+  trades, new entry → brain, kill/degraded → health); swipe/drag to flip. Below it the **main
+  candlestick chart** (fixed, never rotates): candles, volume, EMAs, entry/TP/SL/trail lines,
+  model-prob strip with dashed threshold. Below the chart: **Live trades** = the bot's open
+  positions (live uPnL, close [×]) + recently closed trades.
+- Right column, stacked: **Depth chart** (bid/ask cumulative depth at ±0.2/1/2/3/4/5 % — the same
+  bands the model reads; a small ladder tab inside), **Bot stats & controls** (win rate, open/max,
+  model, drift; start/stop, close position, pause coin, force universe refresh), **Market / stats**
+  (BTC trend, volatility, funding, L/S ratio).
+**Page 2: Bot settings** (full page): risk, exits, universe, model thresholds, safety, alerts,
+effects slider, sound — and a **separate LIVE-mode card** with type-to-confirm boxes (e.g. type
+`LIVE $100`), the −25 % kill + derating summary, and its own arm/disarm controls.
+**Extra tabs:** Markets (universe table, heatmap, data faults), Trades history, Bots/Equity
+(equity curve, shadow models with promote/rollback), Lab (reports).
+**Handhelds (iPad/phone), touch-first:** hero + chart on top, swipe left/right through Depth →
+Bot → Market → Trades panels, bottom tab bar for pages. Desk monitor (1080p+) is the primary
+target; iPad and phone must work.
+
 ## Repo layout & ownership
 | Path | Owner | Python |
 |---|---|---|
@@ -199,6 +234,11 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/universe` → `[{symbol, score, atr_pct, quote_volume_24h, change_24h_pct,
   funding_rate, open_interest_usd, oi_change_1h_pct, last_price, in_universe_since}]`
 - `GET /api/candles?symbol=&tf=5m&limit=500` → `[{t, o, h, l, c, v}]`
+- `GET /api/orderbook?symbol=` → `{symbol, t, mid, spread, bands:[{pct, bid_depth, bid_notional,
+  ask_depth, ask_notional}], bids:[[price, qty]], asks:[[price, qty]]}`; bands at
+  pct = 0.2, 1, 2, 3, 4, 5 are cumulative depth within ±pct % of mid, the same definition as the
+  data.binance.vision bookDepth archive; bids/asks = top-20 ladder. Engine refreshes per universe
+  symbol (REST `/fapi/v1/depth?limit=1000`, every ~5-10 s), best-effort, never blocks trading.
 - `GET /api/signals?symbol=&limit=200` → `[{t, symbol, prob_long, prob_short,
   action:"long"|"short"|"none", reasons:[{feature,label,value,contribution}]}]`
 - `GET /api/positions` → `[{id, symbol, side, entry_price, qty, notional, leverage, margin,
@@ -216,10 +256,10 @@ All timestamps unix **seconds** in the API. JSON.
   distance_atr}, short_enabled, prob_threshold_long, prob_threshold_short,
   corr_cap:{max_corr, max_correlated}, universe_size, universe_refresh_s, kill_dd_pct, fee_taker,
   sound}`
-- `POST /api/control` `{action:"start"|"stop"|"kill"|"reset_kill"|"close_position"|"close_all",
-  position_id?}` → `{ok, error?}`
+- `POST /api/control` `{action:"start"|"stop"|"kill"|"reset_kill"|"close_position"|"close_all"|
+  "pause_symbol"|"unpause_symbol"|"refresh_universe", position_id?, symbol?}` → `{ok, error?}`
 - `GET /api/lab/reports` → `[{id, created_at, kind:"backtest"|"train", title, summary:{...},
   equity:[{t,equity}]}]`
 - `WS /ws` → messages `{type, data}`; types: `status`, `tick` `{symbol,t,price}`, `candle`
   `{symbol,tf,candle}`, `signal`, `position_opened`, `position_updated`, `position_closed`,
-  `universe`, `equity` `{t,equity}`, `log`, `kill`.
+  `universe`, `equity` `{t,equity}`, `log`, `kill`, `orderbook`.
