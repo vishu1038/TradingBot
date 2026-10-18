@@ -54,7 +54,8 @@ export function mountTopbar(el) {
     if (!s) return;
     const [mlabel, mcls] = MODE[s.mode] || [String(s.mode || '?').toUpperCase(), 'mode-paper'];
     const mp = $('mode-pill');
-    mp.textContent = mlabel;
+    const envName = String(s.binance_env || s.env || '').toLowerCase();
+    mp.textContent = s.mode === 'binance_demo' && (s.testnet === true || envName === 'testnet') ? `${mlabel} · TESTNET` : mlabel;
     mp.className = `pill ${mcls}`;
 
     $('tb-equity').textContent = fmtUsd(s.equity);

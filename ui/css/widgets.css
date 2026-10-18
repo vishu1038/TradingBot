@@ -256,3 +256,5 @@ html[data-fx="degen"] .chip-px.up, html[data-fx="degen"] .chip-px.dn { animation
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .logo { background-position: 0 0; }
 }
+.d-band.trunc { opacity: 0.45; filter: grayscale(0.85); }
+.d-band.trunc .d-bar i { opacity: 0.25; }

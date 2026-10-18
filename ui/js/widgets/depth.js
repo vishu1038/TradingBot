@@ -36,12 +36,24 @@ export function createDepth() {
     const max = Math.max(1, ...bands.map((b) => Math.max(b.bid_notional, b.ask_notional))) * 1.1;
     const Y = (v) => PAD_T + (1 - v / max) * (H - PAD_T - PAD_B);
     const y0 = Y(0);
-    const bidPts = [[0, 0], ...bands.map((b) => [-b.pct, b.bid_notional])];
-    const askPts = [[0, 0], ...bands.map((b) => [b.pct, b.ask_notional])];
+    // REST depth only reaches `cover_pct`: bands flagged truncated repeat the last real value, so the curve
+    // is clipped there and the remainder is drawn as a faint "beyond book" zone.
+    const cover = isNum(ob.cover_pct) ? ob.cover_pct : MAXPCT;
+    const real = bands.filter((b) => !b.truncated);
+    const firstTr = bands.find((b) => b.truncated);
+    const clipEnd = (side) => (firstTr && cover < MAXPCT ? [[(side === 'bid' ? -1 : 1) * Math.min(cover, firstTr.pct), firstTr[side + '_notional']]] : []);
+    const bidPts = [[0, 0], ...real.map((b) => [-b.pct, b.bid_notional]), ...clipEnd('bid')];
+    const askPts = [[0, 0], ...real.map((b) => [b.pct, b.ask_notional]), ...clipEnd('ask')];
+    const lastB = bidPts[bidPts.length - 1];
+    const lastA = askPts[askPts.length - 1];
+    const noData = firstTr && cover < MAXPCT
+      ? `<rect x="${X(cover)}" y="${PAD_T}" width="${X(MAXPCT) - X(cover)}" height="${H - PAD_T - PAD_B}" fill="rgba(255,255,255,0.04)"/><rect x="${X(-MAXPCT)}" y="${PAD_T}" width="${X(-cover) - X(-MAXPCT)}" height="${H - PAD_T - PAD_B}" fill="rgba(255,255,255,0.04)"/>
+         <text x="${(X(cover) + X(MAXPCT)) / 2}" y="${H - PAD_B - 8}" text-anchor="middle" class="d-ax">beyond book</text><text x="${(X(-cover) + X(-MAXPCT)) / 2}" y="${H - PAD_B - 8}" text-anchor="middle" class="d-ax">beyond book</text>`
+      : '';
     const poly = (pts) => pts.map(([p, v]) => `${X(p).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
     // extend to the plot edge so the area reaches +-5 %
-    const bidArea = `${X(0)},${y0} ${poly(bidPts)} ${X(-MAXPCT)},${y0}`;
-    const askArea = `${X(0)},${y0} ${poly(askPts)} ${X(MAXPCT)},${y0}`;
+    const bidArea = `${X(0)},${y0} ${poly(bidPts)} ${X(lastB[0])},${y0}`;
+    const askArea = `${X(0)},${y0} ${poly(askPts)} ${X(lastA[0])},${y0}`;
     const ticks = [-5, -4, -3, -2, -1, -0.2, 0.2, 1, 2, 3, 4, 5];
     const grid = ticks
       .map((t) => {
@@ -53,6 +65,7 @@ export function createDepth() {
       .join('');
     const dots = bands
       .map((b, i) => {
+        if (b.truncated) return '';
         const on = hoverIdx === i;
         return `<circle cx="${X(-b.pct)}" cy="${Y(b.bid_notional)}" r="${on ? 4.5 : 2.6}" fill="${BID}"/><circle cx="${X(b.pct)}" cy="${Y(b.ask_notional)}" r="${on ? 4.5 : 2.6}" fill="${ASK}"/>`;
       })
@@ -63,7 +76,7 @@ export function createDepth() {
         <linearGradient id="gB" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${BID}" stop-opacity=".55"/><stop offset="1" stop-color="${BID}" stop-opacity=".04"/></linearGradient>
         <linearGradient id="gA" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${ASK}" stop-opacity=".55"/><stop offset="1" stop-color="${ASK}" stop-opacity=".04"/></linearGradient>
       </defs>
-      ${grid}
+      ${grid}${noData}
       <polygon points="${bidArea}" fill="url(#gB)"/><polygon points="${askArea}" fill="url(#gA)"/>
       <polyline points="${poly(bidPts)}" fill="none" stroke="${BID}" stroke-width="2" stroke-linejoin="round"/>
       <polyline points="${poly(askPts)}" fill="none" stroke="${ASK}" stroke-width="2" stroke-linejoin="round"/>
@@ -78,9 +91,10 @@ export function createDepth() {
   function readout(ob) {
     const i = hoverIdx;
     const b = i != null ? ob.bands[i] : ob.bands[1] || ob.bands[0];
+    const ge = b.truncated ? '≥' : '';
     const tot = b.bid_notional + b.ask_notional;
     const share = tot > 0 ? (b.bid_notional / tot) * 100 : 50;
-    return `<div class="d-read"><span class="dim">±${b.pct}%</span> <b style="color:${BID}">${fmtCompact(b.bid_notional)}</b> <span class="dim">bid</span> · <b style="color:${ASK}">${fmtCompact(b.ask_notional)}</b> <span class="dim">ask</span>
+    return `<div class="d-read"><span class="dim">±${b.pct}%</span> <b style="color:${BID}">${ge}${fmtCompact(b.bid_notional)}</b> <span class="dim">bid</span> · <b style="color:${ASK}">${ge}${fmtCompact(b.ask_notional)}</b> <span class="dim">ask</span>${b.truncated ? ` <span class="dim" title="beyond book coverage">(book ends at ±${isNum(ob.cover_pct) ? ob.cover_pct.toFixed(1) : '?'}%)</span>` : ''}
       <span class="d-imb" title="bid share of depth within ±${b.pct}%"><i style="width:${share.toFixed(1)}%"></i></span><b>${share.toFixed(0)}%</b></div>`;
   }
 
@@ -88,10 +102,10 @@ export function createDepth() {
     const max = Math.max(1, ...ob.bands.map((b) => Math.max(b.bid_notional, b.ask_notional)));
     return `<div class="d-bands">${ob.bands
       .map(
-        (b, i) => `<div class="d-band ${hoverIdx === i ? 'on' : ''}" data-i="${i}">
+        (b, i) => `<div class="d-band ${hoverIdx === i ? 'on' : ''} ${b.truncated ? 'trunc' : ''}" data-i="${i}" ${b.truncated ? `title="beyond book coverage: REST depth ends at ±${isNum(ob.cover_pct) ? ob.cover_pct.toFixed(1) : '?'}%, so this is a lower bound"` : ''}>
           <span class="d-pct">±${b.pct}%</span>
-          <span class="d-bar bid"><i style="width:${((b.bid_notional / max) * 100).toFixed(1)}%"></i><em>${fmtCompact(b.bid_notional)}</em></span>
-          <span class="d-bar ask"><i style="width:${((b.ask_notional / max) * 100).toFixed(1)}%"></i><em>${fmtCompact(b.ask_notional)}</em></span>
+          <span class="d-bar bid"><i style="width:${((b.bid_notional / max) * 100).toFixed(1)}%"></i><em>${b.truncated ? '≥' : ''}${fmtCompact(b.bid_notional)}</em></span>
+          <span class="d-bar ask"><i style="width:${((b.ask_notional / max) * 100).toFixed(1)}%"></i><em>${b.truncated ? '≥' : ''}${fmtCompact(b.ask_notional)}</em></span>
         </div>`
       )
       .join('')}</div>`;

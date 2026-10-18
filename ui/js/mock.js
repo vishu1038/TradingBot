@@ -1182,7 +1182,23 @@ export class MockServer {
       }
       return out;
     };
-    return { symbol: sym, t: Math.floor(this.now), mid, spread, bands, bids: ladder(-1, 1 + B.imb), asks: ladder(1, 1 - B.imb) };
+    // tight-tick coins: pretend the REST book only reaches ~2 % (like the real backend) -> truncated bands
+    if (B.tight === undefined) B.tight = this.rand() < 0.4;
+    let cover_pct = 5;
+    if (B.tight) {
+      cover_pct = +(1.6 + (B.seed * 0.6)).toFixed(2);
+      let last = null;
+      for (const b of bands) {
+        if (b.pct > cover_pct) {
+          b.truncated = true;
+          if (last) Object.assign(b, { bid_depth: last.bid_depth, bid_notional: last.bid_notional, ask_depth: last.ask_depth, ask_notional: last.ask_notional });
+        } else {
+          b.truncated = false;
+          last = b;
+        }
+      }
+    } else for (const b of bands) b.truncated = false;
+    return { symbol: sym, t: Math.floor(this.now), mid, spread, spread_pct: +((spread / mid) * 100).toFixed(4), cover_pct, bands, bids: ladder(-1, 1 + B.imb), asks: ladder(1, 1 - B.imb) };
   }
 
   // ------------------------------------------------------------------ REST
