@@ -82,6 +82,44 @@ incoming webhook (env `GOOGLE_CHAT_WEBHOOK_URL`, POST `{"text": ...}`; URL holds
 logged). Sent from a background queue, rate-limited (~1 msg/s), never blocks the engine. Later
 channel: the native Android app (push + widget for live trades).
 
+## Safety & robustness layer (vehicle-software patterns, user-approved 2026-10-18)
+1. **Independent guard process** (`python -m tb.guard`, ISO 26262-style safety monitor). Own
+   exchange client; does not import the engine. Every ~5 s it checks: engine heartbeat age,
+   every open position has a live exchange-side stop, account drawdown vs kill limit. It writes
+   `safety_state` to the store, which the engine MUST obey before any entry:
+   `NORMAL` → `DEGRADED` (no new entries, keep stops) → `FLATTEN` (close all) → `HALTED`
+   (manual `reset_kill` only). Engine heartbeat stale > 30 s with open positions → guard ensures
+   stops exist (places them itself if missing, demo/live) and sets DEGRADED. In `paper_local`
+   the guard acts through the commands table (paper fills live in the engine).
+2. **Data plausibility + fault debouncing.** Reject a bar/tick before use when: single-bar
+   |return| > max(15%, 8×ATR14); high < low or non-positive prices; zero volume; bar timestamp
+   stale > 2 bars; |mark − last| > 1%. A fault must occur `fault_mature_n` (3) consecutive
+   cycles to mature; it clears after `fault_recover_m` (5) good cycles (hysteresis). Escalation
+   per symbol: warn → exclude symbol from entries; exchange-wide (REST/WS errors): warn →
+   DEGRADED → FLATTEN only if stops cannot be confirmed.
+3. **Drawdown derating curve.** `risk.derate_multiplier(dd_pct, kill_dd_pct) -> float`:
+   1.0 until 40% of the kill limit, linear to 0.5 at 80%, linear to 0 at 100% (live 25:
+   10% → 1.0, 20% → 0.5, 25% → 0; paper 50: 20/40/50). Risk per trade = sl_usd × multiplier;
+   if the result is below the exchange min notional, skip the trade. The backtester uses the
+   SAME function (import from tb.risk).
+4. **Drift ("slip") detection.** Over the last `drift_n` (30) closed trades: predicted = mean
+   model prob of the taken side, realised = win rate; z = (realised − predicted) /
+   sqrt(p(1−p)/n). z < −2 → size × 0.5; z < −3 → DEGRADED for entries until recovered;
+   clears when z > −1 (hysteresis). Also track fill slippage vs the sim assumption; > 2× → alert
+   + size × 0.5. Requires calibrated model probabilities (ML must report calibration).
+5. **Shadow mode + staged rollout.** `models/*.json` has `status`: `champion` | `challenger` |
+   `retired`. Challengers score every bar alongside the champion; their would-be trades are
+   simulated with the same template into `shadow_trades`. Promotion (control action
+   `promote_model`, manual) requires ≥ 50 shadow trades AND higher expectancy than the champion
+   over the same period AND no drift alarm. `rollback_model` restores the previous champion
+   instantly. Stages: paper_local → binance_demo → live; the first 20 live trades run at
+   size × 0.5.
+
+API additions: `/api/status` gains `safety:{state, reasons:[str], derate_mult, drift:{z, n,
+mult}, faults:[{symbol, kind, count, since}]}`; `GET /api/shadow` →
+`[{model, status, n_trades, win_rate, expectancy, pnl, vs_champion}]`; control actions
+`promote_model` / `rollback_model` take `model`. WS types add `safety`, `shadow_trade`.
+
 ## Universe (hot list)
 Refresh every `universe_refresh_s` (3600). Candidates: USDⓈ-M perpetuals quoted in USDT, status
 TRADING. Exclude: 24h quote volume < 50M USD, listed < 7 days (`onboardDate`), |funding| > 0.1%.
