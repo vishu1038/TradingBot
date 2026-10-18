@@ -52,7 +52,7 @@ _ENV_LOADED = False
 
 
 def load_env(force: bool = False) -> None:
-    """Load ``.env`` (repo root, then backend/) without overriding real env vars."""
+    """Load ``.env`` (repo root, then backend/) and ``config.json`` without overriding real env vars."""
     global _ENV_LOADED
     if _ENV_LOADED and not force:
         return
@@ -64,7 +64,26 @@ def load_env(force: bool = False) -> None:
                 load_dotenv(p, override=False)
     except Exception:  # dotenv missing is not fatal; env vars may be set directly
         pass
+    _load_config_json(ROOT / "config.json")
     _ENV_LOADED = True
+
+
+def _load_config_json(path: Path) -> None:
+    """``{"binance": {"api_key", "api_secret", "env"}}`` -> BINANCE_* env vars (gitignored, mode 600)."""
+    if not path.exists():
+        return
+    try:
+        import json
+
+        b = json.loads(path.read_text()).get("binance", {})
+    except Exception:  # a broken file must not leak its content into a traceback
+        print(f"config: {path.name} is not valid JSON; ignored")
+        return
+    for var, key in (("BINANCE_API_KEY", "api_key"), ("BINANCE_API_SECRET", "api_secret"),
+                     ("BINANCE_ENV", "env")):
+        val = str(b.get(key, "")).strip()
+        if val and not os.environ.get(var):
+            os.environ[var] = val
 
 
 def _mask(s: str) -> str:
