@@ -6,6 +6,7 @@ from conftest import FakeData
 from tb.config import Settings
 from tb.exchange.base import ExchangeError
 from tb.exchange.paper import PaperExchange
+from tb.risk import liq_price
 
 CFG = Settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)   # clean maths
 
@@ -28,7 +29,7 @@ def test_market_fill_fee_and_margin():
     assert b.wallet == pytest.approx(100 - fee)
     assert b.available == pytest.approx(100 - fee - 20.0)        # 160 notional / 8x
     pos = p.positions()[0]
-    assert pos.side == "long" and pos.qty == pytest.approx(1.6) and pos.liq_price == pytest.approx(88.0)
+    assert pos.side == "long" and pos.qty == pytest.approx(1.6) and pos.liq_price == pytest.approx(liq_price("long", 100, 8, 0.005))
 
 
 def test_slippage_applied_to_market_fills():
@@ -91,6 +92,21 @@ def test_stop_slippage_on_stop_fills():
     assert ev[0][1].exit_price == pytest.approx(93.75 * 0.999)
 
 
+def test_sim_fill_conventions():
+    """Same fills as tb.sim.template: entry slipped, TP exact, stop = slippage + extra (0.02% + 0.05%)."""
+    cfg = Settings()
+    p = mk(cfg)
+    assert p.market_order("AAAUSDT", "BUY", 1.6).avg_price == pytest.approx(100 * 1.0002)
+    p.place_stop("AAAUSDT", "SELL", 93.75, 1.6)
+    p.place_take_profit("AAAUSDT", "SELL", 103.13, 1.6)
+    ev = p.tick({"AAAUSDT": 93.0})                                 # gaps through the stop
+    assert ev[0][1].exit_price == pytest.approx(93.0 * (1 - 0.0002 - 0.0005))
+    q = mk(cfg)
+    q.market_order("AAAUSDT", "BUY", 1.6)
+    q.place_take_profit("AAAUSDT", "SELL", 103.13, 1.6)
+    assert q.tick({"AAAUSDT": 104.0})[0][1].exit_price == pytest.approx(103.13)    # no slippage on TP
+
+
 def test_sl_wins_when_both_inside_one_range_replay():
     p = mk()
     p.market_order("AAAUSDT", "BUY", 1.6)
@@ -122,7 +138,7 @@ def test_liquidation_loses_margin():
     p.market_order("AAAUSDT", "BUY", 1.6)
     ev = p.tick({"AAAUSDT": 80.0})
     info = ev[0][1]
-    assert info.reason == "liquidation" and info.exit_price == pytest.approx(88.0)
+    assert info.reason == "liquidation" and info.exit_price == pytest.approx(liq_price("long", 100, 8, 0.005))
     # equity lost ~ the isolated margin (20), never more
     assert p.balance().wallet == pytest.approx(100 - 20.0 - 1.6 * 100 * 0.0005, abs=0.2)
     assert p.balance().wallet > 70
@@ -132,7 +148,7 @@ def test_short_liquidation_price_and_pnl():
     p = mk()
     p.market_order("AAAUSDT", "SELL", 1.6)
     pos = p.positions()[0]
-    assert pos.side == "short" and pos.liq_price == pytest.approx(112.0)
+    assert pos.side == "short" and pos.liq_price == pytest.approx(liq_price("short", 100, 8, 0.005))
     p.marks["AAAUSDT"] = 96.875
     assert p.positions()[0].upnl == pytest.approx(5.0)
 

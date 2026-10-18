@@ -78,7 +78,7 @@ def test_status_shape_and_values(env):
     assert st["equity"] == 104.0 and st["peak_equity"] == 110.0 and st["running"] is True
     assert st["drawdown_pct"] == pytest.approx((110 - 104) / 110 * 100)
     assert st["open_positions"] == 1 and st["max_positions"] == 5 and st["trades_today"] == 2
-    assert st["realized_pnl"] == pytest.approx(5.0 - 0.16 - 10.0 - 0.16)
+    assert st["realized_pnl"] == pytest.approx(5.0 - 10.0)        # sum of NET pnl
     assert st["win_rate"] == 0.5
     assert st["kill"] == {"tripped": False, "reason": "", "dd_limit_pct": 50.0}
     assert set(st["model"]) == {"name", "version", "trained_at", "threshold_long", "threshold_short"}

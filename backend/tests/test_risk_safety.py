@@ -360,6 +360,32 @@ def test_guard_paper_acts_through_commands_table(store):
     assert r["state"] == FLATTEN and [c["action"] for c in store.pending_commands()] == ["kill"]
 
 
+def test_guard_halts_when_derated_below_min_notional_zombie_gap(store):
+    """dd just below the kill limit: derating leaves no tradeable size, yet the kill never trips."""
+    clk = Clock()
+    g = G.Guard(store, "paper_local", None, clock=clk)
+    store.kv_set("peak_equity", 100.0)
+    store.kv_set("min_notional_floor", 5.0)
+    store.kv_set("status", {"equity": 51.0, "kill": {"tripped": False}})       # 49% dd of a 50% limit: 0.1x -> 16 USD
+    assert g.step()["state"] == NORMAL
+    store.kv_set("status", {"equity": 50.05, "kill": {"tripped": False}})      # 49.95%: 0.0125x -> 2 USD < 5
+    r = g.step()
+    assert r["state"] == HALTED and "derated below min notional" in " ".join(r["reasons"])
+    assert store.kv_get("safety_guard")["state"] == HALTED
+    # sticky until the manual reset_kill (engine re-baselines the peak and signals the guard)
+    store.kv_set("status", {"equity": 80.0, "kill": {"tripped": False}})
+    assert g.step()["state"] == HALTED
+    store.kv_set("peak_equity", 80.0)
+    store.kv_set(G.KEY_RESET, clk.t + 1)
+    clk.t += 5
+    assert g.step()["state"] == NORMAL
+    # a symbol with a tiny minimum notional can still trade -> no halt
+    store.kv_set("min_notional_floor", 0.1)
+    store.kv_set("peak_equity", 100.0)
+    store.kv_set("status", {"equity": 50.05, "kill": {"tripped": False}})
+    assert G.Guard(store, "paper_local", None, clock=clk).step()["state"] == NORMAL
+
+
 def test_guard_mirrors_engine_kill_as_halted(store):
     clk = Clock()
     g = G.Guard(store, "paper_local", None, clock=clk)

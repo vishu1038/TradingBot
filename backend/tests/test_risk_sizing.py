@@ -4,7 +4,8 @@ import pytest
 
 from tb.config import CorrCap, Settings
 from tb.exchange.base import ConditionalOrder, SymbolFilters
-from tb.risk import (atr14, correlation_gate, derate_multiplier, drawdown_pct, kill_tripped, levels, liq_price,
+from tb.risk import (atr14, correlation_gate, derate_multiplier, derated_below_min_notional, drawdown_pct,
+                     effective_slots, kill_tripped, levels, liq_price,
                      max_positions, positions_without_stop, return_corr, size_trade, trail_update)
 
 F = SymbolFilters(tick_size=0.01, step_size=0.001, min_qty=0.001, min_notional=5.0)
@@ -61,8 +62,12 @@ def test_available_margin_check():
 
 
 def test_liq_price():
-    assert liq_price("long", 100, 8, 0.005) == pytest.approx(88.0)
-    assert liq_price("short", 100, 8, 0.005) == pytest.approx(112.0)
+    # Binance form, identical to tb.sim.template.liq_price
+    assert liq_price("long", 100, 8, 0.005) == pytest.approx(100 * 0.875 / 0.995)
+    assert liq_price("short", 100, 8, 0.005) == pytest.approx(100 * 1.125 / 1.005)
+    from tb.sim.template import liq_price as sim_liq
+    assert liq_price("long", 123.4, 8, 0.005) == pytest.approx(sim_liq(123.4, 1, 8, 0.005))
+    assert liq_price("short", 123.4, 8, 0.005) == pytest.approx(sim_liq(123.4, -1, 8, 0.005))
 
 
 def test_max_positions():
@@ -71,6 +76,26 @@ def test_max_positions():
     assert max_positions(59.9, cfg) == 2
     assert max_positions(500, cfg) == 5          # capped by the setting
     assert max_positions(10, cfg) == 0
+
+
+def test_effective_slots_account_for_entry_fees():
+    cfg = Settings()                                   # 20 margin, 160 notional, 0.05% fee -> 0.08 per entry
+    assert effective_slots(cfg, 0, 100.0) == 4         # not 5: the 5th slice is short by the fees
+    assert effective_slots(cfg, 0, 100.4) == 5
+    assert effective_slots(cfg, 4, 99.68 - 80.0) == 4  # 4 open, 19.68 free -> no 5th
+    assert effective_slots(cfg, 2, 60.0) == 4          # 2 open + 2 more slices
+    assert effective_slots(cfg, 0, 1000.0) == 5        # capped by max_positions
+    assert effective_slots(cfg, 3, 0.0) == 3
+    assert effective_slots(cfg.merge({"max_positions": 2}), 3, 100.0) == 3     # never below what is already open
+
+
+def test_zombie_gap_detected():
+    cfg = Settings()
+    assert not derated_below_min_notional(cfg, 40.0, 50.0, 5.0)          # 0.5x -> 80 notional: fine
+    assert not derated_below_min_notional(cfg, 49.0, 50.0, 5.0)          # 0.1x -> 16 notional: still tradeable
+    assert derated_below_min_notional(cfg, 49.9, 50.0, 5.0)              # 0.005x -> 0.8 < 5: nothing can trade
+    assert derated_below_min_notional(cfg, 25.0, 25.0, 5.0)
+    assert not derated_below_min_notional(cfg, 49.9, 50.0, 0.5)          # a symbol with a tiny minimum still can
 
 
 # ------------------------------------------------------------------ derating curve

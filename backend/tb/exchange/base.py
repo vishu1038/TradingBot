@@ -149,6 +149,16 @@ class CloseInfo:
     reason: str                     # tp | sl | trail | kill | manual | liquidation
     closed_at: int = 0
 
+    # NOTE: ``pnl`` here is GROSS price pnl and ``funding`` a signed cashflow (+ received); the engine
+    # converts to the trades-table convention (pnl NET, funding as a COST) through these helpers.
+    @property
+    def net_pnl(self) -> float:
+        return self.pnl - self.fees + self.funding
+
+    @property
+    def funding_cost(self) -> float:
+        return -self.funding
+
 
 def opposite(side: str) -> str:
     return "SELL" if side.upper() == "BUY" else "BUY"

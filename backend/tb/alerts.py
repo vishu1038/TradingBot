@@ -158,9 +158,9 @@ class AlertDispatcher:
 
     def trade_closed(self, symbol: str, side: str, entry: float, exit_price: float, pnl: float,
                      fees: float, reason: str, mode: str = "") -> None:
-        net = pnl - fees
+        net = pnl                       # pnl is NET (after fees and funding)
         self.send(f"[{mode}] CLOSE {side.upper()} {symbol} {entry:g} -> {exit_price:g} "
-                  f"PnL {pnl:+.2f} (net {net:+.2f}) reason={reason}")
+                  f"net PnL {net:+.2f} (fees {fees:.2f}) reason={reason}")
 
     def kill(self, reason: str, equity: float, dd_pct: float, mode: str = "") -> None:
         self.send(f"[{mode}] KILL SWITCH TRIPPED: {reason}. equity {equity:.2f}, drawdown {dd_pct:.1f}%")

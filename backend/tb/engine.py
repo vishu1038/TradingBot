@@ -411,27 +411,27 @@ class Engine:
         if reason == "sl" and pos.get("trail_active"):
             reason = "trail"
         t = int(info.closed_at or self.clock())
-        net = info.pnl - info.fees + info.funding
+        net = info.net_pnl                       # trades.pnl is NET; fees and funding are COSTS (>0 = paid)
         trade = {"position_id": pos["id"], "symbol": pos["symbol"], "side": pos["side"],
                  "entry_price": pos["entry_price"], "exit_price": info.exit_price, "qty": pos["qty"],
-                 "opened_at": pos["opened_at"], "closed_at": t, "pnl": info.pnl, "fees": info.fees,
-                 "funding": info.funding, "exit_reason": reason, "prob": pos.get("prob")}
+                 "opened_at": pos["opened_at"], "closed_at": t, "pnl": net, "fees": info.fees,
+                 "funding": info.funding_cost, "exit_reason": reason, "prob": pos.get("prob")}
         tid = self.store.insert_trade(trade)
         self.store.delete_position(pos["id"])
-        self.event("position_closed", {**trade, "id": tid, "net_pnl": net})
-        log.info("closed %s %s %s: pnl %+.3f fees %.3f funding %+.3f (%s)", pos["symbol"], pos["side"], pos["qty"],
-                 info.pnl, info.fees, info.funding, reason)
-        self.alerts.trade_closed(pos["symbol"], pos["side"], pos["entry_price"], info.exit_price, info.pnl,
-                                 info.fees - info.funding, reason, self.mode)
+        self.event("position_closed", {**trade, "id": tid})
+        log.info("closed %s %s %s: net pnl %+.3f (gross %+.3f, fees %.3f, funding cost %+.3f) %s", pos["symbol"], pos["side"],
+                 pos["qty"], net, info.pnl, info.fees, info.funding_cost, reason)
+        self.alerts.trade_closed(pos["symbol"], pos["side"], pos["entry_price"], info.exit_price, net,
+                                 info.fees, reason, self.mode)
         self._update_drift()
         self.persist_state(force=True)
 
     def _update_drift(self) -> None:
-        rows = self.store.query("SELECT prob, pnl, fees, funding FROM trades WHERE prob IS NOT NULL "
+        rows = self.store.query("SELECT prob, pnl FROM trades WHERE prob IS NOT NULL "
                                 "ORDER BY id DESC LIMIT ?", (self.cfg.drift_n,))
         rows = list(reversed(rows))
         probs = [r["prob"] for r in rows]
-        wins = [(r["pnl"] - r["fees"] + r["funding"]) > 0 for r in rows]
+        wins = [r["pnl"] > 0 for r in rows]                 # pnl is net
         prev = self.drift.level
         self.drift_state = self.drift.update(probs, wins)
         if self.drift.level != prev:
@@ -532,8 +532,8 @@ class Engine:
                 if info:
                     t = int(self.clock())
                     self.store.insert_trade({"symbol": sym, "side": side, "entry_price": fill, "exit_price": info.exit_price,
-                                             "qty": qty, "opened_at": t, "closed_at": t, "pnl": info.pnl, "fees": info.fees,
-                                             "funding": info.funding, "exit_reason": "manual", "prob": prob})
+                                             "qty": qty, "opened_at": t, "closed_at": t, "pnl": info.net_pnl, "fees": info.fees,
+                                             "funding": info.funding_cost, "exit_reason": "manual", "prob": prob})
             return False
         try:
             tp_id = await self.io(ex.place_take_profit, sym, close_side, tp, qty)
@@ -1101,8 +1101,8 @@ class Engine:
         if today != self._last_day:
             day0 = int(datetime.fromisoformat(self._last_day).replace(tzinfo=timezone.utc).timestamp())
             s = self.store.trade_stats(day0)
-            s_day = self.store.one("SELECT COUNT(*) n, COALESCE(SUM(pnl-fees+funding),0) net, "
-                                   "COALESCE(SUM(CASE WHEN pnl-fees+funding>0 THEN 1 ELSE 0 END),0) w FROM trades "
+            s_day = self.store.one("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) net, "
+                                   "COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) w FROM trades "
                                    "WHERE closed_at>=? AND closed_at<?", (day0, day0 + 86400))
             self.alerts.daily_summary(date=self._last_day, trades=s_day["n"], wins=s_day["w"], pnl=s_day["net"],
                                       equity=self.equity, mode=self.mode)

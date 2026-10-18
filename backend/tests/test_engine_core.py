@@ -146,7 +146,9 @@ def test_tp_hit_recorded_with_fees(store, tmp_path):
     run(eng.prices_cycle())
     assert store.get_positions() == []
     t = store.get_trades(1)[0]
-    assert t["exit_reason"] == "tp" and t["pnl"] == pytest.approx(5.0, abs=0.1) and t["fees"] > 0
+    assert t["exit_reason"] == "tp" and t["fees"] > 0
+    assert t["pnl"] == pytest.approx(5.0 - t["fees"] - t["funding"], abs=0.1)     # pnl is NET, fees/funding are costs
+    assert t["pnl"] == pytest.approx(eng.ex.balance().wallet - 100.0)             # equals the wallet change
     assert eng.ex.open_conditional_orders() == []        # leftover orders cancelled
     assert "position_closed" in [e["type"] for e in store.events_after(0)]
 
@@ -253,10 +255,21 @@ def test_correlated_positions_block_new_entry(store, tmp_path):
     assert len(store.get_positions()) == 2
 
 
+def test_fifth_slot_unreachable_with_100_equity(store, tmp_path):
+    syms = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT", "BTCUSDT")
+    eng, data = mk_engine(store, tmp_path, symbols=syms)
+    eng.universe = list(syms[:5])
+    for s in syms[:5]:
+        open_long(eng, s)
+    assert len(store.get_positions()) == 4                       # the 5th slice is short by the entry fees
+    run(eng.heartbeat_cycle())
+    assert store.kv_get("status")["max_positions"] == 4
+
+
 def test_max_positions_follows_equity(store, tmp_path):
     eng, data = mk_engine(store, tmp_path, settings={"paper_start_equity": 45.0})
     eng.startup()
-    assert E.max_positions(eng.equity, eng.cfg) == 2
+    assert E.effective_slots(eng.cfg, 0, eng.available) == 2          # 45 / 20.08
 
 
 # ------------------------------------------------------------------ derating / staged rollout / drift
@@ -528,7 +541,7 @@ def test_equity_and_status_written(store, tmp_path):
     run(eng.heartbeat_cycle())
     run(eng.housekeeping_cycle())
     st = store.kv_get("status")
-    assert st["mode"] == "paper_local" and st["equity"] == pytest.approx(100.0) and st["max_positions"] == 5
+    assert st["mode"] == "paper_local" and st["equity"] == pytest.approx(100.0) and st["max_positions"] == 4   # fee-aware
     assert st["kill"]["dd_limit_pct"] == 50.0
     assert store.get_equity(5) and store.heartbeat()["data"]["running"] is True
     assert store.kv_get("market")["btc_price"] > 0

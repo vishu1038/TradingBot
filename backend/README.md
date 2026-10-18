@@ -52,7 +52,9 @@ Only one engine can run per DB (flock on `var/tb.sqlite.engine.lock`).
   `/fapi/v1/algoOrder` permanently. Order ids are namespaced strings `o:<id>` / `a:<id>`.
 
 ## Safety layer
-- `safety_state` NORMAL -> DEGRADED -> FLATTEN -> HALTED (HALTED only cleared by `reset_kill`).
+- `safety_state` NORMAL -> DEGRADED -> FLATTEN -> HALTED (HALTED only cleared by `reset_kill`). The guard also
+  HALTs with "derated below min notional" when derating shrinks a full slice below the exchange minimum
+  notional (no valid trade possible, yet the kill never trips).
 - Plausibility checks reject bad bars/ticks; faults mature after 3 consecutive cycles and clear after 5 good
   ones (`fault_mature_n`, `fault_recover_m`).
 - `risk.derate_multiplier(dd_pct, kill_dd_pct)`: 1.0 until 40% of the kill limit, 0.5 at 80%, 0 at 100%.
@@ -63,9 +65,11 @@ Only one engine can run per DB (flock on `var/tb.sqlite.engine.lock`).
   the champion over the same period, no drift alarm. `rollback_model` restores the previous champion.
 
 ## API notes (shapes follow the contract in docs/ARCHITECTURE.md)
-- `trades[].pnl` is the **gross** price PnL; `fees` is a positive cost; `funding` is a signed cashflow
-  (+ received). Net = `pnl - fees + funding`. `status.realized_pnl` is net.
+- `trades[].pnl` is **net** (gross price PnL - fees - funding cost); `fees` >= 0 is a cost; `funding` is a
+  cost (positive = paid, negative = received). Win = net pnl > 0. `status.realized_pnl` is the sum of net pnl.
 - `status.win_rate` is a 0..1 ratio (net-positive trades / all trades).
+- `status.max_positions` is the *effective* slot count: open positions + whole slices that fit in the free
+  margin including each entry's taker fee (100 USD -> 4, not 5).
 - `POST /api/control` also takes `model` (for `promote_model` / `rollback_model`). It waits up to 4 s for the
   engine's answer; `{ok:true, queued:true}` means the engine had not answered yet. If the engine heartbeat is
   older than 15 s the command is **not** queued (`ok:false`).

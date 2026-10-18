@@ -165,7 +165,10 @@ def test_positions_trades_roundtrip(store):
     t = store.get_trades(10)
     assert t[0]["exit_reason"] == "sl" and t[1]["id"] == tid
     s = store.trade_stats()
-    assert s["n"] == 2 and s["wins"] == 1 and s["net"] == pytest.approx(4.8 - 0.16 - 0.01 - 1.1)
+    # trades.pnl is NET; fees and funding are costs; win = net pnl > 0
+    assert s["n"] == 2 and s["wins"] == 1 and s["net"] == pytest.approx(4.8 - 1.0)
+    assert s["fees"] == pytest.approx(0.26) and s["funding"] == pytest.approx(-0.01)
+    assert s["gross"] == pytest.approx(3.8 + 0.26 - 0.01)
     assert store.trade_stats(2500)["n"] == 1
 
 

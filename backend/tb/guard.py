@@ -28,7 +28,7 @@ from . import __version__
 from .alerts import AlertDispatcher
 from .config import Settings, load_secrets, resolve_mode, trading_base_url, db_path, LiveNotAllowed
 from .exchange.base import Exchange, ExchangeError, order_side
-from .risk import drawdown_pct, positions_without_stop
+from .risk import derated_below_min_notional, drawdown_pct, positions_without_stop
 from .safety import DEGRADED, FLATTEN, HALTED, NORMAL, Debouncer
 
 log = logging.getLogger("tb.guard")
@@ -215,6 +215,12 @@ class Guard:
             if dd >= limit:
                 desired = FLATTEN
                 self.flatten_reason = f"drawdown {dd:.1f}% >= kill limit {limit:.0f}%"
+            elif derated_below_min_notional(cfg, dd, limit, float(self.store.kv_get("min_notional_floor", 5.0) or 5.0)):
+                # zombie gap: derating (0 at the limit) makes every trade fall below the exchange minimum while
+                # the kill (dd >= limit) has not tripped -> nothing can ever trade again: HALT, manual reset_kill
+                desired = max(desired, HALTED, key=_rank)
+                self.flatten_reason = "derated below min notional"
+                reasons.append(f"derated below min notional (drawdown {dd:.1f}% of {limit:.0f}% limit)")
         st = self.store.kv_get("status", {}) or {}
         if (st.get("kill") or {}).get("tripped"):
             desired = max(desired, HALTED if not db_positions else FLATTEN, key=_rank)

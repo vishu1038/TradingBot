@@ -316,11 +316,12 @@ class Store:
     def trade_stats(self, since: float | None = None) -> dict:
         w = "WHERE closed_at>=?" if since is not None else ""
         a = (since,) if since is not None else ()
+        # trades.pnl is NET of fees and funding (fees/funding are COSTS, > 0 = paid); win = net pnl > 0
         r = self.one(f"SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees, "
                      f"COALESCE(SUM(funding),0) funding, "
-                     f"COALESCE(SUM(CASE WHEN pnl-fees+funding>0 THEN 1 ELSE 0 END),0) wins FROM trades {w}", a)
-        return {"n": r["n"], "gross": r["pnl"], "fees": r["fees"], "funding": r["funding"],
-                "net": r["pnl"] - r["fees"] + r["funding"], "wins": r["wins"]}
+                     f"COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) wins FROM trades {w}", a)
+        return {"n": r["n"], "net": r["pnl"], "fees": r["fees"], "funding": r["funding"],
+                "gross": r["pnl"] + r["fees"] + r["funding"], "wins": r["wins"]}
 
     # ------------------------------------------------------------------ shadow trades
     def add_shadow_trade(self, t: Mapping[str, Any]) -> int:
