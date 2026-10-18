@@ -376,6 +376,9 @@ def main(argv=None):
     ap.add_argument("--symbols", default="", help="comma list (default: all in archive)")
     ap.add_argument("--archive", default="")
     ap.add_argument("--groups", default="", help="optional feature groups, e.g. depth")
+    ap.add_argument("--start", default="", help="drop rows before this UTC date (YYYY-MM-DD), e.g. where depth exists")
+    ap.add_argument("--use-cols", default="all", choices=["all", "base"],
+                    help="base = train/evaluate on the 49 base features only (paired 'without depth' arm, same rows)")
     ap.add_argument("--folds", type=int, default=4)
     ap.add_argument("--test-days", type=int, default=30)
     ap.add_argument("--val-days", type=int, default=14)
@@ -415,7 +418,10 @@ def main(argv=None):
     else:
         root = Path(a.archive) if a.archive else None
         syms = [s for s in a.symbols.split(",") if s] or None
-        ds = D.build_dataset(syms, root, use_cache=not a.no_cache, groups=groups, log=log)
+        start_ms = int(datetime.strptime(a.start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000) if a.start else 0
+        ds = D.build_dataset(syms, root, use_cache=not a.no_cache, groups=groups, log=log, start_ms=start_ms)
+    if a.use_cols == "base":
+        ds = ds.with_cols(len(ft.FEATURE_NAMES))
     log(f"dataset: {len(ds)} rows, {len(ds.symbols)} symbols, {ds.n_feat} features, X {ds.X.nbytes / 2**30:.2f} GiB fp16 "
         f"({'GPU-resident' if ds.X.nbytes <= T.GPU_MAX_BYTES else 'streamed in GPU chunks'}; RAM budget "
         f"{D.ram_budget_bytes() / 2**30:.1f} GiB)  tag={tag}")

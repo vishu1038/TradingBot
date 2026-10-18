@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
 from tb import features as ft  # noqa: E402
+from tb import features_depth  # noqa: E402,F401  (registers the optional 'depth' feature group)
 from tb.labels import AUX_NAMES, aux_targets, full_cfg, simulate_trades  # noqa: E402
 
 # Label horizon: the live template has no time stop, so labels must look far enough ahead that "timeout" is
@@ -154,6 +155,12 @@ class Dataset:
     def groups(self) -> list[str]:
         return list(self.meta.get("groups", []))
 
+    def with_cols(self, n: int) -> "Dataset":
+        """View on the first ``n`` feature columns (e.g. the base 49, dropping optional groups) - same rows."""
+        from dataclasses import replace
+        meta = dict(self.meta, feature_names=self.feature_names[:n], groups=[] if n <= len(ft.FEATURE_NAMES) else self.groups)
+        return replace(self, X=self.X[:, :n], meta=meta)
+
     def sample_ok_at(self, rows) -> np.ndarray:
         return np.asarray(self.pos[rows]) >= ft.WINDOW - 1
 
@@ -162,9 +169,9 @@ class Dataset:
 
 
 # --------------------------------------------------------------------------------------------
-def _cache_key(symbols, root, cfgs, horizon, groups) -> str:
+def _cache_key(symbols, root, cfgs, horizon, groups, start_ms=0) -> str:
     h = hashlib.sha1()
-    h.update(json.dumps([symbols, str(root), cfgs, horizon, ft.feature_names(groups) if groups else ft.FEATURE_NAMES,
+    h.update(json.dumps([symbols, str(root), cfgs, horizon, start_ms, ft.feature_names(groups) if groups else ft.FEATURE_NAMES,
                          list(groups), ft.WARMUP, list(AUX_NAMES), list(MODES)], sort_keys=True, default=str).encode())
     for s in symbols:
         for sub in (f"klines/5m/{s}.parquet", f"metrics/{s}.parquet", f"funding/{s}.parquet", f"depth/{s}.parquet"):
@@ -178,7 +185,7 @@ def _cache_key(symbols, root, cfgs, horizon, groups) -> str:
 def _build_one(job) -> dict:
     """Features + labels for one symbol (runs in a worker process; numpy/pandas only, no torch).  Saves the
     result as an .npz part file and returns its small header."""
-    sym, root, cfgs, horizon, groups, part_path = job
+    sym, root, cfgs, horizon, groups, part_path, start_ms = job
     root = Path(root)
     kl, m, f = load_symbol(sym, root)
     btc = load_symbol("BTCUSDT", root)[0] if (root / "klines" / "5m" / "BTCUSDT.parquet").exists() else None
@@ -199,8 +206,12 @@ def _build_one(job) -> dict:
             off.append(sim["exit_off"].astype("uint16"))
     ax = aux_targets(kl)
     aux = np.stack([ax[k] for k in AUX_NAMES]).astype("float16")
-    sl = slice(ft.WARMUP, None)
-    n = len(kl) - ft.WARMUP
+    t_all = kl["open_time"].to_numpy("int64")
+    first = max(ft.WARMUP, int(np.searchsorted(t_all, start_ms)))      # drop warm-up rows and anything before start_ms
+    sl = slice(first, None)
+    n = len(kl) - first
+    if n <= 0:
+        return dict(name=sym, skip=True, bars=len(kl), n=0)
     np.savez(part_path, X=x[sl].astype("float16"), t=kl["open_time"].to_numpy("int64")[sl],
              lab=np.stack(lab)[:, sl], pnl=np.stack(pnl)[:, sl], off=np.stack(off)[:, sl], aux=aux[:, sl])
     return dict(name=sym, skip=False, n=n, no_metrics=m is None,
@@ -258,13 +269,13 @@ def load_cached(cdir: Path) -> Dataset:
 
 
 def build_dataset(symbols: list[str] | None = None, root: Path | None = None, exit_cfgs: dict | None = None,
-                  horizon: int = HORIZON, use_cache: bool = True, groups=(), log=print, workers: int | None = None
-                  ) -> Dataset:
+                  horizon: int = HORIZON, use_cache: bool = True, groups=(), log=print, workers: int | None = None,
+                  start_ms: int = 0) -> Dataset:
     root = Path(root or archive_root())
     symbols = symbols or list_symbols(root)
     groups = tuple(groups)
     cfgs = {m: dict(full_cfg({**EXIT_SETS[m], **(exit_cfgs or {}).get(m, {})})) for m in MODES}
-    key = _cache_key(symbols, root, cfgs, horizon, groups)
+    key = _cache_key(symbols, root, cfgs, horizon, groups, start_ms)
     cdir = var_dir() / "ml_cache" / key
     if use_cache and (cdir / "meta.json").exists():
         log(f"[dataset] cache hit {cdir}")
@@ -274,7 +285,7 @@ def build_dataset(symbols: list[str] | None = None, root: Path | None = None, ex
     t0 = time.time()
     part_dir = var_dir() / "ml_cache" / f"parts-{key}"
     part_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(s_, str(root), cfgs, horizon, groups, str(part_dir / f"{s_}.npz")) for s_ in symbols]
+    jobs = [(s_, str(root), cfgs, horizon, groups, str(part_dir / f"{s_}.npz"), start_ms) for s_ in symbols]
     workers = workers or int(os.environ.get("TB_DS_WORKERS", min(3, max(1, (os.cpu_count() or 2) - 2))))
     headers = []
     if workers > 1 and len(jobs) > 1:

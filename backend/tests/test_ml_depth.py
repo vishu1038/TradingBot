@@ -50,12 +50,12 @@ def col(x, nm):
 
 def test_registered_and_shapes(data):
     kl, m, f, btc = data
-    assert "depth" in ft._EXTRA and ft.feature_names(["depth"])[-1] == "has_depth"
-    assert len(fd.NAMES) == 18
+    assert "depth" in ft._EXTRA and ft.feature_names(["depth"])[-2] == "has_depth"
+    assert len(fd.NAMES) == 19 and fd.NAMES[-2:] == ["has_depth", "has_depth_02"]
     x = ft.build_features(kl, m, f, btc, groups=["depth"], extra_data={"depth": make_depth(kl)})
-    assert x.shape == (N, ft.F + 18) and np.isfinite(x).all()
+    assert x.shape == (N, ft.F + 19) and np.isfinite(x).all()
     assert (col(x, "has_depth")[ft.WARMUP if N > ft.WARMUP else 300:] == 1).all()
-    live = x[400:, ft.F:-1]
+    live = x[400:, ft.F:-2]
     assert (live.std(axis=0) > 0).all()
 
 
@@ -87,7 +87,7 @@ def test_no_lookahead_and_coverage(data):
     x = ft.build_features(kl, m, f, btc, groups=["depth"], extra_data={"depth": hole})
     hd = col(x, "has_depth")
     assert hd[450] == 1 and hd[540] == 0 and hd[700] == 1
-    assert (x[540, ft.F:-1] == 0).all()
+    assert (x[540, ft.F:-2] == 0).all()
     # no depth at all
     x0 = ft.build_features(kl, m, f, btc, groups=["depth"], extra_data={})
     assert (x0[:, ft.F:] == 0).all()
@@ -101,3 +101,19 @@ def test_long_format_adapter_matches_wide(data):
     pd.testing.assert_frame_equal(a[b.columns].astype("float64"), b.astype("float64"), check_names=False, rtol=1e-9)
     alt = wide.rename(columns={c: c.replace("bid_", "bid_notional_").replace("ask_", "ask_notional_") for c in wide.columns if c != "open_time"})
     pd.testing.assert_frame_equal(fd.normalize_depth(alt)[a.columns], a)
+
+
+def test_missing_02_band_and_mean_columns(data):
+    kl, m, f, btc = data
+    d = make_depth(kl)
+    d["bid_notional_1_mean"] = 1.0                       # extra archive columns must not be mistaken for bands
+    d["ask_notional_1_mean"] = 1.0
+    d["snap_count"] = 9
+    d.loc[:400, ["bid_0.2", "ask_0.2"]] = np.nan         # the 0.2 % band only exists in newer archive data
+    x = ft.build_features(kl, m, f, btc, groups=["depth"], extra_data={"depth": d})
+    assert np.isfinite(x).all()
+    assert col(x, "has_depth")[300] == 1 and col(x, "has_depth_02")[300] == 0 and col(x, "has_depth_02")[600] == 1
+    assert col(x, "depth_imb_0.2")[300] == 0 and col(x, "depth_imb_0.2")[600] != 0
+    assert col(x, "depth_imb_1")[300] != 0
+    j = 600 - fd.DEPTH_LAG_BARS
+    assert col(x, "depth_imb_1")[600] == pytest.approx(np.log(d["bid_1"].iloc[j] / d["ask_1"].iloc[j]), rel=1e-4)
