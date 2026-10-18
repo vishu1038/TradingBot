@@ -1,0 +1,10 @@
+numpy
+pandas
+pyarrow
+fastapi
+uvicorn
+requests
+websocket-client
+python-dotenv
+httpx
+pytest

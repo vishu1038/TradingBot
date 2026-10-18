@@ -206,6 +206,9 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/trades?limit=200` → `[{id, symbol, side, entry_price, exit_price, qty, opened_at,
   closed_at, pnl, fees, funding, exit_reason:"tp"|"sl"|"trail"|"kill"|"manual"|"liquidation",
   prob}]`
+  **PnL convention (everywhere: sim, engine, API, UI):** `pnl` = NET realised PnL
+  (gross − fees − funding). `fees` ≥ 0 is a cost. `funding` is a cost: positive = paid,
+  negative = received. `win` means net pnl > 0. `win_rate` is a 0–1 fraction.
 - `GET /api/equity?limit=2000` → `[{t, equity}]`
 - `GET /api/logs?limit=200` → `[{t, level, msg}]`
 - `GET /api/settings` / `PUT /api/settings` (partial merge) → `{slice_margin_usd, leverage,

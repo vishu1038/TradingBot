@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Independent safety monitor: separate process, own exchange client, never imports the engine.
+     Keep --mode identical to the engine's. Template: scripts/install_launchd.sh replaces __ROOT__. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.tradingbot.guard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__ROOT__/scripts/run_guard.sh</string>
+        <string>--mode</string>
+        <string>paper_local</string>
+    </array>
+    <key>WorkingDirectory</key><string>__ROOT__</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>__ROOT__/var/guard.out.log</string>
+    <key>StandardErrorPath</key><string>__ROOT__/var/guard.err.log</string>
+</dict>
+</plist>
