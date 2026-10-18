@@ -30,7 +30,7 @@ fixed-risk template. Mostly long; shorts only on a stricter threshold.
 | Path | Owner | Python |
 |---|---|---|
 | `ui/` | UI | none (static ES modules, no build step) |
-| `backend/tb/` exchange, engine, api, store, risk, universe, alerts, scorer | backend | 3.14 `.venv` |
+| `backend/tb/` exchange, engine, api, store, risk, universe, alerts (Google Chat webhook), scorer | backend | 3.14 `.venv` |
 | `backend/tb/data/` (archive downloader, live kline fetch) + `backend/tb/sim/` (backtester) | data | 3.14 `.venv` |
 | `backend/tb/features.py`, `backend/tb/labels.py`, `backend/tb/model_np.py`, `ml/` | ML | features/labels/model_np: numpy-only, must import under BOTH 3.14 and 3.12; `ml/` is 3.12 `.venv-ml` |
 | `docs/` | lead | — |
@@ -75,6 +75,12 @@ Shared runtime dirs (gitignored): `var/` (DB, logs), `data/archive/` (parquet), 
    if corr > `corr_cap.max_corr` (0.8) with ≥ `corr_cap.max_correlated` (2) same-direction
    positions → skip.
 5. A symbol dropping out of the universe never force-closes its trade; it runs to TP/SL.
+
+## Alerts
+No Telegram. `tb/alerts.py` has a pluggable `Notifier` interface; v1 channel = Google Chat
+incoming webhook (env `GOOGLE_CHAT_WEBHOOK_URL`, POST `{"text": ...}`; URL holds secrets — never
+logged). Sent from a background queue, rate-limited (~1 msg/s), never blocks the engine. Later
+channel: the native Android app (push + widget for live trades).
 
 ## Universe (hot list)
 Refresh every `universe_refresh_s` (3600). Candidates: USDⓈ-M perpetuals quoted in USDT, status
