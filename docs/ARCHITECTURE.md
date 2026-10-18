@@ -28,9 +28,13 @@ fixed-risk template. Mostly long; shorts only on a stricter threshold.
 
 ## UI layout & style (user-approved 2026-10-18)
 **Style: hybrid.** Terminal chrome — black background, box-drawn panel frames with `╭─ TITLE ─╮`
-headers, monospace numbers/logs, `/` command palette, ASCII spinners, typed-out log lines,
+headers, `/` command palette, ASCII spinners, typed-out log lines,
 rainbow logo — plus modern foreground controls (pill buttons, toggles, sliders, smooth gauges,
-glowing cards, charts) sized for touch. **Lots of colour** (Claude Code multicolour): each panel
+glowing cards, charts) sized for touch. **Typography (user, 2026-10-18): all text — letters AND numbers — in a modern sans font, not a
+terminal font**: system UI stack (`-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+Roboto, "Helvetica Neue", Arial, sans-serif`), no web-font download; numbers use
+`font-variant-numeric: tabular-nums` so columns align. Monospace only for decorative glyphs
+(box-drawing borders, ASCII spinners, logo art). **Lots of colour** (Claude Code multicolour): each panel
 its own accent (coral, violet, cyan, lime, amber, pink…), each coin a fixed colour everywhere,
 probabilities on a cool→hot gradient; profit green / loss red reserved for money only.
 **Effects:** "loud but readable" default (flash + glitch on TP/SL/kill only) + a calm↔degen

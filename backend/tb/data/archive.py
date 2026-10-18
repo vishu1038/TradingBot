@@ -358,6 +358,21 @@ def download_funding(symbol: str, months: int, root: Path | None = None, verify:
     return stats
 
 
+def universe_symbols(min_age_months: int = 24, today: dt.date | None = None) -> list[str]:
+    """Every USDT-quoted PERPETUAL with status TRADING whose onboardDate is at least
+    `min_age_months` months old, from fapi exchangeInfo (sorted)."""
+    today = today or utc_today()
+    cutoff = to_ms(add_months(month_start(today), -min_age_months).replace(day=min(today.day, 28)))
+    r = _session().get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=30)
+    r.raise_for_status()
+    out = []
+    for s in r.json()["symbols"]:
+        if (s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL"
+                and s.get("status") == "TRADING" and int(s.get("onboardDate", 1 << 62)) <= cutoff):
+            out.append(s["symbol"])
+    return sorted(out)
+
+
 _JOBS = {"klines": download_klines, "metrics": download_metrics, "funding": download_funding}
 
 

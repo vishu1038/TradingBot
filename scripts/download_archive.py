@@ -23,6 +23,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--symbols", default=",".join(archive.DEFAULT_SYMBOLS),
                     help="comma list (default: %(default)s)")
+    ap.add_argument("--all-perps", action="store_true",
+                    help="every TRADING USDT perpetual listed >= --min-age-months ago (overrides --symbols)")
+    ap.add_argument("--min-age-months", type=int, default=24)
     ap.add_argument("--months", type=int, default=12, help="full months before the current one")
     ap.add_argument("--kinds", default="klines,metrics,funding")
     ap.add_argument("--workers", type=int, default=6)
@@ -32,7 +35,11 @@ def main(argv=None) -> int:
     ap.add_argument("--summary-only", action="store_true")
     a = ap.parse_args(argv)
 
-    symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
+    if a.all_perps:
+        symbols = archive.universe_symbols(a.min_age_months)
+        archive.log(f"universe: {len(symbols)} USDT perps listed >= {a.min_age_months} months ago")
+    else:
+        symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
     kinds = [k.strip() for k in a.kinds.split(",") if k.strip()]
     bad = [k for k in kinds if k not in archive.KINDS]
     if bad:
