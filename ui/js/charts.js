@@ -139,10 +139,12 @@ export function createPriceChart(priceEl, probEl, legendEl) {
     lineWidth: 2,
     autoscaleInfoProvider: fixed01,
     priceFormat: { type: 'custom', minMove: 0.01, formatter: (v) => v.toFixed(2) },
-    lastValueVisible: true,
+    lastValueVisible: false, // the last-value tag collided with the threshold tag; value shows in the legend
     priceLineVisible: false,
     crosshairMarkerVisible: true,
   });
+  // fixed 0-1 range; the taller strip gives the auto ticks (0 / 0.5 / 1) room so the threshold tag never lands on one
+  for (const v of [0.5]) probLong.createPriceLine({ price: v, color: 'rgba(255,255,255,0.08)', lineWidth: 1, lineStyle: 3, axisLabelVisible: false, title: '' }); // guide only, no label
   const probShort = probChart.addLineSeries({
     color: 'rgba(255,79,216,0.55)',
     lineWidth: 1,
@@ -152,7 +154,7 @@ export function createPriceChart(priceEl, probEl, legendEl) {
     priceLineVisible: false,
     crosshairMarkerVisible: false,
   });
-  probChart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.08 } });
+  probChart.priceScale('right').applyOptions({ scaleMargins: { top: 0.1, bottom: 0.1 }, autoScale: true, ticksVisible: false });
 
   let candles = [];
   let idxByT = new Map();
@@ -282,6 +284,32 @@ export function createPriceChart(priceEl, probEl, legendEl) {
     idxByT = new Map(candles.map((c, i) => [c.t, i]));
   }
 
+  /** Dragging/scrolling the price axis switches autoScale OFF and it survives setData: always turn it back on. */
+  function autoFit() {
+    for (const [chart, id] of [[priceChart, 'right'], [priceChart, 'vol'], [probChart, 'right']]) {
+      try {
+        chart.priceScale(id).applyOptions({ autoScale: true });
+      } catch (_) {
+        /* scale not present */
+      }
+    }
+    const n = candles.length;
+    priceChart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 130), to: n + 8 });
+  }
+
+  function clearLines() {
+    for (const l of lines) {
+      try {
+        candleSeries.removePriceLine(l);
+      } catch (_) {
+        /* already removed */
+      }
+    }
+    lines = [];
+    lineKey = '\u0000reset'; // never equal to a real key, so the next setPositionLines always rebuilds
+    candleSeries.setMarkers([]);
+  }
+
   const api = {
     setData(sym, cs, sigs) {
       symbol = sym;
@@ -297,9 +325,8 @@ export function createPriceChart(priceEl, probEl, legendEl) {
       ema50S.setData(candles.map((c, i) => (i >= 49 ? { time: c.t, value: ema50[i] } : { time: c.t })));
       probLong.setData(probData());
       probShort.setData(probShortData());
-      lineKey = '';
-      const n = candles.length;
-      priceChart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 130), to: n + 8 });
+      clearLines(); // entry/TP/SL lines + markers of the previous symbol must not survive a switch
+      autoFit();
       setLegend(null);
     },
 
@@ -346,7 +373,7 @@ export function createPriceChart(priceEl, probEl, legendEl) {
       if (!isNum(v) || v === thrValue) return;
       thrValue = v;
       if (thrLine) probLong.removePriceLine(thrLine);
-      thrLine = probLong.createPriceLine({ price: v, color: P.yellow, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'thr' });
+      thrLine = probLong.createPriceLine({ price: v, color: P.yellow, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
     },
 
     /** Entry / TP / SL / trailing lines for open positions of the shown symbol. */
@@ -392,8 +419,25 @@ export function createPriceChart(priceEl, probEl, legendEl) {
     },
 
     resetView() {
-      const n = candles.length;
-      priceChart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 130), to: n + 8 });
+      autoFit();
+    },
+
+    /** test hook: simulate the user dragging the price axis (autoScale OFF + a stale manual range) */
+    debugBreakScale(lo, hi) {
+      priceChart.priceScale('right').applyOptions({ autoScale: false }); // range freezes at the current symbol's
+    },
+
+    /** test hook: visible price range of the main scale vs the candles in view */
+    debugRange() {
+      const r = priceChart.timeScale().getVisibleLogicalRange();
+      const from = Math.max(0, Math.floor(r.from));
+      const to = Math.min(candles.length - 1, Math.ceil(r.to));
+      const vis = candles.slice(from, to + 1);
+      const hi = Math.max(...vis.map((c) => c.h));
+      const lo = Math.min(...vis.map((c) => c.l));
+      const top = candleSeries.coordinateToPrice(0);
+      const bot = candleSeries.coordinateToPrice(priceEl.clientHeight);
+      return { hi, lo, top, bot, autoScale: priceChart.priceScale('right').options().autoScale };
     },
 
     destroy() {
@@ -459,6 +503,11 @@ export function createLineChart(el, opts = {}) {
         lastT = p.t;
       }
       series.setData(clean);
+      try {
+        chart.priceScale('right').applyOptions({ autoScale: true });
+      } catch (_) {
+        /* ignore */
+      }
       if (fit) chart.timeScale().fitContent();
     },
     update(p) {

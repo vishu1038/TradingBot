@@ -4,7 +4,9 @@
 .symbar { grid-column: 1 / -1; display: flex; gap: 8px; align-items: stretch; min-width: 0; }
 .symbar-scroll { display: flex; gap: 7px; overflow-x: auto; flex: 1; min-width: 0; padding: 3px 2px 5px; scrollbar-width: none; scroll-behavior: smooth; }
 .symbar-scroll::-webkit-scrollbar { display: none; }
-.chip { flex: 1 0 104px; max-width: 170px; display: grid; gap: 1px; text-align: left; padding: 6px 10px 6px; background: var(--panel); border: 1px solid color-mix(in srgb, var(--cc) 30%, #1b1b26); border-top: 3px solid var(--cc); border-radius: 0 0 12px 12px; cursor: pointer; transition: background 0.15s, box-shadow 0.15s; }
+.chip { flex: 1 0 104px; max-width: 170px; display: grid; gap: 1px; text-align: left; padding: 6px 10px 6px; background: var(--panel); position: relative; overflow: hidden; border: 1px solid color-mix(in srgb, var(--cc) 30%, #1b1b26); border-radius: 12px; cursor: pointer; transition: background 0.15s, box-shadow 0.15s; }
+.chip::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--cc); }
+.chip { padding-top: 8px; }
 .chip:hover { background: var(--panel-2); }
 .chip.sel { background: linear-gradient(180deg, color-mix(in srgb, var(--cc) 20%, #07070c), var(--panel)); box-shadow: 0 0 14px -2px var(--cc); border-color: var(--cc); }
 .chip.off { opacity: 0.7; }
@@ -25,17 +27,16 @@
 
 /* ------------------------------------------------------------------ LIVE desktop */
 .live { height: 100%; padding: 10px; }
-.live-desk { display: grid; grid-template-columns: minmax(0, 1fr) 392px; grid-template-rows: auto minmax(0, 1fr); gap: 8px 12px; }
-.live-left { display: flex; flex-direction: column; gap: 12px; min-height: 0; min-width: 0; }
-.live-right { display: flex; flex-direction: column; gap: 12px; min-height: 0; overflow-y: auto; padding-right: 2px; padding-bottom: 2px; }
+.live-desk { display: grid; grid-template-columns: minmax(0, 1fr) 392px; grid-template-rows: auto minmax(0, 1fr); gap: 16px 12px; }
+.live-left { display: flex; flex-direction: column; gap: 18px; min-height: 0; min-width: 0; }
+.live-right { display: flex; flex-direction: column; gap: 18px; min-height: 0; overflow-y: auto; padding: 12px 2px 2px 0; margin-top: -12px; }
 .live-right > .card { flex: none; }
 .live-row1 { display: grid; grid-template-columns: minmax(380px, 470px) minmax(0, 1fr); gap: 12px; flex: none; height: 156px; }
 .live-row1 > .card { min-height: 0; }
-.chartcard { --pad: 0px; flex: 1; min-height: 240px; display: flex; flex-direction: column; overflow: hidden; }
-.chartcard > h3 { margin-bottom: 0; }
-.chart-stack { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #000; border-radius: 0 0 11px 11px; overflow: hidden; }
+.chartcard { --pad: 0px; flex: 1; min-height: 240px; display: flex; flex-direction: column; padding: 12px 0 0; }
+.chart-stack { flex: 1; min-height: 0; display: flex; flex-direction: column; background: #000; border-radius: 0 0 11px 11px; overflow: hidden; margin-top: 4px; }
 .chart-price { position: relative; flex: 1; min-height: 0; }
-.chart-prob { position: relative; height: 112px; flex: none; border-top: 1px solid var(--line-2); }
+.chart-prob { position: relative; height: 148px; flex: none; border-top: 1px solid var(--line-2); }
 .chart-el { position: absolute; inset: 0; }
 .chart-legend { position: absolute; left: 10px; top: 6px; z-index: 5; font-size: 12px; display: flex; flex-wrap: wrap; gap: 0 9px; pointer-events: none; text-shadow: 0 0 4px #000, 0 0 2px #000; max-width: calc(100% - 170px); }
 .chart-legend .lg-sym { font-weight: 800; color: #fff; }
@@ -54,7 +55,7 @@
 .show-s { display: none; }
 
 .logcard { min-height: 0; display: flex; flex-direction: column; }
-.log-scroll { flex: 1; min-height: 0; overflow-y: auto; font-size: 11.5px; line-height: 1.5; }
+.log-scroll { flex: 1; min-height: 0; overflow-y: auto; -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 12px); mask-image: linear-gradient(to bottom, transparent 0, #000 12px); font-size: 11.5px; line-height: 1.5; }
 .log { display: flex; gap: 8px; white-space: nowrap; }
 .log-t { color: #5d6171; }
 .log-l { width: 38px; font-weight: 700; flex: none; }
@@ -65,17 +66,17 @@
 .lv-error .log-l, .lv-error .log-m, .lv-critical .log-l { color: var(--down); }
 
 /* ------------------------------------------------------------------ HERO */
-.hero { display: flex; flex-direction: column; overflow: hidden; padding-bottom: 0; }
+.hero { display: flex; flex-direction: column; padding-bottom: 8px; }
+.hero > h3 { overflow: visible; }
 .hero > h3 .hero-name { color: var(--text-dim); font-weight: 600; letter-spacing: 0.08em; font-size: 10.5px; margin-left: 10px; }
 .hero-dots { display: flex; gap: 0; margin-left: 6px; order: 3; }
-.hero > h3::after { order: 4; }
 .hdot { width: 22px; height: 22px; border: none; background: none; cursor: pointer; position: relative; padding: 0; }
 .hdot::after { content: ''; position: absolute; left: 6px; top: 8px; width: 10px; height: 6px; border-radius: 3px; background: #2a2a3a; transition: background 0.2s, width 0.2s; }
 .hdot.on::after { background: var(--pink); width: 14px; left: 4px; box-shadow: 0 0 8px var(--pink); }
 .hero-view { flex: 1; min-height: 0; overflow: hidden; touch-action: pan-y; cursor: grab; user-select: none; }
 .hero-track { display: flex; height: 100%; transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1); }
 .hero-slide { flex: 0 0 100%; min-width: 0; height: 100%; overflow: hidden; padding-right: 2px; }
-.hero-prog { height: 3px; margin: 0 calc(-1px - var(--pad)); background: #12121a; }
+.hero-prog { height: 3px; margin: 6px 0 0; border-radius: 2px; overflow: hidden; background: #12121a; }
 .hero-prog i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--coral), var(--pink), var(--violet)); transition: width 0.1s linear; }
 .hero.paused .hero-prog i { background: var(--text-dim); }
 .h-pnl { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
@@ -148,7 +149,7 @@
 .car-tabs { display: flex; gap: 6px; padding: 2px 0 8px; overflow-x: auto; }
 .car-tab { flex: 1; min-height: 38px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--panel); color: var(--text-dim); font-weight: 750; font-size: 11.5px; letter-spacing: 0.1em; cursor: pointer; }
 .car-tab.on { color: #fff; border-color: var(--coral); background: rgba(217, 119, 87, 0.18); }
-.car-track { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.car-track { display: flex; gap: 10px; padding-top: 12px; overflow-x: auto; scroll-snap-type: x mandatory; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
 .car-track::-webkit-scrollbar { display: none; }
 .car-panel { flex: 0 0 100%; scroll-snap-align: start; min-width: 0; }
 .car-panel > .card { height: 100%; }
@@ -174,12 +175,13 @@
   .mock-badge::before { content: 'MOCK'; font-size: 10px; }
   .pal-btn-t { display: none; }
   .live { height: auto; display: block; padding: 8px; }
-  .symbar { margin-bottom: 8px; }
-  .live-top { display: grid; gap: 12px; margin-bottom: 12px; }
+  .symbar { margin-bottom: 16px; }
+  .live-top { display: grid; gap: 20px; margin-bottom: 14px; }
+  .live-right, .live-left { margin-top: 0; }
   .live-row1, .live-left { display: block; }
   .hero { height: 154px; }
   .chartcard { height: min(56vh, 540px); min-height: 330px; }
-  .chart-prob { height: 96px; }
+  .chart-prob { height: 118px; }
   .page { grid-template-columns: minmax(0, 1fr); padding: 8px; }
   .lab-grid, .live-grid { grid-template-columns: minmax(0, 1fr); }
   .tiles.t7 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -192,7 +194,7 @@
 }
 /* tablet landscape: hero + chart on the left, swipe panels on the right */
 @media (min-width: 1000px) and (max-width: 1279px) {
-  .live { height: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 360px; grid-template-rows: auto minmax(0, 1fr); gap: 8px 12px; padding: 8px 10px; }
+  .live { height: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 360px; grid-template-rows: auto minmax(0, 1fr); gap: 16px 12px; padding: 8px 10px; }
   #view.view-live { overflow: hidden; }
   .live-top { grid-template-rows: auto minmax(0, 1fr); min-height: 0; margin-bottom: 0; }
   .hero { height: 156px; }

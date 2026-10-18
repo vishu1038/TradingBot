@@ -190,12 +190,11 @@ code, kbd { font-family: var(--sans); font-weight: 600; }
 .xbtn:hover { color: #fff; border-color: var(--red); background: rgba(255, 45, 85, 0.25); }
 
 /* ------------------------------------------------------------------ framed cards  ╭─ TITLE ───╮ */
-.card { --ac: var(--coral); --pad: 12px; --bc: color-mix(in srgb, var(--ac) 40%, #1b1b26); position: relative; background: var(--panel); border: 1px solid var(--bc); border-top: none; border-radius: 0 0 var(--radius) var(--radius); padding: 0 var(--pad) var(--pad); min-width: 0; box-shadow: 0 0 22px -14px var(--ac); }
-.card > h3 { display: flex; align-items: center; height: 24px; margin: 0 calc(-1px - var(--pad)) 8px; font: 750 11px/24px var(--sans); letter-spacing: 0.15em; color: var(--ac); white-space: nowrap; text-shadow: 0 0 10px color-mix(in srgb, var(--ac) 45%, transparent); }
-.card > h3::before { content: ''; flex: none; width: 16px; height: 12px; align-self: flex-end; margin-right: 8px; border-top: 1px solid var(--bc); border-left: 1px solid var(--bc); border-radius: var(--radius) 0 0 0; }
-.card > h3::after { content: ''; flex: 1; min-width: 14px; height: 12px; align-self: flex-end; margin-left: 8px; border-top: 1px solid var(--bc); border-right: 1px solid var(--bc); border-radius: 0 var(--radius) 0 0; }
+.card { --ac: var(--coral); --pad: 12px; --bc: color-mix(in srgb, var(--ac) 40%, #1b1b26); position: relative; background: var(--panel); border: 1px solid var(--bc); border-radius: var(--radius); padding: 18px var(--pad) var(--pad); min-width: 0; box-shadow: 0 0 22px -14px var(--ac); }
+.card > h3 { position: absolute; z-index: 3; top: -10px; left: 14px; max-width: calc(100% - 28px); display: flex; align-items: center; height: 20px; margin: 0; padding: 0 9px; background: var(--panel); border-radius: 6px; font: 750 11px/20px var(--sans); letter-spacing: 0.15em; color: var(--ac); white-space: nowrap; text-shadow: 0 0 10px color-mix(in srgb, var(--ac) 45%, transparent); }
 .card > h3 .why-sub, .card > h3 .count { margin-left: 8px; color: var(--text-dim); letter-spacing: 0; font-weight: 500; text-transform: none; text-shadow: none; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 .card > h3 .why-sub:first-of-type { margin-left: 10px; }
+.card > h3 .why-sub, .card > h3 .count { min-width: 0; white-space: nowrap; }
 .ac-coral { --ac: var(--coral); } .ac-violet { --ac: var(--violet); } .ac-cyan { --ac: var(--cyan); } .ac-amber { --ac: var(--amber); }
 .ac-pink { --ac: var(--pink); } .ac-sky { --ac: var(--sky); } .ac-teal { --ac: var(--teal); } .ac-magenta { --ac: var(--magenta); } .ac-red { --ac: var(--red); }
 .span2 { grid-column: 1 / -1; }
@@ -373,7 +372,7 @@ code { color: var(--amber); }
 
 /* command palette */
 #palette-host .pal-backdrop { position: fixed; inset: 0; z-index: 980; background: rgba(0, 0, 0, 0.7); display: flex; justify-content: center; align-items: flex-start; padding-top: 14vh; }
-.pal { width: min(620px, 94vw); padding-bottom: 8px; border-top: 1px solid var(--bc); border-radius: var(--radius); box-shadow: 0 0 50px rgba(217, 119, 87, 0.3); --pad: 12px; border-top: none; }
+.pal { width: min(620px, 94vw); padding: 6px 12px 8px; box-shadow: 0 0 50px rgba(217, 119, 87, 0.3); --pad: 12px; border-top: none; }
 .pal-in { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line-2); border-radius: 12px; padding: 4px 12px; background: #050508; margin-bottom: 8px; margin-top: 10px; }
 .pal-slash { color: var(--coral); font-size: 20px; font-weight: 700; }
 .pal-in input { flex: 1; border: none; background: none; outline: none; font-size: 16px; padding: 8px 0; min-height: 0; }

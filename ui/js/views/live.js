@@ -128,7 +128,7 @@ export function mount(root) {
   }
   const symPositions = () => store.get('positions').filter((p) => p.symbol === store.get('symbol'));
   function refreshOverlays() {
-    if (!chart) return;
+    if (!chart || loadedSymbol !== store.get('symbol')) return;
     const sym = store.get('symbol');
     const pos = symPositions();
     chart.setPositionLines(pos);
@@ -234,7 +234,9 @@ export function mount(root) {
   if (store.get('symbol') && store.get('candles')[store.get('symbol')]) loadChart();
   else ensureChart();
 
-  // crossing the breakpoint rebuilds the page in the other layout
+  window.__tbChart = () => chart; // test hook (WKWebView regression checks)
+
+    // crossing the breakpoint rebuilds the page in the other layout
   const onMq = () => store.emit('relayout', null);
   mq.addEventListener('change', onMq);
 
