@@ -169,7 +169,8 @@ class CorrCap:
 
 # keys exposed through the API contract (GET/PUT /api/settings)
 CONTRACT_KEYS = (
-    "slice_margin_usd", "leverage", "max_positions", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
+    "slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
+    "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
     "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd",
 )
@@ -179,7 +180,11 @@ CONTRACT_KEYS = (
 class Settings:
     slice_margin_usd: float = 20.0
     leverage: int = 8
-    max_positions: int = 5
+    max_positions: int | None = None    # optional hard cap on concurrent trades (null = governed by the rules below)
+    max_leverage: int = 20              # per-trade leverage is chosen automatically, never above this (1..125)
+    max_total_leverage: float = 20.0    # sum(open notional) / bot equity, including a new entry
+    max_margin_ratio: float = 0.50      # sum(maintenance margin) / bot equity, including a new entry
+    max_open_risk_pct: float = 20.0     # sum(loss if every SL fills, fees+slippage incl.) / bot equity, in %
     exit_mode: str = "fixed"            # fixed | atr
     tp_usd: float = 5.0
     sl_usd: float = 10.0
@@ -200,7 +205,7 @@ class Settings:
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
     stop_slippage_pct: float = 0.0005   # extra slippage on stop-market fills (fraction)
-    maint_margin_rate: float = 0.005    # isolated liquidation approximation
+    maint_margin_rate: float = 0.01     # maintenance margin rate when a symbol's brackets are unknown (conservative)
     min_universe_volume_usd: float = 50e6
     min_listing_days: int = 7
     max_abs_funding: float = 0.001
@@ -268,7 +273,11 @@ class Settings:
 
         chk(self.slice_margin_usd > 0, "slice_margin_usd must be > 0")
         chk(1 <= self.leverage <= 50, "leverage must be 1..50")
-        chk(1 <= self.max_positions <= 50, "max_positions must be 1..50")
+        chk(self.max_positions is None or 1 <= self.max_positions <= 50, "max_positions must be 1..50 or null")
+        chk(1 <= self.max_leverage <= 125, "max_leverage must be 1..125")
+        chk(1 <= self.max_total_leverage <= 125, "max_total_leverage must be 1..125")
+        chk(0.05 <= self.max_margin_ratio <= 0.9, "max_margin_ratio must be 0.05..0.9")
+        chk(1 <= self.max_open_risk_pct <= 100, "max_open_risk_pct must be 1..100")
         chk(self.exit_mode in ("fixed", "atr"), "exit_mode must be fixed|atr")
         chk(self.tp_usd > 0 and self.sl_usd > 0, "tp_usd/sl_usd must be > 0")
         chk(self.tp_atr > 0 and self.sl_atr > 0, "tp_atr/sl_atr must be > 0")

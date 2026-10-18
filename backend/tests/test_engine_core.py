@@ -19,7 +19,7 @@ from tb.exchange.paper import PaperExchange
 from tb.safety import DEGRADED, NORMAL
 
 BAR = 300_000
-FAST = {"slippage_pct": 0.0, "stop_slippage_pct": 0.0}
+FAST = {"slippage_pct": 0.0, "stop_slippage_pct": 0.0, "max_open_risk_pct": 100.0}     # (open-risk cap tested separately)
 
 
 def run(coro):
@@ -255,21 +255,26 @@ def test_correlated_positions_block_new_entry(store, tmp_path):
     assert len(store.get_positions()) == 2
 
 
-def test_fifth_slot_unreachable_with_100_equity(store, tmp_path):
+def test_five_template_slices_fit_on_100_with_auto_leverage(store, tmp_path):
     syms = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT", "BTCUSDT")
     eng, data = mk_engine(store, tmp_path, symbols=syms)
     eng.universe = list(syms[:5])
     for s in syms[:5]:
         open_long(eng, s)
-    assert len(store.get_positions()) == 4                       # the 5th slice is short by the entry fees
+    pos = store.get_positions()
+    assert len(pos) == 5                                          # 5 x 160 notional on 100 equity = 8x total (cap 20x)
+    assert all(p["leverage"] == 9 for p in pos)                   # auto leverage for a 6.25% stop, not the template 8
+    assert sum(p["margin"] for p in pos) == pytest.approx(5 * 160 / 9, rel=0.02)
     run(eng.heartbeat_cycle())
-    assert store.kv_get("status")["max_positions"] == 4
+    st = store.kv_get("status")
+    assert st["max_positions"] == 5 and st["total_leverage"] == pytest.approx(8.0, rel=0.02)
+    assert st["margin_ratio"] == pytest.approx(0.08, rel=0.05) and st["max_total_leverage"] == 20 and st["max_margin_ratio"] == 0.5
 
 
 def test_max_positions_follows_equity(store, tmp_path):
     eng, data = mk_engine(store, tmp_path, settings={"paper_start_equity": 45.0})
     eng.startup()
-    assert E.effective_slots(eng.cfg, 0, eng.available) == 2          # 45 / 20.08
+    assert __import__("tb.risk", fromlist=["x"]).effective_slots(eng.cfg, 0, eng.available) == 2          # 45 / 20.08
 
 
 # ------------------------------------------------------------------ derating / staged rollout / drift
@@ -541,7 +546,7 @@ def test_equity_and_status_written(store, tmp_path):
     run(eng.heartbeat_cycle())
     run(eng.housekeeping_cycle())
     st = store.kv_get("status")
-    assert st["mode"] == "paper_local" and st["equity"] == pytest.approx(100.0) and st["max_positions"] == 4   # fee-aware
+    assert st["mode"] == "paper_local" and st["equity"] == pytest.approx(100.0) and st["max_positions"] == 5   # effective capacity (free margin)
     assert st["kill"]["dd_limit_pct"] == 50.0
     assert store.get_equity(5) and store.heartbeat()["data"]["running"] is True
     assert store.kv_get("market")["btc_price"] > 0

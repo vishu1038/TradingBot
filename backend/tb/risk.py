@@ -61,12 +61,74 @@ def atr_pct(high: Sequence[float], low: Sequence[float], close: Sequence[float],
 
 
 # ----------------------------------------------------------------------------- liquidation / sizing
-def liq_price(side: str, entry: float, leverage: float, mmr: float = 0.005) -> float:
-    """Isolated liquidation price, same (Binance) form as ``tb.sim.template.liq_price``:
-    long entry*(1-1/L)/(1-mmr), short entry*(1+1/L)/(1+mmr) (margin = notional/L, no fees)."""
+def liq_price(side: str, entry: float, leverage: float, mmr: float = 0.005, cum_ratio: float = 0.0) -> float:
+    """Isolated liquidation price, Binance form (identical to ``tb.sim.template.liq_price`` when cum == 0):
+    long entry*(1-1/L-cum/notional)/(1-mmr), short entry*(1+1/L+cum/notional)/(1+mmr)
+    (margin = notional/L, no fees; ``cum_ratio`` = maintenance amount / notional of the bracket)."""
     if side == "long":
-        return entry * (1.0 - 1.0 / leverage) / (1.0 - mmr)
-    return entry * (1.0 + 1.0 / leverage) / (1.0 + mmr)
+        return entry * (1.0 - 1.0 / leverage - cum_ratio) / (1.0 - mmr)
+    return entry * (1.0 + 1.0 / leverage + cum_ratio) / (1.0 + mmr)
+
+
+# ----------------------------------------------------------------------------- brackets / maintenance margin
+@dataclass(frozen=True)
+class Bracket:
+    """One Binance leverage-bracket tier: maintenance margin = notional * mmr - cum for floor <= notional < cap;
+    ``max_lev`` is the tier's maximum leverage (initialLeverage)."""
+    floor: float
+    cap: float
+    mmr: float
+    cum: float
+    max_lev: int = 125
+
+
+def parse_brackets(raw) -> dict:
+    """``GET /fapi/v1/leverageBracket`` (a list, or one dict when ``symbol`` was given) -> {symbol: [Bracket]}."""
+    rows = raw if isinstance(raw, list) else [raw]
+    out: dict = {}
+    for r in rows:
+        tiers = sorted((Bracket(float(b.get("notionalFloor", 0)), float(b.get("notionalCap", float("inf"))),
+                                float(b["maintMarginRatio"]), float(b.get("cum", 0)), int(b.get("initialLeverage", 125)))
+                        for b in r.get("brackets", [])), key=lambda t: t.floor)
+        if tiers:
+            out[r["symbol"]] = tiers
+    return out
+
+
+def tier_for(notional: float, brackets) -> Bracket | None:
+    if not brackets:
+        return None
+    for t in brackets:
+        if t.floor <= notional < t.cap:
+            return t
+    return brackets[-1]
+
+
+def maintenance_margin(notional: float, brackets=None, default_mmr: float = 0.01) -> float:
+    """Maintenance margin of a position of ``notional`` USD from its bracket tier (``default_mmr`` if unknown)."""
+    t = tier_for(notional, brackets)
+    if t is None:
+        return notional * default_mmr
+    return max(0.0, notional * t.mmr - t.cum)
+
+
+LIQ_STOP_RATIO = 1.5       # liquidation must be at least 1.5x the stop distance away from entry
+
+
+def choose_leverage(side: str, entry: float, sl: float, notional: float, max_leverage: int = 20, brackets=None,
+                    default_mmr: float = 0.01, ratio: float = LIQ_STOP_RATIO) -> int | None:
+    """Highest integer leverage L (<= max_leverage and <= the bracket's maxLeverage at this notional) whose isolated
+    liquidation price is at least ``ratio`` x |entry - SL| away from entry. None if even 1x does not satisfy it.
+    The same function is used by the engine, the paper exchange and the backtester."""
+    stop_dist = abs(entry - sl)
+    t = tier_for(notional, brackets)
+    mmr = t.mmr if t else default_mmr
+    cum_ratio = (t.cum / notional) if (t and notional > 0) else 0.0
+    cap = int(max_leverage) if not t else min(int(max_leverage), int(t.max_lev))
+    for lev in range(max(1, cap), 0, -1):
+        if abs(entry - liq_price(side, entry, lev, mmr, cum_ratio)) >= ratio * stop_dist:
+            return lev
+    return None
 
 
 @dataclass
@@ -83,10 +145,12 @@ class Sizing:
     reward_usd: float = 0.0
     atr: float | None = None
     liq_price: float = 0.0
+    leverage: int = 1
+    mm: float = 0.0
 
 
 def size_trade(cfg: Settings, side: str, entry: float, atr: float | None, f: SymbolFilters,
-               available: float | None = None, risk_mult: float = 1.0) -> Sizing:
+               available: float | None = None, risk_mult: float = 1.0, brackets=None) -> Sizing:
     """Qty + SL/TP prices for the trade template. ``side`` is 'long' | 'short'.
 
     ``risk_mult`` (drawdown derating / drift / first-live-trades) scales the position: the USD risk
@@ -128,18 +192,21 @@ def size_trade(cfg: Settings, side: str, entry: float, atr: float | None, f: Sym
     if (entry - sl) * d <= 0 or (tp - entry) * d <= 0:
         return Sizing(False, "stop/target collapse onto entry after tick rounding")
     notional = qty * entry
-    margin = notional / cfg.leverage
-    liq = liq_price(side, entry, cfg.leverage, cfg.maint_margin_rate)
     if qty < f.min_qty:
         return Sizing(False, f"qty {qty} < min_qty {f.min_qty}")
     if notional < f.min_notional:
         return Sizing(False, f"notional {notional:.2f} < min_notional {f.min_notional}")
-    if abs(entry - sl) > 0.8 * abs(entry - liq):
-        return Sizing(False, "stop is too close to (or beyond) the liquidation price")
+    # per-trade leverage: the highest L whose liquidation is >= 1.5x the stop distance away (isolated margin)
+    lev = choose_leverage(side, entry, sl, notional, cfg.max_leverage, brackets, cfg.maint_margin_rate)
+    if lev is None:
+        return Sizing(False, "stop is too close to (or beyond) the liquidation price even at 1x")
+    margin = notional / lev
+    t = tier_for(notional, brackets)
+    liq = liq_price(side, entry, lev, t.mmr if t else cfg.maint_margin_rate, (t.cum / notional) if t else 0.0)
     if available is not None and margin * 1.01 > available:
         return Sizing(False, f"insufficient available margin ({available:.2f} < {margin:.2f})")
     return Sizing(True, "", qty, notional, margin, entry, sl, tp, qty * abs(entry - sl), qty * abs(tp - entry),
-                  used_atr, liq)
+                  used_atr, liq, lev, maintenance_margin(notional, brackets, cfg.maint_margin_rate))
 
 
 def levels(cfg: Settings, side: str, entry: float, qty: float, atr: float | None,
@@ -162,15 +229,96 @@ def levels(cfg: Settings, side: str, entry: float, qty: float, atr: float | None
 
 
 def max_positions(equity: float, cfg: Settings) -> int:
-    """Nominal slot count: floor(equity / slice margin), capped by the setting."""
-    return max(0, min(cfg.max_positions, int(math.floor(equity / cfg.slice_margin_usd + 1e-9))))
+    """Nominal slot count: floor(equity / slice margin); capped by ``max_positions`` when that is set."""
+    n = int(math.floor(equity / cfg.slice_margin_usd + 1e-9))
+    return max(0, min(cfg.max_positions, n) if cfg.max_positions is not None else n)
+
+
+# ----------------------------------------------------------------------------- portfolio rules for a new entry
+def sl_loss(cfg: Settings, qty: float, entry: float, sl: float, side: str, *, entry_fee: bool = False) -> float:
+    """USD lost if the stop fills: price loss + exit fee + stop slippage (+ the entry fee if still to be paid).
+    Never negative (a trailed stop in profit risks nothing)."""
+    d = 1.0 if side == "long" else -1.0
+    price_loss = (entry - sl) * d * qty
+    costs = qty * sl * (cfg.fee_taker + cfg.slippage_pct + cfg.stop_slippage_pct)
+    if entry_fee:
+        costs += qty * entry * cfg.fee_taker
+    return max(0.0, price_loss + costs)
+
+
+@dataclass
+class Book:
+    """Aggregates of the open positions + account state used by ``check_entry`` (all in USD)."""
+    equity: float
+    available: float
+    open_notional: float = 0.0
+    open_mm: float = 0.0
+    open_risk: float = 0.0
+
+
+@dataclass
+class EntryCheck:
+    ok: bool
+    rule: str = ""          # total_leverage | margin_ratio | open_risk | free_margin | "" (ok)
+    detail: str = ""
+
+
+def check_entry(cfg: Settings, book: Book, new_notional: float, new_mm: float, new_risk: float, margin: float,
+                fee: float) -> EntryCheck:
+    """A new position is allowed only if, INCLUDING it:
+    (1) sum(notional)/equity <= max_total_leverage, (2) sum(maintenance margin)/equity <= max_margin_ratio,
+    (3) sum(loss if every SL fills)/equity <= max_open_risk_pct %, (4) free margin >= its margin + entry fee."""
+    eq = book.equity
+    if eq <= 0:
+        return EntryCheck(False, "total_leverage", "no equity")
+    lev = (book.open_notional + new_notional) / eq
+    if lev > cfg.max_total_leverage + 1e-9:
+        return EntryCheck(False, "total_leverage", f"total leverage {lev:.2f}x > max {cfg.max_total_leverage:g}x")
+    ratio = (book.open_mm + new_mm) / eq
+    if ratio > cfg.max_margin_ratio + 1e-9:
+        return EntryCheck(False, "margin_ratio", f"maintenance margin ratio {ratio:.2f} > max {cfg.max_margin_ratio:g}")
+    risk = (book.open_risk + new_risk) / eq * 100.0
+    if risk > cfg.max_open_risk_pct + 1e-9:
+        return EntryCheck(False, "open_risk", f"open stop-out risk {risk:.1f}% > max {cfg.max_open_risk_pct:g}%")
+    if book.available + 1e-9 < margin + fee:
+        return EntryCheck(False, "free_margin", f"free margin {book.available:.2f} < slice margin + fee {margin + fee:.2f}")
+    return EntryCheck(True)
+
+
+def slots_fit(cfg: Settings, book: Book, n_open: int, brackets=None) -> int:
+    """How many MORE template slices (slice notional, fixed-mode stop, auto leverage) ``check_entry`` would accept
+    right now (also honouring the optional ``max_positions`` cap)."""
+    notional = cfg.notional_usd
+    entry = 100.0
+    sl = entry * (1.0 - cfg.sl_usd / notional)
+    lev = choose_leverage("long", entry, sl, notional, cfg.max_leverage, brackets, cfg.maint_margin_rate) or 1
+    margin = notional / lev
+    fee = notional * cfg.fee_taker
+    mm = maintenance_margin(notional, brackets, cfg.maint_margin_rate)
+    risk = sl_loss(cfg, notional / entry, entry, sl, "long", entry_fee=True)
+    n = 0
+    b = Book(book.equity, book.available, book.open_notional, book.open_mm, book.open_risk)
+    while n < 100:
+        if cfg.max_positions is not None and n_open + n >= cfg.max_positions:
+            break
+        if not check_entry(cfg, b, notional, mm, risk, margin, fee).ok:
+            break
+        n += 1
+        b.open_notional += notional
+        b.open_mm += mm
+        b.open_risk += risk
+        b.available -= margin + fee
+    return n
 
 
 def effective_slots(cfg: Settings, n_open: int, available: float) -> int:
-    """Slots the account can really fill: open positions + whole slices that fit in the FREE margin
-    including each entry's taker fee (100 USD -> 4, not 5: the 5th slice is short by the fees)."""
+    """Free-margin-only slot count (kept for callers without equity): open + whole slices (margin + entry fee)
+    that fit in ``available``, capped by ``max_positions`` when set."""
     per = cfg.slice_margin_usd + cfg.notional_usd * cfg.fee_taker
-    return max(n_open, min(cfg.max_positions, n_open + int(math.floor(max(0.0, available) / per + 1e-9))))
+    n = n_open + int(math.floor(max(0.0, available) / per + 1e-9))
+    if cfg.max_positions is not None:
+        n = min(cfg.max_positions, n)
+    return max(n_open, n)
 
 
 def derated_below_min_notional(cfg: Settings, dd_pct: float, kill_dd_pct: float, min_notional: float) -> bool:

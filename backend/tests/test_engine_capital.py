@@ -15,14 +15,15 @@ def demo(store, tmp_path, wallet=5000.0, settings=None, **kw):
 
 def test_default_stake_is_100_and_wallet_is_reported_separately(store, tmp_path):
     assert Settings().capital_usd == 100.0
-    eng, data, venue = demo(store, tmp_path)
+    eng, data, venue = demo(store, tmp_path, settings={"max_open_risk_pct": 20.0})
     assert eng.equity == pytest.approx(100.0) and eng.wallet_equity == pytest.approx(5000.0)
     assert eng.start_equity == pytest.approx(100.0) and eng.peak_equity == pytest.approx(100.0)
     assert eng.available == pytest.approx(100.0) and eng.cash == pytest.approx(100.0)
     run(eng.heartbeat_cycle())
     st = store.kv_get("status")
     assert st["equity"] == pytest.approx(100.0) and st["wallet_equity"] == pytest.approx(5000.0)
-    assert st["capital_usd"] == 100.0 and st["max_positions"] == 4              # slots from the stake (fee-aware)
+    assert st["capital_usd"] == 100.0 and st["max_positions"] == 1              # capacity from the stake: open-risk cap binds (20% of 100)
+    assert st["open_risk_pct"] == 0.0 and st["max_open_risk_pct"] == 20.0
 
 
 def test_slots_follow_the_stake_not_the_wallet(store, tmp_path):
@@ -35,7 +36,7 @@ def test_slots_follow_the_stake_not_the_wallet(store, tmp_path):
     # a wallet of 5000 would allow 5 slots; the stake of 100 leaves 2 more slices
     run(eng.prices_cycle())
     assert eng.available == pytest.approx(100.0 - sum(p["margin"] for p in store.get_positions()), abs=0.5)
-    assert eng.available < 61
+    assert eng.available < 66
 
 
 def test_trading_is_capped_by_the_stake(store, tmp_path):
@@ -206,3 +207,92 @@ def test_restart_reconciles_open_positions_and_keeps_exchange_stops(store, tmp_p
                     clock=eng.clock)
     eng4.startup()
     assert store.get_positions() == [] and len(store.get_trades(5)) == 1
+
+
+# ------------------------------------------------------------------ capacity rules (leverage / margin ratio / open risk)
+def test_open_risk_cap_blocks_the_nth_correlated_trade(store, tmp_path, caplog):
+    import logging
+    syms = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "BTCUSDT")
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks={s: 100.0 for s in syms}, venue_marks={s: 100.0 for s in syms},
+                               settings={"max_open_risk_pct": 25.0, "corr_cap": {"max_corr": 0.99, "max_correlated": 9}},
+                               wallet=100.0)
+    eng.cfg = store.get_settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)
+    eng.universe = list(syms[:4])
+    with caplog.at_level(logging.INFO, logger="tb.engine"):
+        for s in syms[:4]:
+            open_(eng, s)
+    # each stop-out risks ~10.1 USD (+fees): two fit under 25% of 100, the third would be 30%
+    assert len(store.get_positions()) == 2
+    assert any("blocked by rule open_risk" in r.message for r in caplog.records)
+    cap = eng.capacity()
+    assert 20 < cap["open_risk_pct"] <= 25 and cap["max_open_risk_pct"] == 25.0
+
+
+def test_total_leverage_rule_blocks_entry(store, tmp_path, caplog):
+    import logging
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=100.0,
+                               settings={"max_open_risk_pct": 100.0, "max_total_leverage": 1.5})
+    eng.cfg = store.get_settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)
+    with caplog.at_level(logging.INFO, logger="tb.engine"):
+        open_(eng, "AAAUSDT")                  # 160 notional on 100 equity = 1.6x > 1.5x
+    assert store.get_positions() == []
+    assert any("blocked by rule total_leverage" in r.message for r in caplog.records)
+
+
+def test_high_mmr_coin_blocked_by_margin_ratio(store, tmp_path, caplog):
+    import logging
+    from tb.risk import Bracket
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=100.0,
+                               settings={"max_open_risk_pct": 100.0, "max_margin_ratio": 0.05})
+    eng.cfg = store.get_settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)
+    venue.leverage_brackets = lambda s: [Bracket(0, 1e9, 0.5 if s == "BBBUSDT" else 0.01, 0.0, 20)]
+    with caplog.at_level(logging.INFO, logger="tb.engine"):
+        open_(eng, "BBBUSDT")                  # mmr 50%: MM 80 USDT on 100 equity -> far above 5%
+        open_(eng, "AAAUSDT")                  # mmr 1%:  MM 1.6 -> 1.6% ok
+    assert [p["symbol"] for p in store.get_positions()] == ["AAAUSDT"]
+    assert any("blocked by rule margin_ratio" in r.message or "liquidation" in r.message for r in caplog.records)
+
+
+def test_leverage_is_set_on_the_exchange_before_entry_and_recorded(store, tmp_path):
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=100.0,
+                               settings={"max_open_risk_pct": 100.0})
+    open_(eng, "AAAUSDT")
+    kinds = [x[0] for x in venue.log]
+    assert kinds.index("iso") < kinds.index("lev") < kinds.index("market")
+    lev = [x for x in venue.log if x[0] == "lev"][0]
+    p = store.get_positions()[0]
+    assert lev[2] == p["leverage"] == 9
+    assert p["margin"] == pytest.approx(p["notional"] / 9, rel=0.01)
+    # liquidation of the chosen leverage is >= 1.5x the stop distance away
+    from tb.risk import liq_price
+    liq = liq_price("long", p["entry_price"], p["leverage"], eng.cfg.maint_margin_rate)
+    assert abs(p["entry_price"] - liq) >= 1.5 * abs(p["entry_price"] - p["sl_price"]) * 0.999
+
+
+def test_leverage_falls_back_when_the_exchange_rejects_it(store, tmp_path):
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=100.0,
+                               settings={"max_open_risk_pct": 100.0})
+    from tb.exchange.base import ExchangeError
+    orig = venue.set_leverage
+
+    def picky(s, lev):
+        if lev > 5:
+            raise ExchangeError("Leverage is not valid", code=-4028)
+        orig(s, lev)
+
+    venue.set_leverage = picky
+    open_(eng, "AAAUSDT")
+    p = store.get_positions()[0]
+    assert p["leverage"] == 4 and p["margin"] == pytest.approx(p["notional"] / 4, rel=0.01)     # 9 -> 9//2 = 4
+
+
+def test_capacity_on_a_200_usdt_stake(store, tmp_path):
+    eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=5000.0,
+                               settings={"capital_usd": 200.0, "max_open_risk_pct": 20.0})
+    run(eng.heartbeat_cycle())
+    st = store.kv_get("status")
+    assert st["equity"] == pytest.approx(200.0)
+    assert st["max_positions"] == 3                              # open risk 20% of 200 = 40 USDT / ~10.3 per stop-out
+    loose = store.patch_settings({"max_open_risk_pct": 100.0}, allow_internal=True)
+    eng.cfg = loose
+    assert eng.capacity()["max_positions"] == 11                 # then free margin binds (200 / 17.9)

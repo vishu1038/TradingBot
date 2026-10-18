@@ -247,6 +247,10 @@ class Exchange(ABC):
                    tp_order_id: str | None = None, entry_price: float = 0.0) -> CloseInfo | None:
         """Describe how a position that vanished from the exchange was closed."""
 
+    def leverage_brackets(self, symbol: str):
+        """Maintenance-margin tiers (``tb.risk.Bracket`` list) for ``symbol``, or None when unavailable."""
+        return None
+
     # ---- helpers
     def filters(self, symbol: str) -> SymbolFilters:
         info = self.exchange_info().get(symbol)

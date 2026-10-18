@@ -372,6 +372,13 @@ class BinanceExchange(Exchange):
                                     float(r.get("isolatedMargin") or 0), r.get("marginType", "isolated").lower() == "isolated"))
         return out
 
+    def leverage_brackets(self, symbol: str):
+        """Signed ``GET /fapi/v1/leverageBracket``; tiers for ``symbol`` (None if the venue lists none)."""
+        from ..risk import parse_brackets
+
+        raw = self._request("GET", "/fapi/v1/leverageBracket", {"symbol": symbol}, signed=True)
+        return parse_brackets(raw).get(symbol)
+
     def position_mode_hedged(self) -> bool:
         return bool(self._request("GET", "/fapi/v1/positionSide/dual", {}, signed=True).get("dualSidePosition"))
 

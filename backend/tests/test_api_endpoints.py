@@ -9,7 +9,8 @@ from tb.store import Store
 
 STATUS_KEYS = {"mode", "running", "equity", "wallet_equity", "start_equity", "peak_equity", "cash", "realized_pnl", "unrealized_pnl",
                "drawdown_pct", "open_positions", "max_positions", "trades_today", "win_rate", "kill", "model",
-               "universe_updated_at", "safety", "paused_symbols"}
+               "universe_updated_at", "safety", "paused_symbols", "total_leverage", "max_total_leverage", "margin_ratio",
+               "max_margin_ratio", "open_risk_pct", "max_open_risk_pct"}
 
 
 @pytest.fixture
@@ -150,7 +151,8 @@ def test_limits_validated(env):
 def test_settings_get_put_merge(env):
     c, s = env
     g = c.get("/api/settings").json()
-    assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
+    assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
+                      "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
                       "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": False, "activate_r": 1.0, "distance_atr": 1.0}
@@ -295,3 +297,17 @@ def test_equity_history_starts_at_the_capital_stake(env):
     assert len(c.get("/api/equity").json()) == 4               # no stake: full history
     s.kv_set(capital.SINCE_KEY, 3000)
     assert [r["equity"] for r in c.get("/api/equity").json()] == [100.0, 101.5]
+
+
+def test_capacity_settings_defaults_and_validation(env):
+    c, s = env
+    g = c.get("/api/settings").json()
+    assert g["max_positions"] is None and g["max_leverage"] == 20 and g["max_total_leverage"] == 20
+    assert g["max_margin_ratio"] == 0.5 and g["max_open_risk_pct"] == 20
+    ok = c.put("/api/settings", json={"max_leverage": 50, "max_total_leverage": 12.5, "max_margin_ratio": 0.3,
+                                      "max_open_risk_pct": 15, "max_positions": 3}).json()
+    assert (ok["max_leverage"], ok["max_total_leverage"], ok["max_margin_ratio"], ok["max_open_risk_pct"], ok["max_positions"]) == (50, 12.5, 0.3, 15, 3)
+    assert c.put("/api/settings", json={"max_positions": None}).json()["max_positions"] is None
+    for bad in ({"max_leverage": 0}, {"max_leverage": 126}, {"max_margin_ratio": 0.04}, {"max_margin_ratio": 0.95},
+                {"max_total_leverage": 0}, {"max_open_risk_pct": 0}, {"max_positions": 0}):
+        assert c.put("/api/settings", json=bad).status_code == 422, bad

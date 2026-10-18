@@ -63,7 +63,7 @@ def test_refresh_with_fake_exchange():
 def test_settings_merge_validation_and_api_shape():
     s = Settings()
     api = s.to_api()
-    assert list(api) == ["slice_margin_usd", "leverage", "max_positions", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
+    assert list(api) == ["slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio", "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
                          "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
                          "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd"]
     assert s.merge({"trail": {"enabled": True}}).trail.activate_r == 1.0

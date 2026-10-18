@@ -90,7 +90,8 @@ def mk_demo(store, tmp_path, *, prod_marks, venue_marks, venue_symbols=None, set
     data.server_time_ms = lambda: int(now * 1000)
     if settings:
         store.patch_settings(settings, allow_internal=True)
-    store.save_settings(store.get_settings().merge(FAST, allow_internal=True))
+    store.save_settings(store.get_settings().merge({k: v for k, v in FAST.items() if not settings or k not in settings},
+                                                    allow_internal=True))
     venue = FakeVenue(venue_symbols or syms, venue_marks, min_notional)
     venue.wallet = wallet
     eng = E.Engine(store, data, venue, "binance_demo", AlertDispatcher([Sent()], min_interval=0),

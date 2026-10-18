@@ -4,7 +4,8 @@ import pytest
 
 from tb.config import CorrCap, Settings
 from tb.exchange.base import ConditionalOrder, SymbolFilters
-from tb.risk import (atr14, correlation_gate, derate_multiplier, derated_below_min_notional, drawdown_pct,
+from tb.risk import (Bracket, Book, atr14, check_entry, choose_leverage, maintenance_margin, parse_brackets,
+                     sl_loss, slots_fit, correlation_gate, derate_multiplier, derated_below_min_notional, drawdown_pct,
                      effective_slots, kill_tripped, levels, liq_price,
                      max_positions, positions_without_stop, return_corr, size_trade, trail_update)
 
@@ -16,7 +17,7 @@ def test_fixed_sizing_matches_template():
     s = size_trade(cfg, "long", 100.0, None, F)
     assert s.ok
     assert s.notional == pytest.approx(160.0)
-    assert s.margin == pytest.approx(20.0)
+    assert s.leverage == 9 and s.margin == pytest.approx(160.0 / 9)     # auto leverage, default mmr 1%
     assert s.qty == pytest.approx(1.6)
     assert (s.tp_price - 100) / 100 == pytest.approx(0.03125, abs=1e-4)      # +5 on 160 = 3.125%
     assert (100 - s.sl_price) / 100 == pytest.approx(0.0625, abs=1e-4)       # -10 on 160 = 6.25%
@@ -51,9 +52,13 @@ def test_min_notional_and_qty_rejected():
 
 
 def test_stop_beyond_liquidation_rejected():
-    cfg = Settings().merge({"sl_usd": 30.0})       # SL at 18.75% but liquidation is ~12% away
+    # an absurdly wide stop: even 1x cannot keep liquidation 1.5x further away than the stop
+    cfg = Settings().merge({"sl_usd": 150.0, "slice_margin_usd": 200.0, "leverage": 1})
     r = size_trade(cfg, "long", 100.0, None, F)
     assert not r.ok and "liquidation" in r.reason
+    # a wide-but-feasible stop simply gets a low leverage instead of being rejected
+    r = size_trade(Settings().merge({"sl_usd": 30.0}), "long", 100.0, None, F)
+    assert r.ok and r.leverage == 3 and abs(100 - r.liq_price) >= 1.5 * abs(100 - r.sl_price)
 
 
 def test_available_margin_check():
@@ -63,6 +68,7 @@ def test_available_margin_check():
 
 def test_liq_price():
     # Binance form, identical to tb.sim.template.liq_price
+    assert liq_price("long", 100, 8, 0.005, 0.0625) == pytest.approx(100 * (0.875 - 0.0625) / 0.995)    # maintenance amount
     assert liq_price("long", 100, 8, 0.005) == pytest.approx(100 * 0.875 / 0.995)
     assert liq_price("short", 100, 8, 0.005) == pytest.approx(100 * 1.125 / 1.005)
     from tb.sim.template import liq_price as sim_liq
@@ -71,22 +77,136 @@ def test_liq_price():
 
 
 def test_max_positions():
-    cfg = Settings()
-    assert max_positions(100, cfg) == 5
-    assert max_positions(59.9, cfg) == 2
-    assert max_positions(500, cfg) == 5          # capped by the setting
-    assert max_positions(10, cfg) == 0
+    assert max_positions(100, Settings()) == 5                       # nominal: equity / slice margin, no cap by default
+    assert max_positions(59.9, Settings()) == 2
+    assert max_positions(500, Settings()) == 25
+    assert max_positions(500, Settings().merge({"max_positions": 5})) == 5
+    assert max_positions(10, Settings()) == 0
 
 
-def test_effective_slots_account_for_entry_fees():
-    cfg = Settings()                                   # 20 margin, 160 notional, 0.05% fee -> 0.08 per entry
+def test_effective_slots_free_margin_only():
+    cfg = Settings()                                   # 20 slice margin, 160 notional, 0.05% fee -> 0.08 per entry
     assert effective_slots(cfg, 0, 100.0) == 4         # not 5: the 5th slice is short by the fees
     assert effective_slots(cfg, 0, 100.4) == 5
-    assert effective_slots(cfg, 4, 99.68 - 80.0) == 4  # 4 open, 19.68 free -> no 5th
-    assert effective_slots(cfg, 2, 60.0) == 4          # 2 open + 2 more slices
-    assert effective_slots(cfg, 0, 1000.0) == 5        # capped by max_positions
+    assert effective_slots(cfg, 0, 1000.0) == 49
+    assert effective_slots(cfg.merge({"max_positions": 5}), 0, 1000.0) == 5
     assert effective_slots(cfg, 3, 0.0) == 3
     assert effective_slots(cfg.merge({"max_positions": 2}), 3, 100.0) == 3     # never below what is already open
+
+
+# ------------------------------------------------------------------ automatic per-trade leverage
+def test_leverage_tight_vs_wide_stop():
+    # liquidation must be >= 1.5x the stop distance away; mmr 1%, no bracket data
+    tight = choose_leverage("long", 100.0, 99.0, 160.0, max_leverage=50)      # 1% stop
+    mid = choose_leverage("long", 100.0, 93.75, 160.0, max_leverage=50)       # 6.25% stop
+    wide = choose_leverage("long", 100.0, 88.0, 160.0, max_leverage=50)       # 12% stop
+    assert mid == 9 and wide == 5 and tight > mid > wide
+    for lev, sl in ((tight, 99.0), (mid, 93.75), (wide, 88.0)):
+        assert abs(100 - liq_price("long", 100.0, lev, 0.01)) >= 1.5 * abs(100 - sl) - 1e-9
+        assert abs(100 - liq_price("long", 100.0, lev + 1, 0.01)) < 1.5 * abs(100 - sl)      # and it is the highest such L
+    assert choose_leverage("short", 100.0, 106.25, 160.0, max_leverage=50) == 9              # symmetric for shorts
+
+
+def test_leverage_caps_setting_and_bracket():
+    assert choose_leverage("long", 100.0, 99.0, 160.0, max_leverage=20) == 20
+    assert choose_leverage("long", 100.0, 99.0, 160.0, max_leverage=125) > 20
+    assert choose_leverage("long", 100.0, 99.0, 160.0, max_leverage=5) == 5
+    br = [Bracket(0, 5000, 0.01, 0.0, 10), Bracket(5000, 50000, 0.025, 75.0, 5)]
+    assert choose_leverage("long", 100.0, 99.0, 160.0, max_leverage=50, brackets=br) == 10      # bracket maxLeverage
+    assert choose_leverage("long", 100.0, 99.0, 8000.0, max_leverage=50, brackets=br) == 5      # larger notional, lower tier
+
+
+def test_leverage_high_mmr_coin_gets_less():
+    base = choose_leverage("long", 100.0, 93.75, 160.0, 50)
+    hot = choose_leverage("long", 100.0, 93.75, 160.0, 50, brackets=[Bracket(0, 1e9, 0.05, 0.0, 50)])
+    assert base == 9 and hot == 7 and hot < base
+    # the maintenance amount (cum) moves liquidation further away -> allows more leverage
+    cum = choose_leverage("long", 100.0, 93.75, 160.0, 50, brackets=[Bracket(0, 1e9, 0.05, 10.0, 50)])
+    assert cum > hot
+
+
+def test_leverage_none_when_even_1x_fails():
+    assert choose_leverage("long", 100.0, 30.0, 160.0, 20) is None       # 70% stop: liq at 0 is only 100% away < 105%
+
+
+def test_size_trade_uses_bracket_leverage_and_mm():
+    br = [Bracket(0, 1e9, 0.05, 0.0, 50)]
+    s = size_trade(Settings(), "long", 100.0, None, F, brackets=br)
+    assert s.leverage == 7 and s.margin == pytest.approx(160 / 7) and s.mm == pytest.approx(160 * 0.05)
+    assert s.liq_price == pytest.approx(liq_price("long", 100.0, 7, 0.05))
+
+
+def test_parse_brackets_and_maintenance_margin():
+    raw = [{"symbol": "ETHUSDT", "notionalCoef": 1.0, "brackets": [
+        {"bracket": 2, "initialLeverage": 50, "notionalCap": 100000, "notionalFloor": 10000, "maintMarginRatio": 0.01, "cum": 50.0},
+        {"bracket": 1, "initialLeverage": 100, "notionalCap": 10000, "notionalFloor": 0, "maintMarginRatio": 0.005, "cum": 0.0}]}]
+    b = parse_brackets(raw)["ETHUSDT"]
+    assert [(t.floor, t.cap, t.mmr, t.cum, t.max_lev) for t in b] == [(0, 10000, 0.005, 0, 100), (10000, 100000, 0.01, 50, 50)]
+    assert maintenance_margin(160.0, b) == pytest.approx(0.8)
+    assert maintenance_margin(20000.0, b) == pytest.approx(20000 * 0.01 - 50)
+    assert maintenance_margin(10000.0, b) == pytest.approx(10000 * 0.01 - 50)          # floor belongs to the next tier
+    assert maintenance_margin(1e9, b) == pytest.approx(1e9 * 0.01 - 50)                 # above the last cap: last tier
+    assert maintenance_margin(160.0, None) == pytest.approx(1.6)                        # default mmr 1%
+    assert maintenance_margin(160.0, None, 0.02) == pytest.approx(3.2)
+    assert parse_brackets({"symbol": "X", "brackets": [{"maintMarginRatio": "0.02", "initialLeverage": 20}]})["X"][0].mmr == 0.02
+
+
+# ------------------------------------------------------------------ portfolio rules for a new entry
+def _book(eq=200.0, avail=200.0, n=0.0, mm=0.0, risk=0.0):
+    return Book(eq, avail, n, mm, risk)
+
+
+def test_check_entry_each_rule_names_itself():
+    cfg = Settings()                                                  # 20x total, 0.5 mm ratio, 20% open risk
+    ok = check_entry(cfg, _book(), 160, 1.6, 10.2, 17.8, 0.08)
+    assert ok.ok and ok.rule == ""
+    r = check_entry(cfg, _book(n=3900), 160, 1.6, 10.2, 17.8, 0.08)                      # (3900+160)/200 = 20.3x
+    assert not r.ok and r.rule == "total_leverage"
+    r = check_entry(cfg, _book(mm=99), 160, 5.0, 10.2, 17.8, 0.08)                       # (99+5)/200 = 0.52
+    assert not r.ok and r.rule == "margin_ratio"
+    r = check_entry(cfg, _book(risk=30), 160, 1.6, 10.2, 17.8, 0.08)                     # 40.2/200 = 20.1%
+    assert not r.ok and r.rule == "open_risk"
+    r = check_entry(cfg, _book(avail=17.0), 160, 1.6, 10.2, 17.8, 0.08)
+    assert not r.ok and r.rule == "free_margin"
+    assert not check_entry(cfg, _book(eq=0.0), 160, 1.6, 10.2, 17.8, 0.08).ok
+    # boundaries are inclusive
+    assert check_entry(cfg, _book(n=3840), 160, 0, 0, 1, 0).ok                           # exactly 20.0x
+    assert check_entry(cfg, _book(risk=29.8), 160, 0, 10.2, 1, 0).ok                     # exactly 20.0%
+
+
+def test_sl_loss_includes_fees_and_stop_slippage():
+    cfg = Settings()
+    base = sl_loss(cfg, 1.6, 100.0, 93.75, "long")
+    assert base == pytest.approx(10.0 + 1.6 * 93.75 * (0.0005 + 0.0002 + 0.0005))
+    assert sl_loss(cfg, 1.6, 100.0, 93.75, "long", entry_fee=True) == pytest.approx(base + 1.6 * 100 * 0.0005)
+    assert sl_loss(cfg, 1.6, 100.0, 106.25, "short") == pytest.approx(10.0 + 1.6 * 106.25 * 0.0012)
+    assert sl_loss(cfg, 1.6, 100.0, 130.0, "long") >= 0                                  # a trailed stop in profit risks nothing
+
+
+def test_slots_fit_capacity_on_stakes():
+    cfg = Settings()
+    # 200 USDT stake: margin 17.8+0.08 per slice -> 11 by margin, 25 by 20x, but open risk 20% = 40 / 10.3 -> 3
+    assert slots_fit(cfg, _book(200, 200), 0) == 3
+    loose = cfg.merge({"max_open_risk_pct": 100})
+    assert slots_fit(loose, _book(200, 200), 0) == 11                                  # margin binds (200 / 17.86)
+    assert slots_fit(loose.merge({"max_total_leverage": 8}), _book(200, 200), 0) == 10  # 8x of 200 = 1600 notional
+    assert slots_fit(loose.merge({"max_positions": 4}), _book(200, 200), 1) == 3        # optional hard cap
+    assert slots_fit(cfg, _book(100, 100), 0) == 1
+    hot = [Bracket(0, 1e9, 0.2, 0.0, 20)]                                               # high-mmr coin: MM ratio binds first
+    assert slots_fit(loose, _book(200, 200), 0, hot) < 11
+
+
+def test_liquidation_beyond_stop_property():
+    rng = np.random.default_rng(3)
+    for _ in range(200):
+        side = "long" if rng.random() < 0.5 else "short"
+        stop_pct = rng.uniform(0.3, 20.0)
+        sl = 100.0 * (1 - stop_pct / 100) if side == "long" else 100.0 * (1 + stop_pct / 100)
+        mmr = rng.uniform(0.004, 0.1)
+        br = [Bracket(0, 1e9, mmr, 0.0, int(rng.integers(5, 125)))]
+        lev = choose_leverage(side, 100.0, sl, 160.0, 50, br)
+        assert lev is not None and 1 <= lev <= min(50, br[0].max_lev)
+        assert abs(100 - liq_price(side, 100.0, lev, mmr)) >= 1.5 * abs(100 - sl) - 1e-9
 
 
 def test_zombie_gap_detected():

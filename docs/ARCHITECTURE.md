@@ -88,8 +88,18 @@ Shared runtime dirs (gitignored): `var/` (DB, logs), `data/archive/` (parquet), 
   and never swallow network errors silently — log the exception.
 
 ## Trade template (shared by sim, labels, engine)
-- Account split into slices: `slice_margin_usd=20`, `leverage=8`, isolated margin →
-  notional = 160 USD. `max_positions = floor(equity / slice_margin)` capped by setting (default 5).
+- Trade SIZE (notional) = `slice_margin_usd × leverage` = 160 USD (template), risk-sized by the exit mode.
+  Per-trade LEVERAGE is chosen automatically (`risk.choose_leverage`, used by engine, paper and sim): the highest
+  integer L ≤ `max_leverage` (20, 1–125) and ≤ the symbol bracket's maxLeverage such that the isolated
+  liquidation price (Binance form, tier mmr/cum) is ≥ 1.5 × |entry − SL| from entry; margin = notional / L;
+  `POST /fapi/v1/leverage` is sent before each entry (isolated margin).
+- Concurrency has no fixed cap (`max_positions` optional, default null). A new entry is allowed only if,
+  INCLUDING it: Σnotional / bot equity ≤ `max_total_leverage` (20); Σ maintenance margin / equity ≤
+  `max_margin_ratio` (0.5; MM = notional × mmr − cum from `GET /fapi/v1/leverageBracket`, default mmr 1% when
+  unknown, e.g. paper); Σ loss-if-every-SL-fills (incl. fees + stop slippage) / equity ≤ `max_open_risk_pct`
+  (20 %); free margin ≥ slice margin + entry fee. The blocking rule is logged. `/api/status.max_positions` =
+  open + how many more template slices currently fit; it also reports `total_leverage`, `margin_ratio`,
+  `open_risk_pct` and their maxima.
 - Exit modes (setting `exit_mode`):
   - `fixed`: TP at +`tp_usd` (5) PnL, SL at −`sl_usd` (10) PnL on the position's notional.
   - `atr`: TP = entry ± `tp_atr`·ATR14(5m) (1.5), SL = entry ∓ `sl_atr`·ATR14 (1.0); qty sized so

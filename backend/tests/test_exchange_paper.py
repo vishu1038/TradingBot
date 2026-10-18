@@ -29,7 +29,7 @@ def test_market_fill_fee_and_margin():
     assert b.wallet == pytest.approx(100 - fee)
     assert b.available == pytest.approx(100 - fee - 20.0)        # 160 notional / 8x
     pos = p.positions()[0]
-    assert pos.side == "long" and pos.qty == pytest.approx(1.6) and pos.liq_price == pytest.approx(liq_price("long", 100, 8, 0.005))
+    assert pos.side == "long" and pos.qty == pytest.approx(1.6) and pos.liq_price == pytest.approx(liq_price("long", 100, 8, CFG.maint_margin_rate))
 
 
 def test_slippage_applied_to_market_fills():
@@ -138,7 +138,7 @@ def test_liquidation_loses_margin():
     p.market_order("AAAUSDT", "BUY", 1.6)
     ev = p.tick({"AAAUSDT": 80.0})
     info = ev[0][1]
-    assert info.reason == "liquidation" and info.exit_price == pytest.approx(liq_price("long", 100, 8, 0.005))
+    assert info.reason == "liquidation" and info.exit_price == pytest.approx(liq_price("long", 100, 8, CFG.maint_margin_rate))
     # equity lost ~ the isolated margin (20), never more
     assert p.balance().wallet == pytest.approx(100 - 20.0 - 1.6 * 100 * 0.0005, abs=0.2)
     assert p.balance().wallet > 70
@@ -148,7 +148,7 @@ def test_short_liquidation_price_and_pnl():
     p = mk()
     p.market_order("AAAUSDT", "SELL", 1.6)
     pos = p.positions()[0]
-    assert pos.side == "short" and pos.liq_price == pytest.approx(liq_price("short", 100, 8, 0.005))
+    assert pos.side == "short" and pos.liq_price == pytest.approx(liq_price("short", 100, 8, CFG.maint_margin_rate))
     p.marks["AAAUSDT"] = 96.875
     assert p.positions()[0].upnl == pytest.approx(5.0)
 

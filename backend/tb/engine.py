@@ -32,8 +32,8 @@ from .alerts import AlertDispatcher
 from .config import (LiveNotAllowed, Settings, db_path, load_secrets, models_dir, resolve_mode, trading_base_url,
                      PROD_BASE)
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
-from .risk import (atr14, correlation_gate, derate_multiplier, drawdown_pct, effective_slots, kill_tripped, levels,
-                   positions_without_stop, size_trade, trail_update)
+from .risk import (Book, atr14, check_entry, correlation_gate, derate_multiplier, drawdown_pct, kill_tripped, levels,
+                   maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit, trail_update)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
                      slippage_drift)
 from .scorer import NullScorer, ModelInfo, Scorer, is_paper_only, load_model, reasons_to_dicts, scan_models
@@ -52,6 +52,7 @@ STOP_CHECK_LIVE_S = 15.0
 SYNC_LIVE_S = 5.0
 DEPTH_MIN_AGE_S = 10.0            # per-symbol order-book refresh period (8 symbols -> <= 0.8 weight-20 calls/s = ~960/min)
 DEPTH_WEIGHT_CEILING = 1500       # skip depth fetches while the minute's used weight is above this (limit 2400)
+BRACKET_TTL_S = 3600.0
 TRAIL_MIN_STEP = 0.0005           # fraction of price a trailing stop must improve by before it is moved
 
 
@@ -130,6 +131,7 @@ class Engine:
         self.last_closed: dict[str, int] = {}
         self.marks: dict[str, float] = {}
         self.rates: dict[str, float] = {}
+        self.brackets: dict[str, tuple[float, list | None]] = {}      # symbol -> (fetched_at, tiers or None)
         self.vmarks: dict[str, float] = {}          # ORDER-VENUE mark prices (== prod marks in paper_local)
         self.dropped_venue: list[str] = []
         self.paused: set[str] = set(store.kv_get("paused_symbols", []) or [])
@@ -534,14 +536,24 @@ class Engine:
         cfg = self.cfg
         ex = self.ex
         osd = order_side(side)
-        if sym not in self._lev_set:
+        lev = sz.leverage
+        try:
+            await self.io(ex.set_isolated, sym)
+        except ExchangeError as e:
+            log.error("cannot set isolated margin for %s: %s; skipping entry", sym, e)
+            return False
+        for attempt in (lev, max(1, lev // 2), 1):       # a lower leverage is always safer than the chosen one
             try:
-                await self.io(ex.set_isolated, sym)
-                await self.io(ex.set_leverage, sym, cfg.leverage)
-                self._lev_set.add(sym)
+                await self.io(ex.set_leverage, sym, attempt)
+                lev = attempt
+                break
             except ExchangeError as e:
-                log.error("cannot set isolated/leverage for %s: %s; skipping entry", sym, e)
-                return False
+                log.warning("set_leverage(%s, %dx) failed: %s", sym, attempt, e)
+        else:
+            log.error("cannot set leverage for %s; skipping entry", sym)
+            return False
+        if lev != sz.leverage:
+            log.warning("%s: leverage lowered from %dx to %dx", sym, sz.leverage, lev)
         try:
             res = await self.io(ex.market_order, sym, osd, sz.qty, False)
         except ExchangeError as e:
@@ -601,7 +613,7 @@ class Engine:
         except ExchangeError as e:
             log.warning("TP placement failed for %s (%s); the engine will close at TP itself", sym, e)
         pos = {"symbol": sym, "side": side, "entry_price": fill, "qty": qty, "notional": qty * fill,
-               "leverage": cfg.leverage, "margin": qty * fill / cfg.leverage, "sl_price": sl, "tp_price": tp,
+               "leverage": lev, "margin": qty * fill / lev, "sl_price": sl, "tp_price": tp,
                "init_sl_price": sl, "atr": atr, "trail_active": False, "trail_price": None, "best_price": fill,
                "mark_price": fill, "upnl": 0.0, "opened_at": int(self.clock()), "prob": prob,
                "reasons": reasons, "sl_order_id": sl_id, "tp_order_id": tp_id, "entry_fee": res.fee or 0.0,
@@ -627,6 +639,29 @@ class Engine:
         await self.io(self._refresh_account)
         return True
 
+    async def get_brackets(self, sym: str):
+        """Maintenance-margin tiers for ``sym`` (cached ~1 h). None = unknown -> ``cfg.maint_margin_rate`` is used."""
+        ent = self.brackets.get(sym)
+        if ent and self.clock() - ent[0] < BRACKET_TTL_S:
+            return ent[1]
+        tiers = None
+        try:
+            tiers = await self.io(self.ex.leverage_brackets, sym)
+        except ExchangeError as e:
+            log.warning("leverage brackets unavailable for %s (%s); using default mmr %.3f", sym, e, self.cfg.maint_margin_rate)
+        self.brackets[sym] = (self.clock(), tiers)
+        return tiers
+
+    def book(self) -> Book:
+        """Account aggregates over the open positions (cached brackets; no I/O)."""
+        n = mm = risk = 0.0
+        for p in self._db_positions():
+            ent = self.brackets.get(p["symbol"])
+            n += p["notional"]
+            mm += maintenance_margin(p["notional"], ent[1] if ent else None, self.cfg.maint_margin_rate)
+            risk += sl_loss(self.cfg, p["qty"], p["entry_price"], p["sl_price"], p["side"])
+        return Book(self.equity, self.available, n, mm, risk)
+
     async def try_open(self, sym: str, side: str, prob: float, reasons: list, closed: pd.DataFrame) -> None:
         async with self.tlock:
             cfg = self.cfg
@@ -638,10 +673,8 @@ class Engine:
             positions = self._db_positions()
             if any(p["symbol"] == sym for p in positions):
                 return
-            if len(positions) >= effective_slots(cfg, len(positions), self.available):
-                return
-            if self.available < cfg.slice_margin_usd * 0.5:
-                log.info("skip %s: not enough available margin (%.2f)", sym, self.available)
+            if cfg.max_positions is not None and len(positions) >= cfg.max_positions:
+                log.info("skip %s %s: blocked by max_positions=%d", side, sym, cfg.max_positions)
                 return
             atr = atr14(closed["high"].to_numpy(), closed["low"].to_numpy(), closed["close"].to_numpy())
             ref = self.marks.get(sym) or float(closed["close"].iloc[-1])
@@ -666,9 +699,16 @@ class Engine:
                 return
             mult, parts = self.risk_multiplier()
             f = await self.io(self.ex.filters, sym)
-            sz = size_trade(cfg, side, ref, atr, f, self.available, risk_mult=mult)
+            brackets = await self.get_brackets(sym)
+            sz = size_trade(cfg, side, ref, atr, f, self.available, risk_mult=mult, brackets=brackets)
             if not sz.ok:
                 log.info("skip %s %s: %s (risk mult %.2f)", side, sym, sz.reason, mult)
+                return
+            fee = sz.notional * cfg.fee_taker
+            new_risk = sl_loss(cfg, sz.qty, sz.entry, sz.sl_price, side, entry_fee=True)
+            chk = check_entry(cfg, self.book(), sz.notional, sz.mm, new_risk, sz.margin, fee)
+            if not chk.ok:
+                log.info("skip %s %s: blocked by rule %s (%s)", side, sym, chk.rule, chk.detail)
                 return
             await self.open_position(sym, side, sz, prob, reasons, atr, ref, mult)
 
@@ -1197,6 +1237,18 @@ class Engine:
             out["avg_funding_rate"] = float(np.mean(fr))
         return out
 
+    def capacity(self) -> dict:
+        """Portfolio usage + how many template slices still fit (open + fit = effective ``max_positions``)."""
+        cfg = self.cfg
+        b = self.book()
+        n_open = len(self._db_positions())
+        eq = self.equity if self.equity > 0 else float("nan")
+        ref = next((e[1] for e in self.brackets.values() if e[1]), None)
+        return {"max_positions": n_open + slots_fit(cfg, b, n_open, ref),
+                "total_leverage": b.open_notional / eq if eq == eq else 0.0, "max_total_leverage": cfg.max_total_leverage,
+                "margin_ratio": b.open_mm / eq if eq == eq else 0.0, "max_margin_ratio": cfg.max_margin_ratio,
+                "open_risk_pct": b.open_risk / eq * 100.0 if eq == eq else 0.0, "max_open_risk_pct": cfg.max_open_risk_pct}
+
     def write_status(self) -> None:
         cfg = self.cfg
         self.store.kv_set("status", {
@@ -1204,7 +1256,7 @@ class Engine:
             "capital_usd": self.cfg.capital_usd if cap.is_active(self.cfg, self.mode) else None,
             "start_equity": self.start_equity,
             "peak_equity": self.peak_equity, "cash": self.cash, "unrealized_pnl": self.upnl,
-            "max_positions": effective_slots(cfg, self.store.one("SELECT COUNT(*) n FROM positions")["n"], self.available),
+            **self.capacity(),
             "kill": {"tripped": bool(self.kill.get("tripped")), "reason": self.kill.get("reason", ""),
                      "dd_limit_pct": cfg.kill_limit(self.mode)},
             "model": {"name": self.model_info.name if self.model_info else "null",
@@ -1253,6 +1305,8 @@ class Engine:
         self.store.prune_signals(20000)
         self.persist_state()
         self.store.kv_set("market", self.market_snapshot())
+        for sy in {p["symbol"] for p in self._db_positions()}:          # keep open positions' tiers fresh (status MM)
+            await self.get_brackets(sy)
         try:     # smallest min-notional among tradable symbols: the guard's "derated below min notional" input
             floors = [(await self.io(self.ex.filters, sy)).min_notional for sy in self.trade_symbols()]
             if floors:
