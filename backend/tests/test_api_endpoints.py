@@ -111,7 +111,7 @@ def test_market_universe_candles_signals(env):
                       "long_short_ratio", "updated_at"} and m["btc_trend"] == "down"
     u = c.get("/api/universe").json()
     assert set(u[0]) == {"symbol", "score", "atr_pct", "quote_volume_24h", "change_24h_pct", "funding_rate", "open_interest_usd",
-                         "oi_change_1h_pct", "last_price", "in_universe_since"}
+                         "oi_change_1h_pct", "last_price", "in_universe_since", "paused"}
     cd = c.get("/api/candles", params={"symbol": "ethusdt", "tf": "5m", "limit": 3}).json()
     assert len(cd) == 3 and set(cd[0]) == {"t", "o", "h", "l", "c", "v"} and cd[0]["t"] < cd[-1]["t"]
     assert c.get("/api/candles").status_code == 422                       # symbol is required

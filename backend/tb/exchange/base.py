@@ -205,6 +205,10 @@ class Exchange(ABC):
     @abstractmethod
     def long_short_ratio(self, symbol: str, period: str = "5m") -> float | None: ...
 
+    def depth(self, symbol: str, limit: int = 1000) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Order book ``(bids high->low, asks low->high)`` as ``(price, qty)``. Optional capability."""
+        raise ExchangeError(f"{self.name} exchange has no order-book support")
+
     # ---- trading
     @abstractmethod
     def set_leverage(self, symbol: str, leverage: int) -> None: ...

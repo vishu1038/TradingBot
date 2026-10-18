@@ -122,6 +122,14 @@ def scan_models(models_dir: str | Path, overrides: Mapping[str, str] | None = No
     return entries
 
 
+PAPER_ONLY_MARKER = "PAPER TEST ONLY"
+
+
+def is_paper_only(entry: ModelEntry) -> bool:
+    """Models whose JSON ``note`` contains 'PAPER TEST ONLY' must never run outside paper_local."""
+    return PAPER_ONLY_MARKER.lower() in str(entry.meta.get("note", "")).lower()
+
+
 def load_model(entry: ModelEntry) -> tuple[Scorer, ModelInfo] | None:
     """``tb.model_np.load`` for one artifact; None (logged) when it cannot be loaded."""
     try:

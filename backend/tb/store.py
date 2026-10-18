@@ -78,6 +78,10 @@ CREATE TABLE IF NOT EXISTS shadow_trades (
     pnl REAL NOT NULL, fees REAL NOT NULL DEFAULT 0, exit_reason TEXT NOT NULL, prob REAL
 );
 CREATE INDEX IF NOT EXISTS ix_shadow_model ON shadow_trades(model, exit_time);
+CREATE TABLE IF NOT EXISTS depth_5m (
+    symbol TEXT NOT NULL, open_time INTEGER NOT NULL, t REAL NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (symbol, open_time)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS candles (
     symbol TEXT NOT NULL, tf TEXT NOT NULL, t INTEGER NOT NULL,
     o REAL, h REAL, l REAL, c REAL, v REAL,
@@ -415,6 +419,28 @@ class Store:
 
     def get_universe(self) -> list[dict]:
         return [dict(r) for r in self.query("SELECT * FROM universe ORDER BY rank")]
+
+    # ------------------------------------------------------------------ order book
+    def set_orderbook(self, symbol: str, snap: Mapping[str, Any]) -> None:
+        self.kv_set(f"orderbook:{symbol}", snap)
+
+    def get_orderbook(self, symbol: str) -> dict | None:
+        return self.kv_get(f"orderbook:{symbol}")
+
+    def upsert_depth_5m(self, symbol: str, open_time: int, t: float, row: Mapping[str, Any]) -> None:
+        self.execute("INSERT INTO depth_5m(symbol,open_time,t,data) VALUES(?,?,?,?) "
+                     "ON CONFLICT(symbol,open_time) DO UPDATE SET t=excluded.t,data=excluded.data WHERE excluded.t>=t",
+                     (symbol, int(open_time), float(t), _j(row)))
+
+    def get_depth_5m(self, symbol: str, limit: int = 2016) -> list[dict]:
+        rows = self.query("SELECT open_time,t,data FROM depth_5m WHERE symbol=? ORDER BY open_time DESC LIMIT ?",
+                          (symbol, limit))
+        return [{"open_time": r["open_time"], "t": r["t"], "data": _load(r["data"], {})} for r in reversed(rows)]
+
+    def prune_depth_5m(self, symbol: str, keep: int = 2016) -> None:
+        self.execute("DELETE FROM depth_5m WHERE symbol=? AND open_time < "
+                     "(SELECT COALESCE(MAX(open_time),0) FROM depth_5m WHERE symbol=?) - ?",
+                     (symbol, symbol, keep * 300_000))
 
     # ------------------------------------------------------------------ lab reports
     def add_lab_report(self, kind: str, title: str, summary: Mapping[str, Any],

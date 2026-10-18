@@ -36,7 +36,7 @@ from .risk import (atr14, correlation_gate, derate_multiplier, drawdown_pct, eff
                    positions_without_stop, size_trade, trail_update)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
                      slippage_drift)
-from .scorer import NullScorer, ModelInfo, Scorer, load_model, reasons_to_dicts, scan_models
+from .scorer import NullScorer, ModelInfo, Scorer, is_paper_only, load_model, reasons_to_dicts, scan_models
 from .shadow import Registry, ShadowBook, promotion_check, shadow_stats
 from .store import Store
 from . import guard as guard_mod
@@ -49,6 +49,8 @@ FIRST_FETCH = 720
 SIGNAL_FRESH_MS = 90_000          # only trade a signal bar that closed < 90 s ago
 STOP_CHECK_LIVE_S = 15.0
 SYNC_LIVE_S = 5.0
+DEPTH_MIN_AGE_S = 10.0            # per-symbol order-book refresh period (8 symbols -> <= 0.8 weight-20 calls/s = ~960/min)
+DEPTH_WEIGHT_CEILING = 1500       # skip depth fetches while the minute's used weight is above this (limit 2400)
 TRAIL_MIN_STEP = 0.0005           # fraction of price a trailing stop must improve by before it is moved
 
 
@@ -127,6 +129,12 @@ class Engine:
         self.last_closed: dict[str, int] = {}
         self.marks: dict[str, float] = {}
         self.rates: dict[str, float] = {}
+        self.vmarks: dict[str, float] = {}          # ORDER-VENUE mark prices (== prod marks in paper_local)
+        self.dropped_venue: list[str] = []
+        self.paused: set[str] = set(store.kv_get("paused_symbols", []) or [])
+        self.force_universe = False
+        self.depth_at: dict[str, float] = {}
+        self.depth_stats = {"ok": 0, "err": 0}
         self.skew_ms = 0
         self.skew_at = 0.0
         self.universe: list[str] = []
@@ -247,7 +255,11 @@ class Engine:
         self._models_sig = sig
         entries = scan_models(self.models_path, self.registry.overrides)
         champ = next((e for e in entries if e.status == "champion"), None)
-        if champ and (self.model_info is None or self.model_info.name != champ.name or force):
+        if champ and not self.paper and is_paper_only(champ):
+            log.error("REFUSING to load champion %s in %s mode: its note says 'PAPER TEST ONLY'; running NullScorer",
+                      champ.name, self.mode)
+            self.scorer, self.model_info = NullScorer(), None
+        elif champ and (self.model_info is None or self.model_info.name != champ.name or force):
             got = load_model(champ)
             if got:
                 self.scorer, self.model_info = got
@@ -261,6 +273,9 @@ class Engine:
             if n not in wanted:
                 del self.challengers[n]
         for n, e in wanted.items():
+            if not self.paper and is_paper_only(e):
+                log.error("REFUSING to load challenger %s in %s mode ('PAPER TEST ONLY')", n, self.mode)
+                continue
             if n not in self.challengers:
                 got = load_model(e)
                 if got:
@@ -280,6 +295,8 @@ class Engine:
             return f"unknown model {model!r}"
         if e.status == "champion":
             return "already the champion"
+        if not self.paper and is_paper_only(e):
+            return f"{model!r} is marked 'PAPER TEST ONLY' and cannot be promoted in {self.mode} mode"
         champ = self.model_info.name if self.model_info else None
         chal_trades = self.store.get_shadow_trades(model)
         since = min((t["entry_time"] for t in chal_trades), default=int(self.clock()))
@@ -509,6 +526,20 @@ class Engine:
         sl = tp = None
         if lv is not None:
             sl, tp = lv
+            if not self.paper:
+                # never send a stop computed from one price level that sits on the wrong side of the venue's mark
+                try:
+                    vm = (await self.io(ex.premium, sym))[0].mark_price
+                except ExchangeError:
+                    vm = self.vmarks.get(sym)
+                d = 1 if side == "long" else -1
+                if vm and (vm - sl) * d <= 0:
+                    log.error("computed SL %s for %s is on the wrong side of the venue mark %s; closing the fill", sl, sym, vm)
+                    lv = None
+                elif vm and (tp - vm) * d <= 0:
+                    log.warning("computed TP %s for %s is already through the venue mark %s; no TP order, engine exits itself",
+                                tp, sym, vm)
+        if lv is not None:
             try:
                 sl_id = await self.io(ex.place_stop, sym, close_side, sl, qty)
             except ExchangeError as e:
@@ -571,6 +602,9 @@ class Engine:
             cfg = self.cfg
             if not self.entry_allowed(sym):
                 return
+            if not await self.io(self.venue_tradable, sym):
+                log.info("skip %s %s: not TRADING on the order venue (%s)", side, sym, self.mode)
+                return
             positions = self._db_positions()
             if any(p["symbol"] == sym for p in positions):
                 return
@@ -581,6 +615,14 @@ class Engine:
                 return
             atr = atr14(closed["high"].to_numpy(), closed["low"].to_numpy(), closed["close"].to_numpy())
             ref = self.marks.get(sym) or float(closed["close"].iloc[-1])
+            if not self.paper:
+                # size on the ORDER VENUE's price; scale the prod-derived ATR to the venue's price level
+                vref = self.vmarks.get(sym)
+                if not vref:
+                    log.info("skip %s %s: no order-venue mark price yet", side, sym)
+                    return
+                atr = atr * vref / ref if atr else atr
+                ref = vref
             # correlation cap
             others = []
             for p in positions:
@@ -600,12 +642,32 @@ class Engine:
                 return
             await self.open_position(sym, side, sz, prob, reasons, atr, ref, mult)
 
+    def venue_tradable(self, sym: str) -> bool:
+        """True when the symbol is TRADING on the order venue (always true for the paper venue = prod)."""
+        if self.paper:
+            return True
+        try:
+            i = self.ex.exchange_info().get(sym)
+        except ExchangeError as e:
+            log.warning("venue exchangeInfo unavailable (%s); not trading %s", e, sym)
+            return False
+        return bool(i and i.status == "TRADING")
+
+    def venue_scale(self, sym: str) -> float:
+        """venue mark / prod mark (1.0 in paper): converts prod-derived price distances (ATR) to the venue."""
+        if self.paper:
+            return 1.0
+        v, p = self.vmarks.get(sym), self.marks.get(sym)
+        return v / p if v and p else 1.0
+
     def entry_allowed(self, sym: str | None = None) -> bool:
         if not self.running or self.kill.get("tripped"):
             return False
         if self.safety_view.get("state", NORMAL) != NORMAL:
             return False
         if sym and self.faults.excluded(sym):
+            return False
+        if sym and sym in self.paused:
             return False
         return True
 
@@ -635,6 +697,17 @@ class Engine:
 
     async def handle_command(self, action: str, payload: dict) -> str | None:
         log.info("command: %s %s", action, payload or "")
+        if action in ("pause_symbol", "unpause_symbol"):
+            sym = str(payload.get("symbol") or "").upper().strip()
+            if not sym or not sym.isalnum():
+                return "symbol is required"
+            (self.paused.add if action == "pause_symbol" else self.paused.discard)(sym)
+            self.store.kv_set("paused_symbols", sorted(self.paused))
+            log.info("%s %s (open trades untouched)", "paused" if action == "pause_symbol" else "unpaused", sym)
+            return None
+        if action == "refresh_universe":
+            self.force_universe = True          # picked up by the universe loop within ~5 s (never blocks commands)
+            return None
         if action == "start":
             if self.kill.get("tripped"):
                 return "kill switch tripped: reset_kill first"
@@ -687,8 +760,19 @@ class Engine:
                     log.warning("implausible mark for %s: %s", s, bad)
                     marks.pop(s)
         self.marks.update(marks)
-        watch = {s: marks[s] for s in self.watchlist() if s in marks}
+        watch = {s: marks[s] for s in self.watchlist() if s in marks}          # PROD marks: signals, shadow, UI ticks
         if self.paper:
+            vwatch = watch                                                    # the simulated venue IS prod
+        else:
+            vwatch = {}
+            try:
+                vprem = await self.io(self.ex.premium)                       # order venue's own mark prices
+                self.vmarks.update({p.symbol: p.mark_price for p in vprem if p.mark_price > 0})
+                vwatch = {s: self.vmarks[s] for s in self.watchlist() if s in self.vmarks}
+            except ExchangeError as e:
+                log.warning("venue mark prices unavailable: %s (positions are not re-marked this cycle)", e)
+        if self.paper:
+            self.vmarks.update(marks)
             self.ex.tick(watch)
             if self.ex.funding_due(self.clock()):
                 paid = self.ex.apply_funding(self.rates, self.clock())
@@ -703,7 +787,7 @@ class Engine:
                 for tr in self.shadow.on_price(s, m, self.clock()):
                     self._record_shadow(tr)
         async with self.tlock:
-            await self.sync_positions(watch)
+            await self.sync_positions(vwatch)
         # universe table + ticks
         self.store.update_universe_prices({s: m for s, m in marks.items() if s in self.universe})
         t = int(self.clock())
@@ -782,7 +866,8 @@ class Engine:
                 continue
             # trailing stop
             if cfg.trail.enabled:
-                atr = atr14(*self._hlc(sym)) or pos.get("atr")
+                a_prod = atr14(*self._hlc(sym))
+                atr = a_prod * self.venue_scale(sym) if a_prod else pos.get("atr")
                 active, new_sl = trail_update(pos["side"], pos["entry_price"], pos["init_sl_price"], pos["sl_price"], best,
                                               atr, bool(pos["trail_active"]), cfg.trail.activate_r, cfg.trail.distance_atr)
                 f = await self.io(self.ex.filters, sym)
@@ -991,7 +1076,8 @@ class Engine:
         from . import universe as uni
 
         cfg = self.cfg
-        if self.universe and self.clock() - self.universe_at < cfg.universe_refresh_s:
+        forced, self.force_universe = self.force_universe, False
+        if not forced and self.universe and self.clock() - self.universe_at < cfg.universe_refresh_s:
             return
         cur = {r["symbol"]: r["in_universe_since"] for r in self.store.get_universe()}
         rows = await self.io(uni.refresh, self.data, cfg, cur, self.clock())
@@ -1005,6 +1091,39 @@ class Engine:
         self.store.kv_set("universe_at", self.universe_at)
         self.event("universe", {"symbols": self.universe, "updated_at": int(self.universe_at)})
         log.info("universe: %s", ", ".join(self.universe))
+
+    async def depth_cycle(self) -> None:
+        """Refresh one symbol's order book per call (the one refreshed longest ago, at most every ~10 s).
+        Best effort: failures are logged at debug level and never touch trading state or fault counters."""
+        from . import orderbook as ob
+
+        syms = [s for s in self.universe + [p["symbol"] for p in self.store.get_positions()] if s]
+        syms = list(dict.fromkeys(syms))
+        if not syms:
+            return
+        now = self.clock()
+        sym = min(syms, key=lambda s: self.depth_at.get(s, 0.0))
+        if now - self.depth_at.get(sym, 0.0) < DEPTH_MIN_AGE_S:
+            return
+        used = getattr(self.data, "used_weight", 0)
+        if used > DEPTH_WEIGHT_CEILING:                      # keep headroom for klines/premium/orders
+            return
+        self.depth_at[sym] = now
+        try:
+            bids, asks = await self.io(self.data.depth, sym, 1000)
+        except RateLimitError:
+            raise
+        except ExchangeError as e:
+            self.depth_stats["err"] += 1
+            log.debug("depth %s failed: %s", sym, e)
+            return
+        snap = ob.compute_snapshot(bids, asks, sym, now)
+        if snap is None:
+            return
+        self.depth_stats["ok"] += 1
+        self.store.set_orderbook(sym, snap)
+        ob.record_snapshot(self.store, snap)
+        self.event("orderbook", snap)
 
     async def derivs_cycle(self) -> None:
         if isinstance(self.scorer, NullScorer) and not self.challengers:
@@ -1143,7 +1262,7 @@ class Engine:
             ("heartbeat", 1.0, self.heartbeat_cycle), ("commands", 0.5, self.commands_cycle),
             ("prices", 3.0, self.prices_cycle), ("bars", 4.0, self.bars_cycle),
             ("universe", 5.0, self.universe_cycle), ("housekeeping", 10.0, self.housekeeping_cycle),
-            ("derivs", 20.0, self.derivs_cycle)]]
+            ("derivs", 20.0, self.derivs_cycle), ("depth", 1.0, self.depth_cycle)]]
         await self.stop_event.wait()
         log.info("engine stopping (open positions keep their exchange-side stops)")
         for t in tasks:

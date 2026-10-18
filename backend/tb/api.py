@@ -31,7 +31,8 @@ from .store import Store
 log = logging.getLogger("tb.api")
 
 ENGINE_ALIVE_S = 15.0
-CONTROL_ACTIONS = ("start", "stop", "kill", "reset_kill", "close_position", "close_all", "promote_model", "rollback_model")
+CONTROL_ACTIONS = ("start", "stop", "kill", "reset_kill", "close_position", "close_all", "promote_model", "rollback_model",
+                   "pause_symbol", "unpause_symbol", "refresh_universe")
 LOCAL_ORIGIN = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
 
@@ -133,7 +134,16 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
     def universe() -> list[dict]:
         keys = ("symbol", "score", "atr_pct", "quote_volume_24h", "change_24h_pct", "funding_rate",
                 "open_interest_usd", "oi_change_1h_pct", "last_price", "in_universe_since")
-        return [{k: r.get(k) for k in keys} for r in store.get_universe()]
+        paused = set(store.kv_get("paused_symbols", []) or [])
+        return [{**{k: r.get(k) for k in keys}, "paused": r["symbol"] in paused} for r in store.get_universe()]
+
+    @app.get("/api/orderbook")
+    def orderbook(symbol: str = Query(...)) -> dict:
+        snap = store.get_orderbook(symbol.upper())
+        if not snap:
+            raise HTTPException(status_code=404, detail=f"no order book snapshot for {symbol.upper()} (not in the universe, or the engine has not fetched it yet)")
+        keys = ("symbol", "t", "mid", "spread", "spread_pct", "cover_pct", "bands", "bids", "asks")
+        return {k: snap.get(k) for k in keys}
 
     @app.get("/api/candles")
     def candles(symbol: str = Query(...), tf: str = "5m", limit: int = Query(500, ge=1, le=1500)) -> list[dict]:
@@ -186,6 +196,11 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             if body.get("position_id") is None:
                 return {"ok": False, "error": "position_id is required"}
             payload["position_id"] = body["position_id"]
+        if action in ("pause_symbol", "unpause_symbol"):
+            sym = str(body.get("symbol") or "").upper().strip()
+            if not sym or not sym.isalnum():
+                return {"ok": False, "error": "symbol is required"}
+            payload["symbol"] = sym
         if action == "promote_model":
             if not body.get("model"):
                 return {"ok": False, "error": "model is required"}

@@ -91,6 +91,9 @@ class PaperExchange(Exchange):
     def long_short_ratio(self, symbol, period="5m"):
         return self.data.long_short_ratio(symbol, period)
 
+    def depth(self, symbol, limit=1000):
+        return self.data.depth(symbol, limit)
+
     # ------------------------------------------------------------------ pricing
     def _price(self, symbol: str) -> float:
         p = self.marks.get(symbol)

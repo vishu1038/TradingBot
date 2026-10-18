@@ -218,6 +218,15 @@ class BinanceExchange(Exchange):
                             {"symbol": symbol, "period": period, "limit": 1})
         return float(raw[-1]["longShortRatio"]) if raw else None
 
+    def depth(self, symbol: str, limit: int = 1000):
+        raw = self._request("GET", "/fapi/v1/depth", {"symbol": symbol, "limit": limit})   # weight 20 at limit=1000
+        return ([(float(p), float(q)) for p, q in raw["bids"]], [(float(p), float(q)) for p, q in raw["asks"]])
+
+    @property
+    def used_weight(self) -> int:
+        """Request weight used in the current minute (as last reported by the exchange)."""
+        return self._used_weight if int(time.time() // 60) == self._weight_minute else 0
+
     # ------------------------------------------------------------------ trading
     def set_leverage(self, symbol: str, leverage: int) -> None:
         self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": int(leverage)}, signed=True)
