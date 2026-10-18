@@ -39,6 +39,7 @@ from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, c
 from .scorer import NullScorer, ModelInfo, Scorer, is_paper_only, load_model, reasons_to_dicts, scan_models
 from .shadow import Registry, ShadowBook, promotion_check, shadow_stats
 from .store import Store
+from . import capital as cap
 from . import guard as guard_mod
 
 log = logging.getLogger("tb.engine")
@@ -149,6 +150,8 @@ class Engine:
         self.upnl = 0.0
         self.available = 0.0
         self.start_equity = 0.0
+        self.wallet_equity = 0.0
+        self.basis_fresh = False
         self.peak_equity = 0.0
         self.kill: dict[str, Any] = {"tripped": False, "reason": "", "t": None}
         self.running = self.paper
@@ -228,6 +231,9 @@ class Engine:
         self.peak_equity = max(float(st.get("peak_equity") or 0.0), self.equity)
         if st.get("kill"):
             self.kill = st["kill"]
+        if cap.is_active(self.cfg, self.mode):
+            if self.basis_fresh or self.store.kv_get(cap.BASIS_KEY) != self.cfg.capital_usd:
+                self.rebase_equity("stake set" if self.basis_fresh else "capital_usd changed")
         self.running = bool(st["running"]) if st.get("running") is not None else self.paper
         if st.get("shadow_open"):
             self.shadow.import_state(st["shadow_open"])
@@ -331,8 +337,31 @@ class Engine:
     # ================================================================== account
     def _refresh_account(self) -> None:
         b = self.ex.balance()
+        self.wallet_equity = b.wallet + b.upnl
         self.cash, self.upnl, self.available = b.wallet, b.upnl, b.available
-        self.equity = b.wallet + b.upnl
+        self.equity = self.wallet_equity
+        if cap.is_active(self.cfg, self.mode):
+            if cap.floor_id(self.store) is None:
+                self.basis_fresh = True                       # first run with a stake: peak/start get re-based
+            bot = cap.bot_equity(self.store, self.cfg, self.mode, self.wallet_equity, b.upnl, create=True)
+            self.equity = bot
+            self.cash = bot - b.upnl
+            used = sum(p["margin"] for p in self.store.get_positions())
+            self.available = max(0.0, min(b.available, bot - used))       # the bot never uses more than its stake
+
+    def rebase_equity(self, why: str) -> None:
+        """Start/peak equity restart from the current bot equity (the old figures were on another basis)."""
+        old = (self.start_equity, self.peak_equity)
+        self.start_equity = self.peak_equity = self.equity
+        self.store.kv_set("start_equity", self.start_equity)
+        self.store.kv_set("peak_equity", self.peak_equity)
+        self.store.kv_set(cap.BASIS_KEY, self.cfg.capital_usd)
+        if self.kill.get("tripped") and str(self.kill.get("reason", "")).startswith("drawdown"):
+            log.warning("clearing a drawdown kill measured on the old equity basis")
+            self.kill = {"tripped": False, "reason": "", "t": None}
+        self.basis_fresh = False
+        log.warning("equity basis re-set (%s): bot equity %.2f (capital_usd=%s, wallet %.2f); was start %.2f / peak %.2f",
+                    why, self.equity, self.cfg.capital_usd, self.wallet_equity, *old)
 
     def persist_state(self, force: bool = False) -> None:
         now = self.clock()
@@ -1170,7 +1199,9 @@ class Engine:
     def write_status(self) -> None:
         cfg = self.cfg
         self.store.kv_set("status", {
-            "mode": self.mode, "running": self.running, "equity": self.equity, "start_equity": self.start_equity,
+            "mode": self.mode, "running": self.running, "equity": self.equity, "wallet_equity": self.wallet_equity,
+            "capital_usd": self.cfg.capital_usd if cap.is_active(self.cfg, self.mode) else None,
+            "start_equity": self.start_equity,
             "peak_equity": self.peak_equity, "cash": self.cash, "unrealized_pnl": self.upnl,
             "max_positions": effective_slots(cfg, self.store.one("SELECT COUNT(*) n FROM positions")["n"], self.available),
             "kill": {"tripped": bool(self.kill.get("tripped")), "reason": self.kill.get("reason", ""),
@@ -1183,7 +1214,12 @@ class Engine:
             "t": self.clock()})
 
     async def heartbeat_cycle(self) -> None:
-        self.cfg = self.store.get_settings()
+        new_cfg = self.store.get_settings()
+        changed = new_cfg.capital_usd != self.cfg.capital_usd
+        self.cfg = new_cfg
+        if changed and not self.paper:
+            await self.io(self._refresh_account)
+            self.rebase_equity("capital_usd changed")
         self.faults.deb.n, self.faults.deb.m = self.cfg.fault_mature_n, self.cfg.fault_recover_m
         self.shadow.cfg = self.cfg
         if self.paper:

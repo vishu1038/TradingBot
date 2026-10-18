@@ -292,6 +292,35 @@ def test_guard_flattens_when_stop_cannot_be_placed(store):
     assert r["state"] == HALTED                              # flat afterwards -> HALTED until manual reset
 
 
+def test_guard_judges_the_bot_stake_not_the_wallet(store):
+    """A 5000 USDT wallet with a 100 USDT stake: wallet noise is irrelevant, the stake's drawdown trips the guard."""
+    clk = Clock()
+    ex = FakeTrade()
+    ex.equity = 5000.0
+    store.kv_set("peak_equity", 100.0)
+    store.kv_set("capital_floor_trade_id", 0)
+    g = G.Guard(store, "binance_demo", ex, clock=clk)
+    store.beat("binance_demo", "2", 1)
+    store.execute("UPDATE heartbeat SET t=?", (clk.t,))
+    assert g.step()["state"] == NORMAL                       # bot equity = min(100, 5000) = 100
+    ex.equity = 4990.0                                       # wallet -10 USDT is only -0.2% of the wallet ...
+    store.insert_trade({"symbol": "A", "side": "long", "entry_price": 1, "exit_price": 1, "qty": 1, "opened_at": 1,
+                        "closed_at": 2, "pnl": -26.0, "fees": 0.1, "exit_reason": "sl"})     # ... but -26% of the stake
+    r = g.step()
+    assert r["state"] == HALTED and "drawdown" in " ".join(r["reasons"])
+
+
+def test_guard_ignores_drawdown_until_stake_initialised(store):
+    clk = Clock()
+    ex = FakeTrade()
+    ex.equity = 40.0
+    store.kv_set("peak_equity", 100.0)
+    g = G.Guard(store, "binance_demo", ex, clock=clk)
+    store.beat("binance_demo", "2", 1)
+    store.execute("UPDATE heartbeat SET t=?", (clk.t,))
+    assert g.step()["state"] == NORMAL
+
+
 def test_guard_drawdown_flatten_then_halted_and_manual_reset(store):
     clk = Clock()
     ex = FakeTrade()
@@ -299,6 +328,7 @@ def test_guard_drawdown_flatten_then_halted_and_manual_reset(store):
     ex.orders = [ConditionalOrder("o:9", "AAAUSDT", "SL", "SELL", 93.75, 1.6, True)]
     pos_row(store)
     store.kv_set("peak_equity", 100.0)
+    store.kv_set("capital_floor_trade_id", 0)               # stake initialised by the engine (capital_usd=100)
     store.beat("binance_demo", "2", 1)
     store.execute("UPDATE heartbeat SET t=?", (clk.t,))
     g = G.Guard(store, "binance_demo", ex, clock=clk)

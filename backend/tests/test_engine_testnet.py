@@ -79,7 +79,8 @@ class FakeVenue(FakeData):
     def balance(self): return Balance(self.wallet, self.wallet - sum(p.margin for p in self.pos.values()), 0.0)
 
 
-def mk_demo(store, tmp_path, *, prod_marks, venue_marks, venue_symbols=None, settings=None, min_notional=5.0):
+def mk_demo(store, tmp_path, *, prod_marks, venue_marks, venue_symbols=None, settings=None, min_notional=5.0,
+            wallet=100.0, start=True):
     now = int(time.time() // 300 * 300) + 10.0
     syms = tuple(prod_marks)
     data = FakeData(syms)
@@ -91,8 +92,11 @@ def mk_demo(store, tmp_path, *, prod_marks, venue_marks, venue_symbols=None, set
         store.patch_settings(settings, allow_internal=True)
     store.save_settings(store.get_settings().merge(FAST, allow_internal=True))
     venue = FakeVenue(venue_symbols or syms, venue_marks, min_notional)
+    venue.wallet = wallet
     eng = E.Engine(store, data, venue, "binance_demo", AlertDispatcher([Sent()], min_interval=0),
                    models_path=tmp_path / "models", clock=lambda: now)
+    if not start:
+        return eng, data, venue
     eng.startup()
     eng.universe = list(syms[:2])
     eng.running = True

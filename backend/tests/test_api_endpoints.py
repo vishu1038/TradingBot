@@ -7,9 +7,9 @@ from fastapi.testclient import TestClient
 from tb.api import create_app
 from tb.store import Store
 
-STATUS_KEYS = {"mode", "running", "equity", "start_equity", "peak_equity", "cash", "realized_pnl", "unrealized_pnl",
+STATUS_KEYS = {"mode", "running", "equity", "wallet_equity", "start_equity", "peak_equity", "cash", "realized_pnl", "unrealized_pnl",
                "drawdown_pct", "open_positions", "max_positions", "trades_today", "win_rate", "kill", "model",
-               "universe_updated_at", "safety"}
+               "universe_updated_at", "safety", "paused_symbols"}
 
 
 @pytest.fixture
@@ -82,6 +82,7 @@ def test_status_shape_and_values(env):
     assert st["win_rate"] == 0.5
     assert st["kill"] == {"tripped": False, "reason": "", "dd_limit_pct": 50.0}
     assert set(st["model"]) == {"name", "version", "trained_at", "threshold_long", "threshold_short"}
+    assert st["paused_symbols"] == []
     assert set(st["safety"]) == {"state", "reasons", "derate_mult", "drift", "faults"}
     assert st["safety"]["state"] == "NORMAL" and set(st["safety"]["drift"]) == {"z", "n", "mult"}
 
@@ -151,7 +152,7 @@ def test_settings_get_put_merge(env):
     g = c.get("/api/settings").json()
     assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
-                      "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound"}
+                      "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": False, "activate_r": 1.0, "distance_atr": 1.0}
     r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": True}, "short_enabled": True})
     assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is True

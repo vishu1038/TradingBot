@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable
 
 from . import __version__
+from . import capital as cap
 from .alerts import AlertDispatcher
 from .config import Settings, load_secrets, resolve_mode, trading_base_url, db_path, LiveNotAllowed
 from .exchange.base import Exchange, ExchangeError, order_side
@@ -72,7 +73,13 @@ class Guard:
         """(equity, peak) from the exchange (demo/live) or the engine's status (paper)."""
         if self.ex is not None and self.mode != "paper_local":
             b = self.ex.balance()
-            eq = b.equity
+            eq = cap.bot_equity(self.store, cfg, self.mode, b.equity, b.upnl)       # the bot's stake, not the wallet
+            if eq is None:                      # stake not initialised yet (engine has not run): no basis to judge
+                return None, 0.0
+            basis = self.store.kv_get(cap.BASIS_KEY)
+            if basis != getattr(self, "_basis", basis):         # capital_usd was changed: old peaks are on another basis
+                self.peak = 0.0
+            self._basis = basis
             self.peak = max(self.peak, eq, float(self.store.kv_get("peak_equity", 0.0) or 0.0))
             return eq, self.peak
         st = self.store.kv_get("status", {}) or {}

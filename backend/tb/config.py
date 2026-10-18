@@ -171,7 +171,7 @@ class CorrCap:
 CONTRACT_KEYS = (
     "slice_margin_usd", "leverage", "max_positions", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-    "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound",
+    "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd",
 )
 
 
@@ -195,6 +195,7 @@ class Settings:
     kill_dd_pct: float = 50.0           # paper default; live is capped at LIVE_KILL_DD_PCT
     fee_taker: float = 0.0005
     sound: bool = True
+    capital_usd: float | None = 100.0   # bot stake in binance_demo/live (null = whole wallet); see tb.capital
     # ---- engine-internal (not part of the API contract; stored but not exposed)
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
@@ -281,6 +282,7 @@ class Settings:
         chk(0 < self.kill_dd_pct <= 100, "kill_dd_pct must be (0,100]")
         chk(0 <= self.fee_taker < 0.01, "fee_taker must be a fraction in [0, 0.01)")
         chk(self.paper_start_equity > 0, "paper_start_equity must be > 0")
+        chk(self.capital_usd is None or self.capital_usd > 0, "capital_usd must be > 0 or null")
 
 
 LIVE_KILL_DD_PCT = 25.0
@@ -296,6 +298,10 @@ def _coerce(cls: type, d: Mapping[str, Any]) -> dict[str, Any]:
 
 def _cast(tp: Any, v: Any, name: str) -> Any:
     t = tp if isinstance(tp, str) else getattr(tp, "__name__", str(tp))
+    if t.endswith("| None"):                      # optional field, e.g. "float | None"
+        if v is None:
+            return None
+        t = t[:-len("| None")].strip()
     try:
         if t == "bool":
             if isinstance(v, str):

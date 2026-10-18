@@ -78,7 +78,7 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
         safety.pop("parts", None)
         return {
             "mode": mode, "running": bool(st.get("running", False)) and age is not None and age < ENGINE_ALIVE_S,
-            "equity": equity, "start_equity": start, "peak_equity": peak, "cash": st.get("cash", equity),
+            "equity": equity, "wallet_equity": st.get("wallet_equity", equity), "start_equity": start, "peak_equity": peak, "cash": st.get("cash", equity),
             "realized_pnl": stats["net"], "unrealized_pnl": st.get("unrealized_pnl", 0.0),
             "drawdown_pct": drawdown_pct(equity, peak), "open_positions": n_open,
             "max_positions": st.get("max_positions", cfg.max_positions), "trades_today": today["n"],
@@ -89,6 +89,7 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
                                          "threshold_short": cfg.prob_threshold_short},
             "universe_updated_at": st.get("universe_updated_at"),
             "safety": safety,
+            "paused_symbols": sorted(store.kv_get("paused_symbols", []) or []),
         }
 
     def build_shadow() -> list[dict]:
