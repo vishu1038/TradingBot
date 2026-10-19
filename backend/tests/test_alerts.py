@@ -190,3 +190,34 @@ def test_worker_survives_notifier_exception():
     d.send("x")
     d.flush(3)
     assert len(ok.calls) == 1
+
+
+def test_every_message_carries_bot_stats_footer():
+    from tb.alerts import status_rows
+    s = Sess()
+    st = {"mode": "paper_local", "equity": 152.1, "start_equity": 200.0, "peak_equity": 210.0, "drawdown_pct": 27.6,
+          "open_positions": 9, "open_risk_pct": 31.0, "unrealized_pnl": -5.5,
+          "kill": {"tripped": False, "dd_limit_pct": 50.0}}
+    d = AlertDispatcher([GoogleChatNotifier(URL, session=s)], min_interval=0, stats=lambda: status_rows(st, "PAPER"))
+    d.send("plain text notice")                                   # no card: one is made for it
+    d.flush(3)
+    d.trade_opened("ETHUSDT", "long", 2364.8, 0.067, 158.4, 2215.5, 2439.4, 0.81, "paper_local")
+    d.flush(3)
+    d.close()
+    assert len(s.calls) == 2
+    for c in s.calls:
+        body = json.loads(c["data"])
+        footer = body["cardsV2"][-1]["card"]["sections"][-1]
+        labels = [w["decoratedText"]["topLabel"] for w in footer["widgets"]]
+        assert footer["header"] == "🤖 Bot" and labels[:3] == ["PAPER · Equity", "PAPER · PnL", "PAPER · Drawdown"]
+        assert "-47.90 (-24.0 %)" in footer["widgets"][1]["decoratedText"]["text"]
+        assert "27.6 % of 50 % kill" in footer["widgets"][2]["decoratedText"]["text"]
+
+
+def test_stats_failure_never_blocks_alert():
+    s = Sess()
+    d = AlertDispatcher([GoogleChatNotifier(URL, session=s)], min_interval=0, stats=lambda: 1 / 0)
+    d.send("x")
+    d.flush(3)
+    d.close()
+    assert len(s.calls) == 1 and json.loads(s.calls[0]["data"]) == {"text": "x"}

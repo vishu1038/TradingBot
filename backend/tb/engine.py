@@ -2108,7 +2108,8 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", e)
         return 2
     logging.getLogger("tb").addHandler(DbLogHandler(store))
-    alerts = AlertDispatcher()
+    from .alerts import store_stats
+    alerts = AlertDispatcher(stats=store_stats(store))   # every alert carries equity/PnL/drawdown/open
     eng = Engine(store, data, trade, mode, alerts)
     try:
         asyncio.run(eng.run())

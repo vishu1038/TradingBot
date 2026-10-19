@@ -300,7 +300,8 @@ def main(argv: list[str] | None = None) -> int:
             log.error("guard: no BINANCE_API_KEY/SECRET in env/.env for mode %s", mode)
             return 2
         ex = BinanceExchange(trading_base_url(mode), sec.api_key, sec.api_secret, mode=mode)
-    alerts = AlertDispatcher()
+    from .alerts import store_stats
+    alerts = AlertDispatcher(stats=store_stats(store))   # every alert carries equity/PnL/drawdown/open
     g = Guard(store, mode, ex, alerts)
     stop = threading.Event()
     for s in (signal.SIGINT, signal.SIGTERM):

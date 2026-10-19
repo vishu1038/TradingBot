@@ -101,7 +101,9 @@ def test_engine_survives_models_that_cannot_load(store, tmp_path):
 
 
 def test_legacy_artifact_loads_as_per_symbol_5m_with_default_history():
-    ent = [e for e in S.scan_models(ROOT / "models") if e.meta.get("arch")] if (ROOT / "models").is_dir() else []
+    # legacy = an artifact without a V3 `kind` (the models/ dir also holds V3 exports, newest first)
+    ent = [e for e in S.scan_models(ROOT / "models") if e.meta.get("arch") and not e.meta.get("kind")] \
+        if (ROOT / "models").is_dir() else []
     if not ent:
         pytest.skip("no exported model in models/")
     got = S.load_model(ent[0])

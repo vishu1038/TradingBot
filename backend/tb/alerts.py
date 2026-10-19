@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 log = logging.getLogger("tb.alerts")
@@ -57,6 +57,13 @@ def build_card(title: str, subtitle: str, rows: Sequence[tuple[str, Any, str | N
                                                     "onClick": {"openLink": {"url": dash}}}]}})
     return {"cardId": card_id, "card": {"header": {"title": _esc(title), "subtitle": _esc(subtitle)},
                                         "sections": [{"widgets": widgets}]}}
+
+
+def stats_section(rows: Sequence[tuple[str, Any, str | None]], header: str = "🤖 Bot") -> dict:
+    """A cardsV2 section of label/value rows (used for the bot-stats footer)."""
+    return {"header": _esc(header),
+            "widgets": [{"decoratedText": {"topLabel": _esc(label), "text": _colored(value, color)}}
+                        for label, value, color in rows]}
 
 
 def _pct(a: float, b: float) -> str:
@@ -143,6 +150,46 @@ class GoogleChatNotifier:
         raise NotifyError(f"google chat webhook HTTP {code}", retryable=retryable, retry_after=retry_after)
 
 
+def status_rows(st: Mapping[str, Any] | None, label: str = "") -> list[tuple[str, Any, str | None]]:
+    """Bot stats footer rows from the engine's stored ``status`` (kv) or ``/api/status``."""
+    if not st:
+        return []
+    eq, start, peak = st.get("equity"), st.get("start_equity"), st.get("peak_equity")
+    if eq is None:
+        return []
+    p = f"{label} · " if label else ""
+    rows: list[tuple[str, Any, str | None]] = [(f"{p}Equity", f"{eq:.2f}" + (f" (start {start:.2f})" if start else ""), None)]
+    if start:
+        pnl = eq - start
+        rows.append((f"{p}PnL", f"{pnl:+.2f} ({pnl / start * 100:+.1f} %)", GREEN if pnl >= 0 else RED))
+    dd = st.get("drawdown_pct")
+    if dd is None and peak:
+        dd = max(0.0, (peak - eq) / peak * 100)
+    if dd is not None:
+        lim = (st.get("kill") or {}).get("dd_limit_pct")
+        rows.append((f"{p}Drawdown", f"{dd:.1f} %" + (f" of {lim:g} % kill" if lim else ""),
+                     RED if lim and dd >= 0.8 * lim else (AMBER if dd >= 10 else None)))
+    op = st.get("open_positions")
+    if op is not None:
+        risk = st.get("open_risk_pct")
+        rows.append((f"{p}Open", f"{op} positions" + (f" · risk {risk:.0f} %" if risk is not None else "")
+                     + (f" · uPnL {st['unrealized_pnl']:+.2f}" if st.get("unrealized_pnl") is not None else ""), None))
+    if (st.get("kill") or {}).get("tripped"):
+        rows.append((f"{p}Kill switch", "TRIPPED", RED))
+    return rows
+
+
+def store_stats(store: Any) -> Callable[[], list[tuple[str, Any, str | None]]]:
+    """Stats provider for engine/guard dispatchers: reads the status the engine stores each loop."""
+    def provider() -> list[tuple[str, Any, str | None]]:
+        try:
+            st = store.kv_get("status") or {}
+        except Exception:
+            return []
+        return status_rows(st, (st.get("mode") or "").upper())
+    return provider
+
+
 def notifier_from_env(env: Mapping[str, str] | None = None) -> list[Notifier]:
     from .config import load_secrets
 
@@ -155,8 +202,10 @@ class AlertDispatcher:
 
     def __init__(self, notifiers: Sequence[Notifier] | None = None, *, min_interval: float = 1.1,
                  max_attempts: int = 5, backoff_base: float = 1.0, backoff_max: float = 60.0,
-                 dedupe_s: float = 600.0, max_queue: int = 500):
+                 dedupe_s: float = 600.0, max_queue: int = 500,
+                 stats: Callable[[], list[tuple[str, Any, str | None]]] | None = None):
         self.notifiers = list(notifiers if notifiers is not None else notifier_from_env())
+        self.stats = stats          # footer rows (equity, PnL, drawdown, open) added to every message
         self.min_interval = min_interval
         self.max_attempts = max_attempts
         self.backoff_base = backoff_base
@@ -300,10 +349,30 @@ class AlertDispatcher:
             if self._q.empty():
                 self._idle.set()
 
+    def _stats_rows(self) -> list[tuple[str, Any, str | None]]:
+        if not self.stats:
+            return []
+        try:
+            return list(self.stats() or [])
+        except Exception:  # a stats failure must never block an alert
+            return []
+
     def _deliver(self, batch: list[Alert]) -> None:
         text = "\n".join(a.text for a in batch)
         headlines = "\n".join(a.headline or a.text for a in batch)
         cards = [dict(a.card, cardId=f"{a.card['cardId']}-{i}") for i, a in enumerate(batch) if a.card]
+        rows = self._stats_rows()
+        if rows:
+            # Every message ends with the bot's current stats: on the last card, or on a card made for
+            # plain-text alerts; text-only channels get one appended line.
+            if not cards:
+                first = (batch[0].headline or batch[0].text).splitlines()[0][:120]
+                body = text if len(text) <= 3000 else text[:3000] + " …"
+                cards = [{"cardId": "msg-0", "card": {"header": {"title": _esc(first)},
+                          "sections": [{"widgets": [{"textParagraph": {"text": _esc(body)}}]}]}}]
+            last = cards[-1]
+            last["card"] = dict(last["card"], sections=list(last["card"].get("sections", [])) + [stats_section(rows)])
+            text = text + "\n" + " · ".join(f"{label}: {value}" for label, value, _ in rows)
         for n in self.notifiers:
             for attempt in range(1, self.max_attempts + 1):
                 try:
