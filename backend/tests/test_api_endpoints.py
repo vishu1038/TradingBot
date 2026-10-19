@@ -246,6 +246,49 @@ def test_shadow_endpoint(env, tmp_path, monkeypatch):
     assert out["chal"]["win_rate"] == 0.75
 
 
+def test_shadow_equity_endpoint(env, tmp_path, monkeypatch):
+    c, s = env
+    d = tmp_path / "models"
+    d.mkdir()
+    monkeypatch.setenv("TB_MODELS", str(d))
+    import json
+    (d / "champ.json").write_text(json.dumps({"name": "champ", "status": "champion"}))
+    (d / "chal.json").write_text(json.dumps({"name": "chal", "status": "challenger", "kind": "gbm"}))
+    (d / "idle.json").write_text(json.dumps({"name": "idle", "status": "challenger"}))
+    t0 = 1_700_000_000
+
+    def add(m, entry, exit_, pnl):
+        s.add_shadow_trade({"model": m, "symbol": "A", "side": "long", "entry_time": entry, "exit_time": exit_,
+                            "entry_price": 1, "exit_price": 1, "qty": 1, "pnl": pnl, "exit_reason": "tp"})
+
+    add("champ", t0 + 10, t0 + 100, 1.0)
+    add("champ", t0 + 20, t0 + 50, -0.5)      # closes earlier than the first insert: ordering is by exit time
+    add("champ", t0 + 30, t0 + 100, 0.25)     # same close second as the first: merged into one point
+    add("chal", t0 + 5, t0 + 60, -2.0)
+    rows = {r["model"]: r for r in c.get("/api/shadow/equity").json()}
+    assert set(rows) == {"champ", "chal", "idle"}
+    assert set(rows["champ"]) == {"model", "status", "kind", "points"}
+    assert rows["champ"]["status"] == "champion" and rows["chal"]["status"] == "challenger"
+    assert rows["chal"]["kind"] == "gbm" and rows["champ"]["kind"] == "per_symbol_5m"
+    assert rows["champ"]["points"] == [{"t": t0 + 10, "pnl": 0.0}, {"t": t0 + 50, "pnl": -0.5}, {"t": t0 + 100, "pnl": 0.75}]
+    assert rows["chal"]["points"] == [{"t": t0 + 5, "pnl": 0.0}, {"t": t0 + 60, "pnl": -2.0}]
+    # a model without trades still gets its single zero point
+    assert len(rows["idle"]["points"]) == 1 and rows["idle"]["points"][0]["pnl"] == 0.0
+    # the final value equals /api/shadow's total pnl
+    tot = {r["model"]: r["pnl"] for r in c.get("/api/shadow").json()}
+    for m, r in rows.items():
+        assert r["points"][-1]["pnl"] == pytest.approx(tot[m])
+    # limit keeps the newest points (cumulative values stay absolute)
+    lim = {r["model"]: r for r in c.get("/api/shadow/equity?limit=2").json()}
+    assert lim["champ"]["points"] == [{"t": t0 + 50, "pnl": -0.5}, {"t": t0 + 100, "pnl": 0.75}]
+    # trades opened before the stake started are ignored (like /api/equity)
+    s.kv_set("capital_since_t", t0 + 8)
+    rows = {r["model"]: r for r in c.get("/api/shadow/equity").json()}
+    assert rows["champ"]["points"][-1]["pnl"] == pytest.approx(0.75)
+    assert rows["chal"]["points"] == [{"t": t0 + 8, "pnl": 0.0}]
+    assert c.get("/api/shadow/equity?limit=1").status_code == 422
+
+
 def test_cors_localhost_only(env):
     c, _ = env
     ok = c.get("/api/health", headers={"Origin": "http://localhost:5173"})

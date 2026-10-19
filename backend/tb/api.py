@@ -162,7 +162,8 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             "paused_symbols": sorted(store.kv_get("paused_symbols", []) or []),
         }
 
-    def build_shadow() -> list[dict]:
+    def shadow_registry() -> tuple[list[str], dict[str, str], dict[str, dict], dict[str, dict]]:
+        """(model names, name -> status, name -> meta, name -> loaded status row): champion + challengers + retired."""
         reg = Registry.from_dict(store.kv_get("model_registry"))
         scanned = scan_models(models_dir(), reg.overrides)
         entries = {e.name: e.status for e in scanned}
@@ -173,6 +174,10 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             if n not in entries:
                 names.append(n)
                 entries[n] = "retired"
+        return names, entries, metas, loaded
+
+    def build_shadow() -> list[dict]:
+        names, entries, metas, loaded = shadow_registry()
         champ = next((n for n, s in entries.items() if s == "champion"), None)
         out = []
         for n in names:
@@ -310,6 +315,35 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
     @app.get("/api/shadow")
     def shadow() -> list[dict]:
         return build_shadow()
+
+    @app.get("/api/shadow/equity")
+    def shadow_equity(limit: int = Query(5000, ge=2, le=20000)) -> list[dict]:
+        """Cumulative NET PnL (USDT) over time of every model's closed shadow trades, for the all-bots chart.
+
+        One entry per registry model (champion + challengers + retired), even with 0 trades. ``points`` start at
+        ``{t: first entry (or the stake start / now), pnl: 0}`` then one point per close time (same-second closes
+        merged). Only trades opened since the stake started count, like /api/equity."""
+        since = capital.since_t(store)
+        names, entries, metas, _ = shadow_registry()
+        out = []
+        for n in names:
+            trades = sorted(store.get_shadow_trades(n, since), key=lambda r: (r["exit_time"], r["id"]))
+            if trades:
+                t0 = min(r["entry_time"] for r in trades)
+                t0 = min(t0, trades[0]["exit_time"] - 1)
+            else:
+                t0 = since if since is not None else int(time.time())
+            pts: list[dict] = [{"t": int(t0), "pnl": 0.0}]
+            cum = 0.0
+            for r in trades:
+                cum += float(r["pnl"])
+                if pts[-1]["t"] == r["exit_time"]:
+                    pts[-1]["pnl"] = cum
+                else:
+                    pts.append({"t": int(r["exit_time"]), "pnl": cum})
+            out.append({"model": n, "status": entries[n], "kind": (metas.get(n) or {}).get("kind") or "per_symbol_5m",
+                        "points": pts[-limit:]})
+        return out
 
     # ------------------------------------------------------------------ websocket
     @app.websocket("/ws")

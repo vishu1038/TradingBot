@@ -132,7 +132,9 @@ export const api = {
   settings: () => api.request('GET', '/api/settings'),
   saveSettings: (patch) => api.request('PUT', '/api/settings', {}, patch),
   shadow: () => api.request('GET', '/api/shadow'),
-  labReports: () => api.request('GET', '/api/lab/reports'),
+  /** cumulative net PnL per model (champion + every challenger): [{model,status,kind,points:[{t,pnl}]}] */
+  shadowEquity: (limit = 5000) => api.request('GET', '/api/shadow/equity', { limit }),
+  labReports:() => api.request('GET', '/api/lab/reports'),
   /** control actions: start|stop|kill|reset_kill|close_position|close_all|promote_model|rollback_model */
   async control(action, extra = {}) {
     const r = await api.request('POST', '/api/control', {}, { action, ...extra });

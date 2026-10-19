@@ -1,7 +1,8 @@
 // BOTS view: equity + drawdown charts, stat tiles, model card, risk governor, shadow models, controls.
 import { store } from '../state.js';
 import { api } from '../api.js';
-import { createLineChart } from '../charts.js';
+import { createLineChart, createMultiLineChart } from '../charts.js';
+import { modelColor } from '../theme.js';
 import { confirmDialog } from '../dialog.js';
 import * as fx from '../fx.js';
 import { esc, fmtUsd, fmtPct, fmtDateTime, fmtNum, signClass, throttle, winRatePct, isNum, clamp, fmtAgo } from '../format.js';
@@ -36,9 +37,42 @@ function curveSvg(dd, limit, mult) {
   </svg>`;
 }
 
+const HIDE_KEY = 'tb.bots.hidden';
+const ACCOUNT = 'account';
+const REFRESH_MS = 60000;
+
+function loadHidden() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(HIDE_KEY) || '[]'));
+  } catch (_) {
+    return new Set();
+  }
+}
+function saveHidden(set) {
+  try {
+    localStorage.setItem(HIDE_KEY, JSON.stringify([...set]));
+  } catch (_) {
+    /* storage blocked: the choice just does not persist */
+  }
+}
+
+/** 'cnn_atr32_20261018_1716_papertest' -> 'cnn_atr32 papertest 1018-1716' (the long timestamp is what makes names unreadable). */
+export function shortModel(name) {
+  const m = String(name).match(/^(.*?)_\d{4}(\d{2})(\d{2})_(\d{2})(\d{2})(?:_(.+))?$/);
+  if (!m) return String(name);
+  return `${m[1]}${m[6] ? ' ' + m[6] : ''} ${m[2]}${m[3]}-${m[4]}${m[5]}`;
+}
+const kindLabel = (k) => String(k || 'per_symbol_5m').replace(/_5m$/, '');
+
 export function mount(root) {
   root.innerHTML = `
     <div class="page bots">
+      <div class="card span2 ac-magenta" id="ab-card">
+        <h3>ALL BOTS <span class="why-sub" id="ab-sub"></span></h3>
+        <div class="ab-bar"><button class="btn btn-mini" data-ab="all">SHOW ALL</button><button class="btn btn-mini" data-ab="none">HIDE ALL</button><button class="btn btn-mini" data-ab="fit">FIT</button><span class="dim ab-hint">click a row to hide / show its line</span></div>
+        <div class="line-chart tall ab-chart" id="ab-chart"></div>
+        <div class="tbl-wrap ab-legend" id="ab-legend"></div>
+      </div>
       <div class="card span2 ac-coral"><h3>EQUITY <span class="why-sub" id="eq-sub"></span></h3><div class="line-chart tall" id="eq-chart"></div></div>
       <div class="card ac-violet"><h3>STATS</h3><div id="bot-tiles"></div></div>
       <div class="card ac-cyan"><h3>DRAWDOWN</h3><div class="line-chart" id="dd-chart"></div></div>
@@ -51,6 +85,136 @@ export function mount(root) {
   const offs = [];
   let eqChart = null;
   let ddChart = null;
+  let abChart = null;
+  let shadowEq = []; // GET /api/shadow/equity
+  let abError = '';
+  let hoverT = null;
+  let lastLegendHtml = '';
+  let lastStart = null;
+  const hidden = loadHidden();
+  let destroyed = false;
+
+  const startEq = () => store.get('status')?.start_equity;
+
+  function legendRows() {
+    const stat = new Map((store.get('shadow') || []).map((r) => [r.model, r]));
+    const rank = { champion: 0, challenger: 1, retired: 2 };
+    const models = [...shadowEq].sort((a, b) => (rank[a.status] ?? 3) - (rank[b.status] ?? 3) || a.model.localeCompare(b.model));
+    models.forEach((m) => modelColor(m.model)); // assign colours in a stable order
+    const rows = [];
+    const eq = store.get('equity');
+    const st = store.get('status');
+    if (eq.length && isNum(startEq())) {
+      const trades = store.get('trades') || [];
+      const total = (st && isNum(st.equity) ? st.equity : eq[eq.length - 1].equity) - startEq();
+      const n = trades.length;
+      rows.push({ id: ACCOUNT, name: 'ACCOUNT (real)', title: 'the real bot: equity - start equity', color: '#ffffff', kind: 'real', status: 'live', n: n >= 500 ? '500+' : n, exp: n && n < 500 ? total / n : null, total, account: true });
+    }
+    for (const m of models) {
+      const s = stat.get(m.model);
+      const last = m.points.length ? m.points[m.points.length - 1].pnl : 0;
+      const n = s ? s.n_trades : Math.max(0, m.points.length - 1);
+      rows.push({ id: m.model, name: shortModel(m.model), title: m.model, color: modelColor(m.model), kind: kindLabel(m.kind), status: m.status, n, exp: n ? last / n : null, total: last, champion: m.status === 'champion' });
+    }
+    return rows;
+  }
+
+  function buildItems() {
+    const items = [];
+    const eq = store.get('equity');
+    if (eq.length && isNum(startEq())) {
+      items.push({ id: ACCOUNT, color: '#ffffff', width: 3, step: false, label: true, visible: !hidden.has(ACCOUNT), points: eq.map((p) => ({ t: p.t, v: p.equity - startEq() })) });
+    }
+    for (const m of shadowEq) {
+      const champ = m.status === 'champion';
+      items.push({ id: m.model, color: modelColor(m.model), width: champ ? 4 : 2, step: true, label: champ, visible: !hidden.has(m.model), points: m.points.map((p) => ({ t: p.t, v: p.pnl })) });
+    }
+    return items;
+  }
+
+  function renderLegend() {
+    if (destroyed) return;
+    const rows = legendRows();
+    if (!rows.length) {
+      lastLegendHtml = '';
+      return ($('ab-legend').innerHTML = `<div class="empty">${esc(abError || 'no models reported by /api/shadow/equity yet')}</div>`);
+    }
+    const html = `<table class="tbl compact"><thead><tr><th>bot</th><th class="hide-m">kind</th><th class="hide-m">status</th><th class="r">trades</th><th class="r">$/trade</th><th class="r">total PnL</th><th class="r ab-cur-h" id="ab-cur-h">at cursor</th></tr></thead><tbody>
+      ${rows
+        .map(
+          (r) => `<tr class="ab-row${hidden.has(r.id) ? ' is-off' : ''}${r.account ? ' ab-acct' : ''}${r.champion ? ' ab-champ' : ''}" data-id="${esc(r.id)}" title="${esc(r.title)}">
+            <td class="ab-name"><i class="ab-sw" style="background:${r.color};${r.account || r.champion ? 'height:5px' : ''}"></i><span>${esc(r.name)}</span></td>
+            <td class="hide-m dim">${esc(r.kind)}</td><td class="hide-m"><span class="mstat mstat-${esc(r.status)}">${esc(String(r.status).toUpperCase())}</span></td>
+            <td class="r">${esc(r.n)}</td><td class="r">${r.exp == null ? '<span class="dim">–</span>' : pnlSpan(r.exp, 3)}</td><td class="r">${pnlSpan(r.total)}</td>
+            <td class="r ab-cur" data-cur="${esc(r.id)}"><span class="dim">–</span></td></tr>`
+        )
+        .join('')}
+    </tbody></table>`;
+    if (html === lastLegendHtml) return;
+    lastLegendHtml = html;
+    $('ab-legend').innerHTML = html;
+    showHover(hoverT);
+  }
+
+  function showHover(t) {
+    hoverT = t;
+    const h = $('ab-cur-h');
+    if (h) h.textContent = t == null ? 'at cursor' : `at ${fmtDateTime(t)}`;
+    for (const cell of root.querySelectorAll('#ab-legend [data-cur]')) {
+      const v = t == null || !abChart ? null : abChart.valueAt(cell.dataset.cur, t);
+      cell.innerHTML = v == null ? '<span class="dim">–</span>' : pnlSpan(v);
+    }
+  }
+
+  function drawBots() {
+    if (destroyed) return;
+    if (!abChart && typeof LightweightCharts !== 'undefined') {
+      abChart = createMultiLineChart($('ab-chart'), { format: (v) => fmtUsd(v) });
+      abChart.onHover(showHover);
+    }
+    if (abChart) {
+      abChart.setSeries(buildItems(), !abChart.userMoved());
+      lastStart = startEq();
+    }
+    renderLegend();
+    const n = shadowEq.length;
+    $('ab-sub').textContent = abError ? `· ${abError}` : n ? `· ${n} models + the real account · cumulative net PnL (USDT), refreshed every ${REFRESH_MS / 1000}s and on every shadow trade` : '';
+  }
+
+  async function refreshBots() {
+    try {
+      const r = await api.shadowEquity(5000);
+      // champion first = drawn underneath, so a thin challenger line that overlaps it stays visible
+      const rank = { champion: 0, challenger: 1, retired: 2 };
+      shadowEq = (Array.isArray(r) ? r : []).sort((x, y) => (rank[x.status] ?? 3) - (rank[y.status] ?? 3) || x.model.localeCompare(y.model));
+      abError = '';
+    } catch (e) {
+      abError = `/api/shadow/equity unavailable (${e.message}); restart tb.api`;
+    }
+    drawBots();
+  }
+  const refreshBotsT = throttle(refreshBots, 3000);
+
+  $('ab-card').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-ab]');
+    if (btn) {
+      if (btn.dataset.ab === 'fit') return abChart && abChart.fit();
+      hidden.clear();
+      if (btn.dataset.ab === 'none') for (const r of legendRows()) hidden.add(r.id);
+      saveHidden(hidden);
+      lastLegendHtml = '';
+      return drawBots();
+    }
+    const row = e.target.closest('.ab-row');
+    if (!row) return;
+    const id = row.dataset.id;
+    if (hidden.has(id)) hidden.delete(id);
+    else hidden.add(id);
+    saveHidden(hidden);
+    row.classList.toggle('is-off', hidden.has(id));
+    lastLegendHtml = '';
+    abChart && abChart.setVisible(id, !hidden.has(id));
+  });
 
   function drawdownSeries(eq) {
     let peak = -Infinity;
@@ -76,12 +240,16 @@ export function mount(root) {
 
   let peakSoFar = -Infinity;
   offs.push(store.on('equity_point', (p) => {
+    if (abChart && isNum(startEq())) abChart.update(ACCOUNT, { t: p.t, v: p.equity - startEq() });
     if (!eqChart) return;
     eqChart.update({ t: p.t, v: p.equity });
     peakSoFar = Math.max(peakSoFar, p.equity, store.get('status')?.peak_equity ?? 0);
     ddChart.update({ t: p.t, v: peakSoFar > 0 ? -((peakSoFar - p.equity) / peakSoFar) * 100 : 0 });
   }));
-  offs.push(store.on('change:equity', () => loadCharts(false)));
+  offs.push(store.on('change:equity', () => {
+    loadCharts(false);
+    drawBots();
+  }));
 
   function renderTiles() {
     const s = store.get('status');
@@ -214,15 +382,31 @@ export function mount(root) {
   const renderT = throttle(() => {
     renderTiles();
   }, 500);
-  offs.push(store.on('change:status', renderT));
-  offs.push(store.on('change:shadow', renderShadow));
+  const renderLegendT = throttle(renderLegend, 1000);
+  offs.push(store.on('change:status', () => {
+    renderT();
+    if (startEq() !== lastStart) drawBots();
+    else renderLegendT();
+  }));
+  offs.push(store.on('change:shadow', () => {
+    renderShadow();
+    renderLegendT();
+  }));
+  offs.push(store.on('shadow_trade', refreshBotsT));
+  const refreshTimer = setInterval(refreshBots, REFRESH_MS);
 
   loadCharts(true);
   renderTiles();
   renderShadow();
   api.shadow().then((r) => r && store.set('shadow', r)).catch(() => {});
+  refreshBots();
 
   return () => {
+    destroyed = true;
+    clearInterval(refreshTimer);
+    refreshBotsT.cancel();
+    renderLegendT.cancel();
+    abChart && abChart.destroy();
     offs.forEach((o) => o());
     renderT.cancel();
     eqChart && eqChart.destroy();

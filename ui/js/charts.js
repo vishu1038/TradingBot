@@ -523,3 +523,168 @@ export function createLineChart(el, opts = {}) {
     },
   };
 }
+
+// ---------------------------------------------------------------------------------------------
+/**
+ * Many labelled lines in ONE chart (the BOTS "all models" chart).
+ *   setSeries(items, fit)  items: [{id, color, width, step, label, visible, points:[{t,v}]}]; series are added / removed /
+ *                          restyled by id, every line is extended flat to the newest time, autoScale is forced back ON
+ *                          (dragging the price axis turns it off and it would survive setData), a dashed 0 line is drawn.
+ *   update(id, {t,v})      append / replace the last point of one line (live account curve)
+ *   setVisible(id, bool)   hide / show a line (hidden lines leave the auto range)
+ *   valueAt(id, t)         step value of a line at time t (cumulative PnL is constant between closes)
+ *   onHover(cb)            cb(t | null) on crosshair move; fit() re-fits the time axis
+ */
+export function createMultiLineChart(el, opts = {}) {
+  const P = palette();
+  const lw = LW();
+  const chart = lw.createChart(el, { ...baseOptions(P), width: el.clientWidth || 400, height: el.clientHeight || 260 });
+  const fmt = opts.format || ((v) => fmtNum(v, 2));
+  const priceFormat = { type: 'custom', minMove: 0.01, formatter: fmt };
+  const anchor = chart.addLineSeries({ priceFormat, color: 'rgba(0,0,0,0)', lineWidth: 1, lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
+  anchor.createPriceLine({ price: 0, color: 'rgba(255,255,255,0.45)', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '' });
+  const lines = new Map(); // id -> {series, pts:[{time,value}], visible}
+  let tMin = 0;
+  let tMax = 0;
+  let hoverCb = null;
+  let userMoved = false;
+  let destroyed = false;
+  const STEP = lw.LineType ? lw.LineType.WithSteps : 1;
+
+  const off = observeResize(el, (w, h) => w > 0 && h > 0 && chart.applyOptions({ width: w, height: h }));
+  const touch = () => {
+    userMoved = true;
+  };
+  el.addEventListener('wheel', touch, { passive: true });
+  el.addEventListener('pointerdown', touch, { passive: true });
+  chart.subscribeCrosshairMove((p) => {
+    if (destroyed || !hoverCb) return;
+    hoverCb(!p || p.time === undefined || !p.point ? null : p.time);
+  });
+
+  const autoScale = () => {
+    try {
+      chart.priceScale('right').applyOptions({ autoScale: true });
+    } catch (_) {
+      /* ignore */
+    }
+  };
+  const clean = (points) => {
+    const out = [];
+    let last = -Infinity;
+    for (const p of points || []) {
+      if (!isNum(p.t) || !isNum(p.v)) continue;
+      if (p.t === last) out[out.length - 1].value = p.v; // same second: the later value wins
+      else if (p.t > last) out.push({ time: p.t, value: p.v });
+      else continue;
+      last = p.t;
+    }
+    return out;
+  };
+
+  return {
+    chart,
+    userMoved: () => userMoved,
+    setSeries(items, fit = true) {
+      const ids = new Set(items.map((i) => i.id));
+      for (const [id, l] of [...lines]) {
+        if (!ids.has(id)) {
+          try {
+            chart.removeSeries(l.series);
+          } catch (_) {
+            /* gone */
+          }
+          lines.delete(id);
+        }
+      }
+      const cleaned = items.map((it) => ({ it, pts: clean(it.points) }));
+      tMin = Infinity;
+      tMax = -Infinity;
+      for (const { pts } of cleaned) {
+        if (!pts.length) continue;
+        tMin = Math.min(tMin, pts[0].time);
+        tMax = Math.max(tMax, pts[pts.length - 1].time);
+      }
+      for (const { it, pts } of cleaned) {
+        if (pts.length && pts[pts.length - 1].time < tMax) pts.push({ time: tMax, value: pts[pts.length - 1].value }); // flat to "now"
+        const style = {
+          color: it.color,
+          lineWidth: it.width || 2,
+          lineType: it.step ? STEP : 0,
+          visible: it.visible !== false,
+          lastValueVisible: !!it.label,
+          priceLineVisible: false,
+          crosshairMarkerVisible: true,
+          crosshairMarkerRadius: it.width >= 3 ? 4 : 3,
+          title: '',
+        };
+        let l = lines.get(it.id);
+        if (!l) {
+          l = { series: chart.addLineSeries({ priceFormat, ...style }), pts: [], visible: true };
+          lines.set(it.id, l);
+        } else {
+          l.series.applyOptions(style);
+        }
+        l.pts = pts;
+        l.visible = style.visible;
+        l.series.setData(pts);
+      }
+      if (isFinite(tMin) && tMax > tMin) anchor.setData([{ time: tMin, value: 0 }, { time: tMax, value: 0 }]);
+      else anchor.setData(isFinite(tMin) ? [{ time: tMin, value: 0 }] : []);
+      autoScale();
+      if (fit) {
+        chart.timeScale().fitContent();
+        userMoved = false;
+      }
+    },
+    update(id, p) {
+      const l = lines.get(id);
+      if (!l || !isNum(p.t) || !isNum(p.v)) return;
+      const last = l.pts[l.pts.length - 1];
+      if (last && p.t < last.time) return;
+      const pt = { time: p.t, value: p.v };
+      if (last && last.time === p.t) l.pts[l.pts.length - 1] = pt;
+      else l.pts.push(pt);
+      l.series.update(pt);
+      tMax = Math.max(tMax, p.t);
+    },
+    setVisible(id, vis) {
+      const l = lines.get(id);
+      if (!l) return;
+      l.visible = vis;
+      l.series.applyOptions({ visible: vis });
+      autoScale();
+    },
+    valueAt(id, t) {
+      const l = lines.get(id);
+      if (!l || !l.pts.length || t < l.pts[0].time) return null;
+      let lo = 0;
+      let hi = l.pts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (l.pts[mid].time <= t) lo = mid;
+        else hi = mid - 1;
+      }
+      return l.pts[lo].value;
+    },
+    onHover(cb) {
+      hoverCb = cb;
+    },
+    fit() {
+      autoScale();
+      chart.timeScale().fitContent();
+      userMoved = false;
+    },
+    destroy() {
+      destroyed = true;
+      off();
+      el.removeEventListener('wheel', touch);
+      el.removeEventListener('pointerdown', touch);
+      try {
+        chart.remove();
+      } catch (_) {
+        /* ignore */
+      }
+    },
+  };
+}

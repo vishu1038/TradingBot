@@ -57,6 +57,26 @@ export function coinColor(sym) {
   return c;
 }
 
+// one fixed colour per model (the BOTS all-models chart + legend); no green / red (those mean money), white = the real account
+const MODEL_COLORS = ['#ff8a5c', '#a78bfa', '#4fe3ff', '#ffb020', '#ff7ac6', '#5aa9ff', '#ffe14f', '#ff4fd8', '#7f8cff', '#c8a2ff'];
+const modelAssigned = new Map();
+
+/** Stable colour per model name: hashed to a palette slot, probing to the next free slot on a clash (once assigned it never changes). */
+export function modelColor(name) {
+  const key = String(name || '');
+  if (modelAssigned.has(key)) return modelAssigned.get(key);
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const taken = new Set(modelAssigned.values());
+  let k = (h >>> 0) % MODEL_COLORS.length;
+  for (let i = 0; i < MODEL_COLORS.length && taken.has(MODEL_COLORS[k]); i++) k = (k + 1) % MODEL_COLORS.length;
+  modelAssigned.set(key, MODEL_COLORS[k]);
+  return MODEL_COLORS[k];
+}
+
 const PROB_STOPS = [
   [0.0, [79, 124, 255]], // cool blue
   [0.35, [155, 107, 255]], // violet

@@ -138,6 +138,12 @@ export class MockServer {
     this.prevChampion = { model: 'cnn1d-5m@0.2.9', name: 'cnn1d-5m (mock)', version: '0.2.9' };
     this.challenger = { model: 'cnn1d-5m@0.4.0-rc', name: 'cnn1d-5m (mock)', version: '0.4.0-rc', trades: [] };
     this.retired = [{ model: 'cnn1d-5m@0.2.9', n_trades: 212, win_rate: 0.47, expectancy: -0.03, pnl: -6.4 }];
+    // more challengers (other model kinds) so the BOTS all-models chart has several lines
+    this.extraBots = [
+      { model: 'v3_gbm_mock_20261019_0607', kind: 'gbm', status: 'challenger', edge: 0.46, trades: [] },
+      { model: 'xsec_mlp_mock_20261019_1133', kind: 'xsec', status: 'challenger', edge: 0.58, trades: [] },
+      { model: 'mtf_kal_mock_20261018_2230', kind: 'mtf', status: 'challenger', edge: 0.52, trades: [] },
+    ];
     this.faults = [];
     this.paused = new Set();
     this.flattenUntil = 0;
@@ -151,6 +157,9 @@ export class MockServer {
     for (const s of this.universeSyms) this.syms[s].since = this.now - 6 * 3600 - Math.floor(this.rand() * 40000);
     this._seedTrades();
     for (let i = 0; i < 34; i++) this._genShadowTrade(false, this.now - (34 - i) * 420);
+    this.extraBots.forEach((b, k) => {
+      for (let i = 0; i < 20 + k * 9; i++) this._genBotTrade(b, false, this.now - (20 + k * 9 - i) * 900);
+    });
     this.faults.push({ symbol: this.universeSyms[3], kind: 'stale_bar', count: 2, since: this.now - 40, age: 0 });
     this._seedLogs();
     this._seedPositions();
@@ -764,11 +773,12 @@ export class MockServer {
   }
 
   _shadowRows() {
-    const champ = { model: this.champion.model, status: 'champion', ...this._stat(this.trades) };
-    const chal = this.challenger ? { model: this.challenger.model, status: 'challenger', ...this._stat(this.challenger.trades) } : null;
+    const champ = { model: this.champion.model, status: 'champion', kind: 'per_symbol_5m', ...this._stat(this.trades) };
+    const chal = this.challenger ? { model: this.challenger.model, status: 'challenger', kind: 'per_symbol_5m', ...this._stat(this.challenger.trades) } : null;
     const rows = [champ];
     if (chal) rows.push(chal);
-    for (const r of this.retired) rows.push({ status: 'retired', ...r });
+    for (const b of this.extraBots) rows.push({ model: b.model, status: b.status, kind: b.kind, ...this._stat(b.trades) });
+    for (const r of this.retired) rows.push({ status: 'retired', kind: 'per_symbol_5m', ...r });
     for (const r of rows) r.vs_champion = +(r.expectancy - champ.expectancy).toFixed(4);
     return rows;
   }
@@ -788,14 +798,59 @@ export class MockServer {
       closed_at: Math.floor(t ?? this.now),
       exit_reason: win ? 'tp' : 'sl',
     };
+    trade.opened_at = trade.closed_at - 300 * (1 + Math.floor(this.rand() * 6));
     this.challenger.trades.push(trade);
     if (emit) this.out.push({ type: 'shadow_trade', data: { model: this.challenger.model, trade } });
+  }
+
+  /** A simulated trade for one of the extra challengers (win probability = bot.edge). */
+  _genBotTrade(bot, emit, t) {
+    const sym = this.universeSyms[Math.floor(this.rand() * this.universeSyms.length)];
+    const S = this.syms[sym];
+    const win = this.rand() < bot.edge;
+    const pnl = win ? 0.8 + this.rand() * 1.2 : -(0.7 + this.rand() * 0.45);
+    const closed = Math.floor(t ?? this.now);
+    const trade = {
+      id: `${bot.kind[0]}${bot.trades.length + 1}`,
+      symbol: sym,
+      side: this.rand() < 0.5 ? 'long' : 'short',
+      entry_price: S.price,
+      exit_price: S.price * (1 + (win ? 0.008 : -0.006)),
+      pnl: +pnl.toFixed(4),
+      opened_at: closed - 300 * (1 + Math.floor(this.rand() * 8)),
+      closed_at: closed,
+      exit_reason: win ? 'tp' : 'sl',
+    };
+    bot.trades.push(trade);
+    if (emit) this.out.push({ type: 'shadow_trade', data: { model: bot.model, trade } });
+  }
+
+  /** GET /api/shadow/equity: cumulative net PnL per model (contract: [{model,status,kind,points:[{t,pnl}]}]). */
+  _shadowEquity(limit) {
+    const curve = (model, status, kind, trades) => {
+      const tr = [...trades].sort((a, b) => a.closed_at - b.closed_at);
+      const t0 = tr.length ? Math.min(...tr.map((x) => x.opened_at ?? x.closed_at), tr[0].closed_at - 1) : this.now;
+      const pts = [{ t: t0, pnl: 0 }];
+      let cum = 0;
+      for (const x of tr) {
+        cum += x.pnl;
+        if (pts[pts.length - 1].t === x.closed_at) pts[pts.length - 1].pnl = +cum.toFixed(4);
+        else pts.push({ t: x.closed_at, pnl: +cum.toFixed(4) });
+      }
+      return { model, status, kind, points: pts.slice(-limit) };
+    };
+    const out = [curve(this.champion.model, 'champion', 'per_symbol_5m', this.trades)];
+    if (this.challenger) out.push(curve(this.challenger.model, 'challenger', 'per_symbol_5m', this.challenger.trades));
+    for (const b of this.extraBots) out.push(curve(b.model, b.status, b.kind, b.trades));
+    for (const r of this.retired) out.push({ model: r.model, status: 'retired', kind: 'per_symbol_5m', points: [{ t: this.now - 86400, pnl: 0 }] });
+    return out;
   }
 
   _shadowTick() {
     // on every bar close the challenger "would have" opened 0..2 trades
     if (!this.challenger) return;
     for (let k = 0; k < 2; k++) if (this.rand() < 0.7) this._genShadowTrade(true);
+    for (const b of this.extraBots) if (this.rand() < 0.5) this._genBotTrade(b, true);
   }
 
   _promote(model) {
@@ -1333,6 +1388,8 @@ export class MockServer {
       }
       case 'GET /api/shadow':
         return ok(this._shadowRows());
+      case 'GET /api/shadow/equity':
+        return ok(this._shadowEquity(limit(5000)));
       case 'GET /api/lab/reports':
         return ok(this.labReports);
       default:

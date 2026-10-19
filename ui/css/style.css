@@ -281,6 +281,25 @@ code, kbd { font-family: var(--sans); font-weight: 600; }
 .prog { display: inline-block; width: 90px; height: 7px; background: #0a0a10; border-radius: 4px; overflow: hidden; vertical-align: middle; border: 1px solid var(--line-2); }
 .prog i { display: block; height: 100%; background: linear-gradient(90deg, var(--cyan), var(--violet)); }
 .shadow-note { margin-top: 8px; }
+/* BOTS: all-models chart + interactive legend */
+.ab-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.ab-hint { margin-left: 6px; font-size: 11px; }
+.ab-chart.line-chart.tall { height: 340px; }
+.ab-legend { margin-top: 10px; max-height: 300px; }
+.ab-row { cursor: pointer; user-select: none; }
+.ab-row.is-off { opacity: 0.38; }
+.ab-row.is-off .ab-name span { text-decoration: line-through; }
+.ab-name { display: flex; align-items: center; gap: 8px; max-width: 230px; }
+.ab-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ab-sw { display: inline-block; flex: none; width: 18px; height: 3px; border-radius: 2px; box-shadow: 0 0 6px currentColor; }
+.ab-acct td, .ab-champ td { font-weight: 700; }
+.ab-cur-h, .ab-cur { min-width: 96px; }
+@media (max-width: 700px) {
+  .ab-chart.line-chart.tall { height: 250px; }
+  .ab-legend .hide-m { display: none; }
+  .ab-name { max-width: 150px; }
+  .ab-hint { display: none; }
+}
 .filters { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
 .filters label { color: var(--text-dim); display: flex; gap: 6px; align-items: center; }
 select, input[type='number'], input[type='text'] { background: #050508; border: 1px solid var(--line-2); border-radius: 8px; padding: 6px 9px; color: var(--text); min-height: 32px; }

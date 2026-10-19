@@ -359,6 +359,10 @@ All timestamps unix **seconds** in the API. JSON.
   **PnL convention (everywhere: sim, engine, API, UI):** `pnl` = NET realised PnL
   (gross − fees − funding). `fees` ≥ 0 is a cost. `funding` is a cost: positive = paid,
   negative = received. `win` means net pnl > 0. `win_rate` is a 0–1 fraction.
+- `GET /api/shadow/equity?limit=5000` → `[{model, status, kind, points:[{t, pnl}]}]`: cumulative NET PnL (USDT) of each registry
+  model's closed shadow trades (champion + challengers + retired; a model with no trades gets one `pnl: 0` point). `points[0]` is
+  `{t: first entry (or stake start / now), pnl: 0}`, then one point per close time; only trades opened since the stake began
+  (same cut-off as `/api/equity`). The BOTS page draws it with the account curve (`equity − start_equity`) in one chart.
 - `GET /api/equity?limit=2000` → `[{t, equity}]`
 - `GET /api/logs?limit=200` → `[{t, level, msg}]`
 - `GET /api/settings` / `PUT /api/settings` (partial merge) → `{slice_margin_usd, leverage,

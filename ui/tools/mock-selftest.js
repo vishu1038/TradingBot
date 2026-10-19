@@ -94,6 +94,14 @@ need(get('/api/status').safety, ['state', 'reasons', 'derate_mult', 'drift', 'fa
 need(get('/api/status').safety.drift, ['z', 'n', 'mult'], 'safety.drift');
 const sh = get('/api/shadow');
 need(sh[0], ['model', 'status', 'n_trades', 'win_rate', 'expectancy', 'pnl', 'vs_champion'], 'shadow row');
+const she = get('/api/shadow/equity');
+need(she[0], ['model', 'status', 'kind', 'points'], 'shadow equity row');
+check('shadow equity: one curve per /api/shadow model', she.length === sh.length && sh.every((r) => she.some((e) => e.model === r.model)));
+check('shadow equity: points start at 0, ascending t, last = total pnl', she.every((e) => {
+  const p = e.points;
+  const tot = sh.find((r) => r.model === e.model).pnl;
+  return p.length >= 1 && p[0].pnl === 0 && p.every((x, i) => i === 0 || x.t > p[i - 1].t) && (p.length === 1 || Math.abs(p[p.length - 1].pnl - tot) < 1e-3 || e.status === 'retired');
+}));
 check('shadow has champion + challenger', sh.some((r) => r.status === 'champion') && sh.some((r) => r.status === 'challenger'));
 check('safety/shadow_trade messages emitted', (types.safety || 0) >= 1 && (types.shadow_trade || 0) >= 10, JSON.stringify([types.safety, types.shadow_trade]));
 const chal = sh.find((r) => r.status === 'challenger');
