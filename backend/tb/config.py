@@ -173,7 +173,7 @@ CONTRACT_KEYS = (
     "slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
     "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-    "universe_size", "universe_refresh_s", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
+    "universe_size", "universe_refresh_s", "universe_atr_bars", "universe_retention", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
     "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
     "maker_reprices", "maker_on_timeout",
     "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
@@ -201,6 +201,8 @@ class Settings:
     corr_cap: CorrCap = CorrCap()
     universe_size: int = 8
     universe_refresh_s: int = 3600
+    universe_atr_bars: int = 72          # ranking volatility window in 5m bars (72 = 6 h, 12 = 1 h)
+    universe_retention: float = 1.5      # member stays while in top ceil(retention*size); 1.0 = no buffer
     universe_whitelist: list[str] | None = None   # null = hot-list ranking; else exactly these coins (∩ symbols TRADING on the order venue)
     kill_dd_pct: float = 50.0           # paper default; live is capped at LIVE_KILL_DD_PCT
     dd_basis: str = "start"             # drawdown for kill/derating vs the starting stake ("start") or the high-water mark ("peak")
@@ -322,6 +324,8 @@ class Settings:
         chk(self.corr_cap.max_correlated >= 1, "corr_cap.max_correlated must be >= 1")
         chk(1 <= self.universe_size <= 50, "universe_size must be 1..50")
         chk(self.universe_refresh_s >= 30, "universe_refresh_s must be >= 30")
+        chk(6 <= self.universe_atr_bars <= 80, "universe_atr_bars must be 6..80")
+        chk(1.0 <= self.universe_retention <= 3.0, "universe_retention must be 1.0..3.0")
         wl = self.universe_whitelist
         chk(wl is None or (isinstance(wl, list) and 1 <= len(wl) <= 50 and len(set(wl)) == len(wl)
                            and all(isinstance(x, str) and _SYMBOL_RE.match(x) for x in wl)),

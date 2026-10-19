@@ -65,7 +65,7 @@ def test_settings_merge_validation_and_api_shape():
     api = s.to_api()
     assert list(api) == ["slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio", "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
                          "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-                         "universe_size", "universe_refresh_s", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars",
+                         "universe_size", "universe_refresh_s", "universe_atr_bars", "universe_retention", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars",
                              "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
                              "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac"]
     assert s.merge({"trail": {"enabled": False}}).trail.activate_r == 1.5
@@ -222,3 +222,12 @@ def test_numpy_values_serialise(store):
     import numpy as np
     store.kv_set("n", {"a": np.float32(1.5), "b": np.arange(3)})
     assert store.kv_get("n") == {"a": 1.5, "b": [0, 1, 2]}
+
+
+def test_universe_retention_one_means_pure_top_n():
+    from tb.universe import select
+    ranked = [f"C{i}USDT" for i in range(20)]
+    current = ["C14USDT", "C3USDT"]                      # C14 ranks 15th
+    assert "C14USDT" in select(ranked, current, 12)      # default 1.5x buffer keeps it (top 18)
+    assert "C14USDT" not in select(ranked, current, 12, retention=1.0)   # no buffer: replaced
+    assert select(ranked, current, 12, retention=1.0) == ranked[:12]

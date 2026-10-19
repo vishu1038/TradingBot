@@ -28,6 +28,19 @@ class Candidate:
     score: float = 0.0
 
 
+def _atr_bars(cfg: Settings) -> int:
+    """Volatility window for ranking (5m bars): 72 = 6 h (default), 12 = 1 h reacts to what moves now."""
+    return int(getattr(cfg, "universe_atr_bars", ATR_BARS) or ATR_BARS)
+
+
+def _atr_fetch(cfg: Settings) -> int:
+    return _atr_bars(cfg) + 18          # ATR warm-up; stays < 100 bars (request weight 1)
+
+
+def _retention(cfg: Settings) -> float:
+    return float(getattr(cfg, "universe_retention", 1.5) or 1.5)
+
+
 def eligible(info: SymbolInfo, t: Ticker24h, prem: Premium | None, cfg: Settings, now_ms: int) -> bool:
     if info.status != "TRADING" or info.contract_type != "PERPETUAL" or info.quote_asset != "USDT":
         return False
@@ -44,10 +57,10 @@ def score(atr_pct_: float, quote_volume: float) -> float:
     return atr_pct_ * math.sqrt(quote_volume)
 
 
-def select(ranked: Sequence[str], current: Sequence[str], size: int) -> list[str]:
-    """Retention buffer: a member stays while it ranks within top ceil(1.5*size); free slots are
-    filled from the top of the ranking. Returned in rank order."""
-    keep_rank = math.ceil(1.5 * size)
+def select(ranked: Sequence[str], current: Sequence[str], size: int, retention: float = 1.5) -> list[str]:
+    """Retention buffer: a member stays while it ranks within top ceil(retention*size); free slots are
+    filled from the top of the ranking. retention=1.0 = no buffer (pure top-N). Returned in rank order."""
+    keep_rank = math.ceil(max(1.0, retention) * size)
     top_keep = set(ranked[:keep_rank])
     kept = [s for s in ranked if s in current and s in top_keep][:size]
     chosen = set(kept)
@@ -98,8 +111,8 @@ def _whitelist_rows(ex: Exchange, cfg: Settings, info: Mapping[str, SymbolInfo],
         t = tickers.get(s)
         atr = None
         try:
-            kl = ex.klines(s, "5m", ATR_FETCH)
-            atr = atr_pct(kl["high"].to_numpy(), kl["low"].to_numpy(), kl["close"].to_numpy(), ATR_BARS)
+            kl = ex.klines(s, "5m", _atr_fetch(cfg))
+            atr = atr_pct(kl["high"].to_numpy(), kl["low"].to_numpy(), kl["close"].to_numpy(), _atr_bars(cfg))
         except NetworkError as e:
             log.warning("universe: klines failed for %s: %s", s, e)
         vol = t.quote_volume if t else 0.0
@@ -145,19 +158,19 @@ def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float 
     pre = pre[:150]
     for c in pre:
         try:
-            kl = ex.klines(c.symbol, "5m", ATR_FETCH)
-            c.atr_pct = atr_pct(kl["high"].to_numpy(), kl["low"].to_numpy(), kl["close"].to_numpy(), ATR_BARS)
+            kl = ex.klines(c.symbol, "5m", _atr_fetch(cfg))
+            c.atr_pct = atr_pct(kl["high"].to_numpy(), kl["low"].to_numpy(), kl["close"].to_numpy(), _atr_bars(cfg))
         except NetworkError as e:
             log.warning("universe: klines failed for %s: %s", c.symbol, e)
     ranked = rank_candidates(pre)
     by = {c.symbol: c for c in ranked}
     order = [c.symbol for c in ranked]
-    chosen = select(order, list(current), cfg.universe_size)
+    chosen = select(order, list(current), cfg.universe_size, _retention(cfg))
     if venue_info is not None:
         tradable = venue_filter(order, venue_info)
         if dropped is not None:
             dropped.extend(s for s in chosen if s not in set(tradable))
-        chosen = select(tradable, [s for s in current if s in set(tradable)], cfg.universe_size)
+        chosen = select(tradable, [s for s in current if s in set(tradable)], cfg.universe_size, _retention(cfg))
     rows = []
     for rank, s in enumerate(chosen, 1):
         c = by[s]
