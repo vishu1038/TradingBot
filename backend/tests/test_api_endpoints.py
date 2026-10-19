@@ -10,7 +10,7 @@ from tb.store import Store
 STATUS_KEYS = {"mode", "running", "equity", "wallet_equity", "start_equity", "peak_equity", "cash", "realized_pnl", "unrealized_pnl",
                "drawdown_pct", "open_positions", "max_positions", "trades_today", "win_rate", "kill", "model",
                "universe_updated_at", "safety", "paused_symbols", "total_leverage", "max_total_leverage", "margin_ratio",
-               "max_margin_ratio", "open_risk_pct", "max_open_risk_pct", "models", "decisions", "maker", "xsec_legs"}
+               "max_margin_ratio", "open_risk_pct", "max_open_risk_pct", "models", "decisions", "maker", "xsec_legs", "dd_basis"}
 
 
 @pytest.fixture
@@ -77,7 +77,7 @@ def test_status_shape_and_values(env):
     st = c.get("/api/status").json()
     assert set(st) == STATUS_KEYS
     assert st["equity"] == 104.0 and st["peak_equity"] == 110.0 and st["running"] is True
-    assert st["drawdown_pct"] == pytest.approx((110 - 104) / 110 * 100)
+    assert st["dd_basis"] == "start" and st["drawdown_pct"] == 0.0   # 104 is above the 100 stake (peak 110 ignored)
     assert st["open_positions"] == 1 and st["max_positions"] == 5 and st["trades_today"] == 2
     assert st["realized_pnl"] == pytest.approx(5.0 - 10.0)        # sum of NET pnl
     assert st["win_rate"] == 0.5
@@ -154,7 +154,7 @@ def test_settings_get_put_merge(env):
     assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
                       "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
-                      "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
+                      "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
                           "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": False, "activate_r": 1.0, "distance_atr": 1.0}
     r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": True}, "short_enabled": True})

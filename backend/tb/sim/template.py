@@ -40,7 +40,8 @@ class SimConfig:
     slippage: float = 0.0002
     stop_slippage_extra: float = 0.0005   # same as labels' stop_slippage_pct
     mmr: float = 0.005                     # maintenance margin rate used for the liquidation price
-    kill_dd_pct: float = 50.0              # drawdown from peak that closes everything (>=100: off)
+    kill_dd_pct: float = 50.0              # drawdown that closes everything (>=100: off)
+    dd_basis: str = "start"                # drawdown vs the starting equity ("start", as live) or the peak ("peak")
     corr_max: float = 0.8
     corr_max_correlated: int = 2
     corr_window: int = 288                 # 24h of 5m bars

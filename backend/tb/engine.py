@@ -36,7 +36,7 @@ from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, nex
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
 from .exits import SETTINGS_SPEC, ExitSpec, exit_atr, resolve_exit
 from .exits import bind as bind_exit
-from .risk import (Book, atr14, check_entry, correlation_gate, derate_multiplier, drawdown_pct, kill_tripped, levels,
+from .risk import (Book, atr14, check_entry, correlation_gate, dd_reference, derate_multiplier, drawdown_pct, kill_tripped, levels,
                    maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit, trail_update)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
                      slippage_drift)
@@ -523,10 +523,14 @@ class Engine:
         except Exception:
             log.exception("persist failed")
 
+    def dd(self) -> float:
+        """Drawdown % used by the kill switch and derating, on the configured basis (stake or peak)."""
+        return drawdown_pct(self.equity, dd_reference(self.start_equity, self.peak_equity, self.cfg.dd_basis))
+
     def risk_multiplier(self) -> tuple[float, dict]:
         """derate x drift x slippage x staged-rollout multiplier (+ the parts, for logging)."""
         cfg = self.cfg
-        dd = drawdown_pct(self.equity, self.peak_equity)
+        dd = self.dd()
         derate = derate_multiplier(dd, cfg.kill_limit(self.mode))
         drift = self.drift_state.mult
         slip = 0.5 if self.slip_alarm else 1.0
@@ -1106,7 +1110,7 @@ class Engine:
         self.kill = {"tripped": True, "reason": reason, "t": int(self.clock())}
         log.error("KILL SWITCH: %s", reason)
         self.event("kill", {**self.kill, "dd_limit_pct": self.cfg.kill_limit(self.mode)})
-        self.alerts.kill(reason, self.equity, drawdown_pct(self.equity, self.peak_equity), self.mode)
+        self.alerts.kill(reason, self.equity, self.dd(), self.mode)
         self.persist_state(force=True)
         await self.close_all("kill")
         await self.io(self._refresh_account)
@@ -1225,8 +1229,9 @@ class Engine:
         await self.io(self._refresh_account)
         self.peak_equity = max(self.peak_equity, self.equity)
         limit = cfg.kill_limit(self.mode)
-        if not self.kill.get("tripped") and kill_tripped(self.equity, self.peak_equity, limit):
-            await self.trip_kill(f"drawdown {drawdown_pct(self.equity, self.peak_equity):.1f}% >= {limit:.0f}% of peak")
+        if not self.kill.get("tripped") and self.dd() >= limit:
+            await self.trip_kill(f"drawdown {self.dd():.1f}% >= {limit:.0f}% of "
+                                 f"{'starting stake' if cfg.dd_basis == 'start' else 'peak'}")
         self.stats["loops"] += 1
 
     async def sync_positions(self, marks: dict[str, float]) -> None:

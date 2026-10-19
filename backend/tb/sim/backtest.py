@@ -280,7 +280,8 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 continue
             scale = 1.0
             if cfg.derate_enabled and cfg.kill_dd_pct > 0:
-                dd = max(0.0, (peak - equity_now) / peak * 100.0) if peak > 0 else 0.0
+                ref = float(cfg.start_equity) if cfg.dd_basis == "start" else peak
+                dd = max(0.0, (ref - equity_now) / ref * 100.0) if ref > 0 else 0.0
                 scale = safety.derate_multiplier(dd, cfg.kill_dd_pct)
             dscale = drift.multiplier if drift is not None else 1.0
             scale_eff = scale * dscale
@@ -376,8 +377,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
         equity_now = wallet + sum(unreal(p) for p in real)
         if equity_now > peak:
             peak = equity_now
-        if (not killed and cfg.kill_dd_pct < 100 and peak > 0
-                and (peak - equity_now) / peak * 100.0 >= cfg.kill_dd_pct):
+        ref = float(cfg.start_equity) if cfg.dd_basis == "start" else peak
+        if (not killed and cfg.kill_dd_pct < 100 and ref > 0
+                and (ref - equity_now) / ref * 100.0 >= cfg.kill_dd_pct):
             killed = True
             kill_time = T0
             for p in real:

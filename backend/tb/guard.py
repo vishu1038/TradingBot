@@ -29,7 +29,7 @@ from . import capital as cap
 from .alerts import AlertDispatcher
 from .config import Settings, load_secrets, resolve_mode, trading_base_url, db_path, LiveNotAllowed
 from .exchange.base import Exchange, ExchangeError, order_side
-from .risk import derated_below_min_notional, drawdown_pct, positions_without_stop
+from .risk import dd_reference, derated_below_min_notional, drawdown_pct, positions_without_stop
 from .safety import DEGRADED, FLATTEN, HALTED, NORMAL, Debouncer
 
 log = logging.getLogger("tb.guard")
@@ -218,7 +218,8 @@ class Guard:
         # ---- drawdown vs kill limit
         limit = cfg.kill_limit(self.mode)
         if eq is not None and peak > 0:
-            dd = drawdown_pct(eq, peak)
+            start = float(self.store.kv_get("start_equity", 0.0) or 0.0)
+            dd = drawdown_pct(eq, dd_reference(start, peak, cfg.dd_basis))
             if dd >= limit:
                 desired = FLATTEN
                 self.flatten_reason = f"drawdown {dd:.1f}% >= kill limit {limit:.0f}%"

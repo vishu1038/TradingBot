@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, capital
 from .config import Settings, db_path, models_dir, resolve_mode, ui_dir
-from .risk import drawdown_pct
+from .risk import dd_reference, drawdown_pct
 from .safety import merged_safety
 from .scorer import scan_models
 from .shadow import Registry, shadow_stats, vs_champion
@@ -89,7 +89,8 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             "mode": mode, "running": bool(st.get("running", False)) and age is not None and age < ENGINE_ALIVE_S,
             "equity": equity, "wallet_equity": st.get("wallet_equity", equity), "start_equity": start, "peak_equity": peak, "cash": st.get("cash", equity),
             "realized_pnl": stats["net"], "unrealized_pnl": st.get("unrealized_pnl", 0.0),
-            "drawdown_pct": drawdown_pct(equity, peak), "open_positions": n_open,
+            "drawdown_pct": drawdown_pct(equity, dd_reference(start, peak, cfg.dd_basis)),
+            "dd_basis": cfg.dd_basis, "open_positions": n_open,
             "max_positions": st.get("max_positions", cfg.max_positions or 0), "trades_today": today["n"],
             "total_leverage": st.get("total_leverage", 0.0), "max_total_leverage": cfg.max_total_leverage,
             "margin_ratio": st.get("margin_ratio", 0.0), "max_margin_ratio": cfg.max_margin_ratio,

@@ -285,7 +285,7 @@ def test_drawdown_derating_halves_size(store, tmp_path):
     eng2, _ = mk_engine(store, tmp_path)
     store.execute("DELETE FROM positions")
     eng2.ex.pos.clear()
-    eng2.peak_equity = eng2.equity / 0.6                  # 40% drawdown vs the 50% paper kill limit -> x0.5
+    eng2.start_equity = eng2.peak_equity = eng2.equity / 0.6                  # 40% drawdown vs the 50% paper kill limit -> x0.5
     mult, parts = eng2.risk_multiplier()
     assert mult == pytest.approx(0.5) and parts["dd_pct"] == pytest.approx(40.0)
     open_long(eng2, "AAAUSDT")
@@ -298,7 +298,7 @@ def test_derated_trade_below_min_notional_is_skipped(store, tmp_path):
     eng.ex.exchange_info = lambda: {s: __import__("tb.exchange.base", fromlist=["SymbolInfo"]).SymbolInfo(
         s, filters=__import__("tb.exchange.base", fromlist=["SymbolFilters"]).SymbolFilters(0.01, 0.001, 0.001, 100.0))
         for s in data.marks}
-    eng.peak_equity = eng.equity / 0.6                    # x0.5 -> 80 notional < 100 minimum
+    eng.start_equity = eng.peak_equity = eng.equity / 0.6                    # x0.5 -> 80 notional < 100 minimum
     open_long(eng)
     assert store.get_positions() == []
 

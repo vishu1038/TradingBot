@@ -172,7 +172,7 @@ CONTRACT_KEYS = (
     "slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
     "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-    "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd",
+    "universe_size", "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
     "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
     "maker_reprices", "maker_on_timeout",
 )
@@ -200,6 +200,7 @@ class Settings:
     universe_size: int = 8
     universe_refresh_s: int = 3600
     kill_dd_pct: float = 50.0           # paper default; live is capped at LIVE_KILL_DD_PCT
+    dd_basis: str = "start"             # drawdown for kill/derating vs the starting stake ("start") or the high-water mark ("peak")
     fee_taker: float = 0.0005
     sound: bool = True
     capital_usd: float | None = 100.0   # bot stake in binance_demo/live (null = whole wallet); see tb.capital
@@ -310,6 +311,7 @@ class Settings:
         chk(0 < self.kill_dd_pct <= 100, "kill_dd_pct must be (0,100]")
         chk(0 <= self.fee_taker < 0.01, "fee_taker must be a fraction in [0, 0.01)")
         chk(self.paper_start_equity > 0, "paper_start_equity must be > 0")
+        chk(self.dd_basis in ("start", "peak"), "dd_basis must be 'start' or 'peak'")
         chk(self.capital_usd is None or self.capital_usd > 0, "capital_usd must be > 0 or null")
 
 

@@ -356,6 +356,16 @@ def kill_tripped(equity: float, peak: float, limit_pct: float) -> bool:
     return drawdown_pct(equity, peak) >= limit_pct
 
 
+def dd_reference(start: float, peak: float, basis: str = "start") -> float:
+    """Equity the drawdown is measured from: the starting stake (default) or the high-water mark.
+
+    "start" = loss of the user's money (kill at -25 % means 25 % of the stake is gone); "peak" also
+    counts giving back open/realised profit. Falls back to the peak when no start is known."""
+    if basis == "start" and start and start > 0:
+        return start
+    return peak
+
+
 # ----------------------------------------------------------------------------- correlation cap
 def return_corr(a: pd.Series, b: pd.Series, bars: int = 288, min_overlap: int = 100) -> float | None:
     """Correlation of 5m returns over the last ``bars`` aligned bars (index = open_time)."""
