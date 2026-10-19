@@ -69,7 +69,8 @@ def test_settings_merge_validation_and_api_shape():
                              "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
                              "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
                              "min_tp_usd", "min_sl_usd", "max_net_exposure_pct", "reversal_z", "reversal_lock_r",
-                             "reversal_block_bars", "mirror_enabled", "mirror_venue", "mirror_size"]
+                             "reversal_block_bars", "reverse_enabled", "reverse_min_prob_margin",
+                             "mirror_enabled", "mirror_venue", "mirror_size"]
     assert s.merge({"trail": {"enabled": False}}).trail.activate_r == 1.5
     for bad in ({"leverage": 0}, {"exit_mode": "x"}, {"prob_threshold_long": 1.5}, {"nope": 1}, {"trail": {"zzz": 1}},
                 {"leverage": "abc"}, {"slice_margin_usd": float("nan")}):

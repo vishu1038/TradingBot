@@ -159,7 +159,7 @@ def test_settings_get_put_merge(env):
                           "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
                           "mirror_enabled", "mirror_venue", "mirror_size",
                           "min_tp_usd", "min_sl_usd", "max_net_exposure_pct", "reversal_z", "reversal_lock_r",
-                          "reversal_block_bars"}
+                          "reversal_block_bars", "reverse_enabled", "reverse_min_prob_margin"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": True, "activate_r": 1.5, "distance_atr": 1.0}
     r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": False}, "short_enabled": True})
     assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is False

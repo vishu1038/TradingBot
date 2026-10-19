@@ -181,6 +181,7 @@ CONTRACT_KEYS = (
     "maker_reprices", "maker_on_timeout",
     "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
     "min_tp_usd", "min_sl_usd", "max_net_exposure_pct", "reversal_z", "reversal_lock_r", "reversal_block_bars",
+    "reverse_enabled", "reverse_min_prob_margin",
     "mirror_enabled", "mirror_venue", "mirror_size",
 )
 
@@ -241,6 +242,8 @@ class Settings:
     reversal_z: float = 2.5             # basket (universe / BTC) 15 min or 1 h move AGAINST the book's net side with z >= this: lock winners, block that side; 0 = off
     reversal_lock_r: float = 0.5        # only positions in profit >= this many initial risks get their stop tightened
     reversal_block_bars: int = 6        # no NEW entries on the hurt side for this many 5m bars after a reversal signal
+    reverse_enabled: bool = True        # an opposite-side signal on a held coin closes it (exit "reverse") and opens the new side
+    reverse_min_prob_margin: float = 0.0  # extra confidence over the new side's threshold required to reverse
     # ---- engine-internal (not part of the API contract; stored but not exposed)
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
@@ -342,6 +345,7 @@ class Settings:
         chk(self.reversal_z == 0 or 0.5 <= self.reversal_z <= 10, "reversal_z must be 0 (off) or 0.5..10")
         chk(0 <= self.reversal_lock_r <= 20, "reversal_lock_r must be 0..20")
         chk(0 <= self.reversal_block_bars <= 1000, "reversal_block_bars must be 0..1000")
+        chk(0 <= self.reverse_min_prob_margin <= 1, "reverse_min_prob_margin must be 0..1")
         chk(self.trail.activate_r > 0 and self.trail.distance_atr > 0, "trail values must be > 0")
         chk(0 <= self.prob_threshold_long <= 1, "prob_threshold_long must be 0..1")
         chk(0 <= self.prob_threshold_short <= 1, "prob_threshold_short must be 0..1")

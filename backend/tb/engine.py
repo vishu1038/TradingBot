@@ -1212,8 +1212,16 @@ class Engine:
                 log.info("skip %s %s: not TRADING on the order venue (%s)", side, sym, self.mode)
                 return False
             positions = self._db_positions()
-            if any(p["symbol"] == sym for p in positions):
-                return False
+            held = next((p for p in positions if p["symbol"] == sym), None)
+            if held is not None:
+                if held["side"] == side or not self._reverse_ok(side, prob):
+                    return False
+                # reversal (user 2026-10-19): the model now calls the other side; close with a normal order, then open the new
+                # side through every check below on the book without the old position. Blocked new side = stays flat.
+                log.info("reverse %s: %s -> %s (p=%.3f)", sym, held["side"], side, prob)
+                if not await self.close_position(held, "reverse"):
+                    return False
+                positions = self._db_positions()
             if cfg.max_positions is not None and len(positions) + len(self.pending) >= cfg.max_positions:
                 log.info("skip %s %s: blocked by max_positions=%d", side, sym, cfg.max_positions)
                 return False
@@ -1299,6 +1307,14 @@ class Engine:
             return 1.0
         v, p = self.vmarks.get(sym), self.marks.get(sym)
         return v / p if v and p else 1.0
+
+    def _reverse_ok(self, side: str, prob: float) -> bool:
+        """An opposite-side signal on a held coin may reverse it: enabled, and ``prob`` clears the new side's threshold plus
+        ``reverse_min_prob_margin``."""
+        if not getattr(self.cfg, "reverse_enabled", False):
+            return False
+        th_long, th_short = self.model_thresholds(self.model_info)
+        return prob >= (th_long if side == "long" else th_short) + float(getattr(self.cfg, "reverse_min_prob_margin", 0.0))
 
     def entry_allowed(self, sym: str | None = None) -> bool:
         if not self.running or self.kill.get("tripped"):
