@@ -46,9 +46,23 @@ class _Cond:
     qty: float
 
 
+@dataclass
+class _Lim:
+    id: str
+    symbol: str
+    side: str          # BUY | SELL (entry side)
+    qty: float
+    price: float
+    placed_ms: int
+    filled: float = 0.0
+    fee: float = 0.0
+    cancelled: bool = False
+
+
 class PaperExchange(Exchange):
     name = "paper"
     mode = "paper_local"
+    maker_fill_ratio = 1.0         # share of the remaining quantity filled per through-event (tests set < 1: partial fills)
 
     def __init__(self, data: Exchange, cfg: Settings, start_equity: float | None = None):
         self.data = data
@@ -59,6 +73,8 @@ class PaperExchange(Exchange):
         self.closes: dict[str, CloseInfo] = {}
         self.marks: dict[str, float] = {}
         self.leverage: dict[str, int] = {}
+        self.limits: dict[str, _Lim] = {}          # resting maker entries (not persisted: they die with the engine)
+        self.done_limits: dict[str, _Lim] = {}
         self._seq = 0
         self._slot = int(time.time() // FUNDING_PERIOD_S)
         self._lock = threading.RLock()
@@ -136,26 +152,112 @@ class PaperExchange(Exchange):
                 return OrderResult(self._id(), symbol, side, q, px, "FILLED", info.fees)
             if p and (p.side == "long") != (side == "BUY"):
                 raise ExchangeError("opposite position open (one-way mode)", code=-4061)
-            lev = self.leverage.get(symbol, self.cfg.leverage)
-            margin = q * px / lev
-            fee = q * px * self.cfg.fee_taker
-            used = sum(x.margin for x in self.pos.values())
-            if margin + fee > self.wallet - used:
-                raise ExchangeError("Margin is insufficient", code=-2019)
-            self.wallet -= fee
-            ps = "long" if side == "BUY" else "short"
-            if p:   # add to position: weighted entry
-                tot = p.qty + q
-                p.entry = (p.entry * p.qty + px * q) / tot
-                p.qty = tot
-                p.margin += margin
-                p.fees += fee
-                p.liq = liq_price(p.side, p.entry, p.leverage, self.cfg.maint_margin_rate)
-            else:
-                self.pos[symbol] = _Pos(symbol, ps, q, px, lev, margin,
-                                        liq_price(ps, px, lev, self.cfg.maint_margin_rate),
-                                        int(time.time() * 1000), fees=fee)
+            fee = self._open_fill(symbol, side, q, px, q * px * self.cfg.fee_taker)
             return OrderResult(self._id(), symbol, side, q, px, "FILLED", fee)
+
+    def _open_fill(self, symbol: str, side: str, q: float, px: float, fee: float) -> float:
+        """Add ``q`` at ``px`` to the (new or existing) position; margin and fee are checked and booked."""
+        p = self.pos.get(symbol)
+        lev = self.leverage.get(symbol, self.cfg.leverage)
+        margin = q * px / lev
+        used = sum(x.margin for x in self.pos.values())
+        if margin + fee > self.wallet - used:
+            raise ExchangeError("Margin is insufficient", code=-2019)
+        self.wallet -= fee
+        ps = "long" if side == "BUY" else "short"
+        if p:   # add to position: weighted entry
+            tot = p.qty + q
+            p.entry = (p.entry * p.qty + px * q) / tot
+            p.qty = tot
+            p.margin += margin
+            p.fees += fee
+            p.liq = liq_price(p.side, p.entry, p.leverage, self.cfg.maint_margin_rate)
+        else:
+            self.pos[symbol] = _Pos(symbol, ps, q, px, lev, margin,
+                                    liq_price(ps, px, lev, self.cfg.maint_margin_rate),
+                                    int(time.time() * 1000), fees=fee)
+        return fee
+
+    # ------------------------------------------------------------------ maker (post-only) limit entries
+    def best_bid_ask(self, symbol: str) -> tuple[float, float]:
+        try:
+            return self.data.best_bid_ask(symbol)               # prod order book: realistic spread
+        except ExchangeError:
+            m = self._price(symbol)
+            t = self.filters(symbol).tick_size
+            return m - t, m + t                                 # no book available: one tick either side of the mark
+
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
+                    reduce_only: bool = False) -> OrderResult:
+        """Resting limit entry. Conservative fill model: it fills only when the mark / a later candle trades
+        THROUGH the limit price (strictly), at the limit price, with the maker fee and no slippage; the fill
+        may be partial (``maker_fill_ratio`` of the remaining quantity per through-event)."""
+        side = side.upper()
+        if reduce_only:
+            raise ExchangeError("paper venue: reduce-only limit orders are not simulated")
+        with self._lock:
+            f = self.filters(symbol)
+            q = f.round_qty(qty)
+            px = f.round_price(price)
+            if q < f.min_qty or q <= 0:
+                raise ExchangeError(f"qty {qty} below min_qty {f.min_qty}", code=-4003)
+            p = self.pos.get(symbol)
+            if p and (p.side == "long") != (side == "BUY"):
+                raise ExchangeError("opposite position open (one-way mode)", code=-4061)
+            bid, ask = self.best_bid_ask(symbol)
+            if post_only and ((side == "BUY" and px >= ask) or (side == "SELL" and px <= bid)):
+                raise ExchangeError("Due to the order could not be executed as maker, the Post Only order will be "
+                                    "rejected.", code=-5022)
+            lev = self.leverage.get(symbol, self.cfg.leverage)
+            used = sum(x.margin for x in self.pos.values()) + sum(o.qty * o.price / lev for o in self.limits.values())
+            if q * px / lev + q * px * self.cfg.fee_maker > self.wallet - used:
+                raise ExchangeError("Margin is insufficient", code=-2019)
+            o = _Lim(self._id(), symbol, side, q, px, int(time.time() * 1000))
+            self.limits[o.id] = o
+            return self._lim_result(o)
+
+    def _lim_result(self, o: "_Lim") -> OrderResult:
+        status = "FILLED" if o.filled >= o.qty - 1e-12 else ("PARTIALLY_FILLED" if o.filled > 0 else "NEW")
+        if o.cancelled and status != "FILLED":
+            status = "CANCELED" if o.filled <= 0 else "PARTIALLY_FILLED"
+        return OrderResult(o.id, o.symbol, o.side, o.qty, o.price if o.filled > 0 else 0.0, status, o.fee, o.filled, o.price)
+
+    def get_order(self, symbol: str, order_id: str) -> OrderResult:
+        with self._lock:
+            o = self.limits.get(order_id) or self.done_limits.get(order_id)
+            if o is None:
+                raise ExchangeError("Order does not exist.", code=-2013)
+            return self._lim_result(o)
+
+    def _fill_limits(self, symbol: str, low: float, high: float, bar_open_ms: int | None = None) -> None:
+        """Fill resting limits that ``low``/``high`` traded strictly through (bars: only those opened after placement)."""
+        for o in [o for o in self.limits.values() if o.symbol == symbol]:
+            if bar_open_ms is not None and bar_open_ms <= o.placed_ms:
+                continue
+            through = low < o.price if o.side == "BUY" else high > o.price
+            if not through:
+                continue
+            remaining = o.qty - o.filled
+            q = remaining if self.maker_fill_ratio >= 1.0 else self.cfg_round(symbol, remaining * self.maker_fill_ratio)
+            if q <= 0:
+                continue
+            fee = q * o.price * self.cfg.fee_maker
+            try:
+                self._open_fill(symbol, o.side, q, o.price, fee)
+            except ExchangeError:
+                continue                                     # margin gone meanwhile: stays resting
+            o.filled += q
+            o.fee += fee
+            if o.filled >= o.qty - 1e-12:
+                self.limits.pop(o.id, None)
+                self.done_limits[o.id] = o
+
+    def cfg_round(self, symbol: str, qty: float) -> float:
+        return self.filters(symbol).round_qty(qty)
+
+    def pending_limits(self) -> list[str]:
+        with self._lock:
+            return list(self.limits)
 
     def _place_cond(self, kind: str, symbol: str, side: str, price: float, qty: float) -> str:
         with self._lock:
@@ -182,12 +284,23 @@ class PaperExchange(Exchange):
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         with self._lock:
+            o = self.limits.pop(order_id, None)
+            if o is not None:
+                o.cancelled = True
+                self.done_limits[o.id] = o
+                return
             self.conds.pop(order_id, None)
 
     def cancel_all(self, symbol: str) -> None:
         with self._lock:
             for k in [k for k, c in self.conds.items() if c.symbol == symbol]:
                 del self.conds[k]
+            for k in [k for k, o in self.limits.items() if o.symbol == symbol]:
+                self.cancel_order(symbol, k)
+
+    def open_entry_orders(self, symbol: str | None = None) -> list[tuple[str, str]]:
+        with self._lock:
+            return [(o.symbol, o.id) for o in self.limits.values() if symbol in (None, o.symbol)]
 
     def open_conditional_orders(self, symbol: str | None = None) -> list[ConditionalOrder]:
         with self._lock:
@@ -240,6 +353,8 @@ class PaperExchange(Exchange):
             for s, m in marks.items():
                 if m and m > 0:
                     self.marks[s] = float(m)
+                    if self.limits:
+                        self._fill_limits(s, float(m), float(m))
             for s in list(self.pos):
                 if s in marks and marks[s] > 0:
                     ev = self._eval(s, float(marks[s]))
@@ -251,6 +366,8 @@ class PaperExchange(Exchange):
         """Replay a completed candle's wicks (adverse extreme first = SL first). Only bars that
         started after the entry are considered, so pre-entry prices can never trigger a stop."""
         with self._lock:
+            if self.limits:
+                self._fill_limits(symbol, low, high, bar_open_ms)
             p = self.pos.get(symbol)
             if not p or bar_open_ms <= p.opened_ms:
                 return None

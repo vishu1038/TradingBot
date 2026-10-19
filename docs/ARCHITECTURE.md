@@ -190,6 +190,46 @@ Trade if `prob_long ≥ prob_threshold_long` (default 0.70) or, when `short_enab
 `prob_short ≥ prob_threshold_short` (default 0.80). Thresholds are configurable and the Lab
 reports which value is break-even after fees for the chosen exit mode.
 
+### V3 engine (docs/V3_EXPERIMENTS.md is the model-side contract)
+- **Scorer v2.** `Scorer.kind`, `Scorer.history_bars_5m`, `Scorer.score_universe(frames: {symbol: FrameBundle})`.
+  `FrameBundle(symbol, kl, metrics, funding, depth, btc_kl)` (aliases `klines`, `btc`) = closed 5m bars + derivative frames.
+  `scorer.load_model` dispatches on the artifact `kind`: `per_symbol_5m`/`mtf` -> `tb.model_np.load`, `gbm` ->
+  `tb.model_gbm.load`, `xsec` -> `tb.model_xsec.load`; an unknown kind, a missing module or a broken artifact is logged and
+  skipped. Classic per-symbol models are still scored through `score(symbol, window)` exactly as before.
+- **History.** The engine keeps `max(720, history_bars_5m of every loaded model (+ ATR-timeframe / vol-stop need))` 5m bars per
+  symbol: the first fetch takes 1500, then ONE older REST page (`endTime`) per symbol per bars cycle (max 3 symbols/cycle, none
+  while the minute's request weight > 1200) until enough; a young listing marks itself exhausted. Metrics / funding lookback
+  follows the same need (<= 28 days, incremental top-ups).
+- **Decision points / limits** (`entry_cfg` of the model, `Settings` defaults per key: `decision_every_bars`, `cooldown_bars`,
+  `max_trades_per_day`, `entry_mode`, `maker_timeout_s`, `maker_reprices`, `maker_on_timeout`): a model decides on the 5m bar that
+  closes on a multiple of `decision_every_bars` on the UTC grid (12 = every full hour); cooldown counts from the coin's last entry
+  or exit, max trades per UTC day counts entries (all coins). Restart-safe (seeded from the DB). Thresholds: classic models use the
+  Settings, V3 kinds use the artifact's `thresholds` (Settings if absent).
+- **Exits.** Only `exit_cfg.exit_mode = "pct"` (`tp_pct`/`sl_pct` in PERCENT, like `tb.labels`) or a non-5m `atr_tf` (Wilder ATR14
+  of UTC-aligned resampled bars) make the artifact drive the exits (`tb.exits`); classic `fixed`/`atr` on 5m stay the Settings
+  template. Sizing is still risk-capped (`sl_usd`) and every cap applies. xsec artifacts use `stop_vol_mult` x trailing-7d daily
+  vol (clipped `stop_min..stop_max`), stop only (legs close on the rebalance). Model-driven positions are not trailed.
+- **Maker entries** (`entry_mode: maker`). Post-only GTX LIMIT at the venue's best bid (long) / ask (short) (`/fapi/v1/ticker/bookTicker`);
+  -5022 (would take) re-prices; every `maker_timeout_s` the order is cancelled and re-posted, at most `maker_reprices` times; the
+  FIRST fill (partial or full) ends the attempt, the remainder is cancelled and the stop/TP are placed for exactly the filled
+  quantity only AFTER the fill (never an unprotected resting position; a fill that arrives when entries are no longer allowed is
+  closed at once). Nothing filled -> skip, or taker per `maker_on_timeout`. The order rests OUTSIDE the trade lock (kill / close_all /
+  stop checks keep running); the in-flight order is reserved against every cap and blocks a duplicate. Stale `tbm...` resting orders
+  are cancelled at engine start. Paper venue: fills only when the mark / a later bar trades strictly through the limit, at the limit,
+  maker fee, no slippage, optional partial fills. Shadow: the same conservative `tb.sim.execution.fill_order` the labels use.
+- **Shadow.** Every loaded model (any kind) is simulated at its own decision points with its own entry/exit config, gate and
+  execution model into `shadow_trades`; xsec challengers open/close legs on their rebalance (exit reason `rebalance`).
+  Champion = the existing promotion rule; "PAPER TEST ONLY" is refused in live for champions and challengers of every kind.
+- **xsec champion.** On each `rebalance_every_h` slot (UTC grid, executed within 15 min of the boundary, first sight waits for
+  the next boundary) the engine ranks the universe with `score_universe`, goes long the `top_k` highest `prob_long` and short the
+  `bottom_k` highest `prob_short` (shorts need `short_enabled`; `0/0` scores = not tradable), closes legs no longer targeted
+  (`exit_reason: rebalance`), keeps unchanged legs, opens new ones through `try_open(neutral=True)`: all caps, kill, guard state,
+  derating and the per-leg exchange stop apply, only the correlation cap does not. The leg book persists in kv `xsec_book`.
+- **Status.** `/api/status` adds `models[]` (name, kind, role, history, cadence, entry/exit mode, next_decision_t), `decisions`
+  (next decision time, trades today vs max, cadence, history ready), `maker` (entries, filled, partial, timeouts, gtx_rejects,
+  reprices, taker_fallback, skipped, aborted, fill_rate, in_flight), `xsec_legs`; `/api/shadow` rows add `kind`, `entry_mode`,
+  `loaded`. `/api/settings` adds the seven entry-control keys above. `exit_reason` may also be `rebalance`.
+
 ## Features contract (`backend/tb/features.py`, numpy/pandas only)
 ```python
 FEATURE_NAMES: list[str]                     # stable order, F ≈ 40

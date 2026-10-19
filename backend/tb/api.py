@@ -100,13 +100,28 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
                                          "threshold_long": cfg.prob_threshold_long,
                                          "threshold_short": cfg.prob_threshold_short},
             "universe_updated_at": st.get("universe_updated_at"),
+            # V3: loaded models (kind / role / cadence / next decision), the champion's entry limits, maker fill stats
+            "models": st.get("models") or [],
+            "decisions": st.get("decisions") or {"kind": None, "next_decision_t": None,
+                                                 "decision_every_bars": cfg.decision_every_bars,
+                                                 "cooldown_bars": cfg.cooldown_bars, "trades_today": today["n"],
+                                                 "max_trades_per_day": cfg.max_trades_per_day,
+                                                 "entry_mode": cfg.entry_mode, "history_bars_5m": None,
+                                                 "history_ready": 0},
+            "maker": st.get("maker") or {"entries": 0, "filled": 0, "partial": 0, "timeouts": 0, "gtx_rejects": 0,
+                                         "reprices": 0, "taker_fallback": 0, "skipped": 0, "aborted": 0,
+                                         "fill_rate": None, "in_flight": []},
+            "xsec_legs": st.get("xsec_legs") or {},
             "safety": safety,
             "paused_symbols": sorted(store.kv_get("paused_symbols", []) or []),
         }
 
     def build_shadow() -> list[dict]:
         reg = Registry.from_dict(store.kv_get("model_registry"))
-        entries = {e.name: e.status for e in scan_models(models_dir(), reg.overrides)}
+        scanned = scan_models(models_dir(), reg.overrides)
+        entries = {e.name: e.status for e in scanned}
+        metas = {e.name: e.meta for e in scanned}
+        loaded = {m.get("name"): m for m in (store.kv_get("status") or {}).get("models", [])}
         names = list(entries)
         for n in store.shadow_models():
             if n not in entries:
@@ -121,7 +136,11 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             if champ and n != champ and trades:
                 since = min(t["entry_time"] for t in trades)
                 vs = vs_champion(s, shadow_stats(store.get_shadow_trades(champ, since)))
-            out.append({"model": n, "status": entries[n], "n_trades": s["n_trades"], "win_rate": s["win_rate"],
+            meta = metas.get(n, {})
+            ld = loaded.get(n) or {}
+            out.append({"model": n, "status": entries[n], "kind": meta.get("kind") or "per_symbol_5m",
+                        "entry_mode": ld.get("entry_mode") or (meta.get("entry_cfg") or {}).get("entry_mode") or "taker",
+                        "loaded": n in loaded, "n_trades": s["n_trades"], "win_rate": s["win_rate"],
                         "expectancy": s["expectancy"], "pnl": s["pnl"], "vs_champion": vs})
         return out
 

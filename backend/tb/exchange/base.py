@@ -102,6 +102,13 @@ class OrderResult:
     avg_price: float = 0.0
     status: str = "NEW"
     fee: float = 0.0                # quote-currency fee for fills known at placement time (paper)
+    executed_qty: float | None = None   # limit orders: filled so far (None = ``qty`` is the executed quantity)
+    price: float = 0.0              # limit orders: the limit price
+
+    @property
+    def filled(self) -> float:
+        """Executed quantity (market orders report it in ``qty``; limit orders in ``executed_qty``)."""
+        return self.qty if self.executed_qty is None else self.executed_qty
 
 
 @dataclass
@@ -250,6 +257,25 @@ class Exchange(ABC):
     def leverage_brackets(self, symbol: str):
         """Maintenance-margin tiers (``tb.risk.Bracket`` list) for ``symbol``, or None when unavailable."""
         return None
+
+    # ---- maker (post-only) entries; optional capability, implemented by the Binance and paper venues
+    def best_bid_ask(self, symbol: str) -> tuple[float, float]:
+        """(best bid, best ask) of the venue's own order book."""
+        raise ExchangeError(f"{self.name} exchange has no best bid/ask support")
+
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
+                    reduce_only: bool = False) -> OrderResult:
+        """Resting LIMIT order; ``post_only`` = time-in-force GTX. A post-only order that would take liquidity is
+        rejected with ``ExchangeError(code=-5022)``. Returns immediately (status NEW / PARTIALLY_FILLED / FILLED)."""
+        raise ExchangeError(f"{self.name} exchange has no limit-order support")
+
+    def get_order(self, symbol: str, order_id: str) -> OrderResult:
+        """Current state of an order placed by ``limit_order`` (status, executed qty, average fill price)."""
+        raise ExchangeError(f"{self.name} exchange has no order lookup support")
+
+    def open_entry_orders(self, symbol: str | None = None) -> list[tuple[str, str]]:
+        """[(symbol, order_id)] of resting NON-conditional maker entries (stale ones left by a crashed engine)."""
+        return []
 
     # ---- helpers
     def filters(self, symbol: str) -> SymbolFilters:

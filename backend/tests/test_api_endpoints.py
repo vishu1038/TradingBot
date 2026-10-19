@@ -10,7 +10,7 @@ from tb.store import Store
 STATUS_KEYS = {"mode", "running", "equity", "wallet_equity", "start_equity", "peak_equity", "cash", "realized_pnl", "unrealized_pnl",
                "drawdown_pct", "open_positions", "max_positions", "trades_today", "win_rate", "kill", "model",
                "universe_updated_at", "safety", "paused_symbols", "total_leverage", "max_total_leverage", "margin_ratio",
-               "max_margin_ratio", "open_risk_pct", "max_open_risk_pct"}
+               "max_margin_ratio", "open_risk_pct", "max_open_risk_pct", "models", "decisions", "maker", "xsec_legs"}
 
 
 @pytest.fixture
@@ -154,7 +154,8 @@ def test_settings_get_put_merge(env):
     assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
                       "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
-                      "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd"}
+                      "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
+                          "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": False, "activate_r": 1.0, "distance_atr": 1.0}
     r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": True}, "short_enabled": True})
     assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is True
@@ -230,7 +231,7 @@ def test_shadow_endpoint(env, tmp_path, monkeypatch):
             s.add_shadow_trade({"model": m, "symbol": "A", "side": "long", "entry_time": t0 + i, "exit_time": t0 + i + 1,
                                 "entry_price": 1, "exit_price": 1, "qty": 1, "pnl": p, "exit_reason": "tp"})
     out = {r["model"]: r for r in c.get("/api/shadow").json()}
-    assert set(out["chal"]) == {"model", "status", "n_trades", "win_rate", "expectancy", "pnl", "vs_champion"}
+    assert set(out["chal"]) == {"model", "status", "kind", "entry_mode", "loaded", "n_trades", "win_rate", "expectancy", "pnl", "vs_champion"}
     assert out["champ"]["status"] == "champion" and out["champ"]["n_trades"] == 3 and out["champ"]["vs_champion"] is None
     assert out["chal"]["status"] == "challenger" and out["chal"]["n_trades"] == 4
     assert out["chal"]["expectancy"] == pytest.approx(0.75) and out["chal"]["vs_champion"] == pytest.approx(0.75 - 1.0 / 3)

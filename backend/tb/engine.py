@@ -21,6 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -31,12 +32,16 @@ from . import __version__
 from .alerts import AlertDispatcher
 from .config import (LiveNotAllowed, Settings, db_path, load_secrets, models_dir, resolve_mode, trading_base_url,
                      PROD_BASE)
+from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, next_decision_ms, next_rebalance_ms, rebalance_slot
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
+from .exits import SETTINGS_SPEC, ExitSpec, exit_atr, resolve_exit
+from .exits import bind as bind_exit
 from .risk import (Book, atr14, check_entry, correlation_gate, derate_multiplier, drawdown_pct, kill_tripped, levels,
                    maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit, trail_update)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
                      slippage_drift)
-from .scorer import NullScorer, ModelInfo, Scorer, is_paper_only, load_model, reasons_to_dicts, scan_models
+from .scorer import (KIND_PER_SYMBOL, FrameBundle, ModelInfo, NullScorer, Score, Scorer, is_paper_only, load_model,
+                     per_symbol_window, reasons_to_dicts, scan_models, score_frames)
 from .shadow import Registry, ShadowBook, promotion_check, shadow_stats
 from .store import Store
 from . import capital as cap
@@ -47,6 +52,11 @@ log = logging.getLogger("tb.engine")
 BAR_MS = 300_000
 CACHE_BARS = 760
 FIRST_FETCH = 720
+HISTORY_PAGE = 1500               # klines per REST page when backfilling history (weight 10)
+HISTORY_WEIGHT_CEILING = 1200     # no history page while the minute's used request weight is above this (limit 2400)
+HISTORY_PAGES_PER_CYCLE = 3       # at most this many symbols get a backfill page per bars_cycle
+MAKER_POLL_S = 1.0                # order-state poll while a post-only entry rests
+XSEC_FRESH_S = 900                # a rebalance slot is only executed within this long after its boundary
 SIGNAL_FRESH_MS = 90_000          # only trade a signal bar that closed < 90 s ago
 STOP_CHECK_LIVE_S = 15.0
 SYNC_LIVE_S = 5.0
@@ -54,6 +64,16 @@ DEPTH_MIN_AGE_S = 10.0            # per-symbol order-book refresh period (8 symb
 DEPTH_WEIGHT_CEILING = 1500       # skip depth fetches while the minute's used weight is above this (limit 2400)
 BRACKET_TTL_S = 3600.0
 TRAIL_MIN_STEP = 0.0005           # fraction of price a trailing stop must improve by before it is moved
+
+
+@dataclass
+class MakerFill:
+    """What an entry attempt ended with: ``qty`` filled at ``avg_price`` (``mode``: maker | taker fallback)."""
+    qty: float
+    avg_price: float
+    fee: float
+    opened_ts: int            # when the first order was placed (every fill of the attempt is at or after it)
+    mode: str = "maker"
 
 
 class DbLogHandler(logging.Handler):
@@ -90,20 +110,31 @@ class DerivFeed:
         self.metrics_at: dict[str, float] = {}
         self.funding_at: dict[str, float] = {}
 
-    def refresh(self, symbol: str) -> None:
+    def refresh(self, symbol: str, lookback_h: float = 26.0) -> None:
+        """Top up ``symbol``'s metrics / funding. ``lookback_h`` = how much derivative history the loaded models
+        need (hours; REST serves <= 29 days of metrics): the first fetch covers all of it, later ones only the
+        tail (overlapping the last 2 h so a late-published row is picked up)."""
         from .data import live
 
         now = int(time.time() * 1000)
+        lb_ms = int(max(26.0, lookback_h) * 3600_000)
         try:
-            m = live.fetch_metrics(symbol, now - 26 * 3600_000, now=now, pace=0.15)
+            have = self.metrics.get(symbol)
+            start = now - lb_ms
+            if have is not None and len(have) and int(have["create_time"].iloc[0]) <= now - lb_ms + 6 * 3600_000:
+                start = max(start, int(have["create_time"].iloc[-1]) - 2 * 3600_000)     # incremental top-up
+            m = live.fetch_metrics(symbol, start, now=now, pace=0.15 if lb_ms <= 48 * 3600_000 else 0.3)
             if len(m):
-                self.metrics[symbol] = m
+                if have is not None and len(have) and start > now - lb_ms:
+                    m = pd.concat([have[have["create_time"] < int(m["create_time"].iloc[0])], m], ignore_index=True)
+                self.metrics[symbol] = m[m["create_time"] >= now - lb_ms].drop_duplicates("create_time", keep="last") \
+                    .reset_index(drop=True)
         except Exception as e:
             log.warning("metrics top-up failed for %s: %s", symbol, e)
         self.metrics_at[symbol] = time.time()
         if time.time() - self.funding_at.get(symbol, 0) > 3600:
             try:
-                f = live.fetch_funding(symbol, now - 4 * 86_400_000, now)
+                f = live.fetch_funding(symbol, now - max(4 * 86_400_000, lb_ms + 2 * 86_400_000), now)
                 if len(f):
                     self.funding[symbol] = f
             except Exception as e:
@@ -178,6 +209,22 @@ class Engine:
         self.shadow = ShadowBook(self.cfg)
         self._models_sig: tuple | None = None
         self.stats = {"loops": 0, "errors": 0}
+        # V3: history, entry controls, maker entries, cross-sectional book
+        self.hist_need = FIRST_FETCH                           # 5m bars of history to keep per symbol
+        self.hist_done: set[str] = set()                       # symbols whose REST history is exhausted (new listings)
+        self.hist_warned: dict[str, float] = {}
+        self.live_gate = EntryGate()                           # cooldown / trades-per-day of the real account
+        self.shadow_gates: dict[str, EntryGate] = {}           # ... and of every shadow model
+        self.pending: dict[str, dict] = {}                     # symbol -> reservation of an in-flight maker entry
+        self.maker_poll_s = MAKER_POLL_S
+        self.maker_sleep: Callable = asyncio.sleep             # tests replace it with a no-op
+        self.maker_stats = {"entries": 0, "filled": 0, "partial": 0, "timeouts": 0, "gtx_rejects": 0, "reprices": 0,
+                            "taker_fallback": 0, "skipped": 0, "aborted": 0}
+        self.xsec_slots: dict[str, int] = {}                   # model -> last executed rebalance slot
+        self.xsec_book: dict[str, str] = {}                    # symbol -> side of the live cross-sectional legs
+        self.model_gaps: dict[str, float] = {}
+        self._spec_cache: dict[tuple, ExitSpec] = {}
+        self._backfill_budget = HISTORY_PAGES_PER_CYCLE
 
     # ================================================================== helpers
     async def io(self, fn: Callable, *a: Any, **kw: Any) -> Any:
@@ -219,7 +266,8 @@ class Engine:
                 raise RuntimeError("account is in hedge (dual-side) position mode; switch to one-way mode")
         # restore persisted state
         st = self.store.kv_get_many(["start_equity", "peak_equity", "kill", "running", "paper_state",
-                                     "shadow_open", "universe_at", "live_trades_opened"])
+                                     "shadow_open", "universe_at", "live_trades_opened", "xsec_book", "xsec_slots",
+                                     "maker_stats"])
         if self.paper:
             if st.get("paper_state"):
                 self.ex.import_state(st["paper_state"])
@@ -240,7 +288,14 @@ class Engine:
         if st.get("shadow_open"):
             self.shadow.import_state(st["shadow_open"])
         self.store.kv_set("start_equity", self.start_equity)
+        self.xsec_book = {str(k): str(v) for k, v in (st.get("xsec_book") or {}).items()}
+        self.xsec_slots = {str(k): int(v) for k, v in (st.get("xsec_slots") or {}).items()}
+        for k, v in (st.get("maker_stats") or {}).items():
+            if k in self.maker_stats:
+                self.maker_stats[k] = int(v)
         self.reload_models(force=True)
+        self.seed_live_gate()
+        self.cancel_stale_entries()
         # universe
         rows = self.store.get_universe()
         if rows:
@@ -288,7 +343,88 @@ class Engine:
                 got = load_model(e)
                 if got:
                     self.challengers[n] = got
-                    log.info("challenger model loaded (shadow mode): %s", n)
+                    log.info("challenger model loaded (shadow mode): %s kind=%s history=%s bars", n, got[1].kind,
+                             got[1].history_bars_5m or "default")
+        self.recompute_history_need()
+
+    # ---- V3 model properties
+    def all_models(self) -> list[tuple[str, Scorer, ModelInfo, bool]]:
+        """[(name, scorer, info, is_champion)] for the champion (when real) and every challenger."""
+        out: list[tuple[str, Scorer, ModelInfo, bool]] = []
+        if self.model_info and not isinstance(self.scorer, NullScorer):
+            out.append((self.model_info.name, self.scorer, self.model_info, True))
+        out += [(n, sc, info, False) for n, (sc, info) in self.challengers.items()]
+        return out
+
+    def model_spec(self, info: ModelInfo | None) -> ExitSpec:
+        """Exit template of a model: its ``exit_cfg`` for pct / non-5m-ATR exits, else the Settings exits."""
+        if info is None or not info.exit_cfg:
+            return SETTINGS_SPEC
+        key = (info.name, repr(sorted(info.exit_cfg.items(), key=lambda kv: kv[0])), info.kind)
+        got = self._spec_cache.get(key)
+        if got is None:
+            got = self._spec_cache[key] = resolve_exit(info.exit_cfg, info.kind, info.name)
+        return got
+
+    def model_entry(self, info: ModelInfo | None) -> EntryCfg:
+        return EntryCfg.resolve(self.cfg, info.entry_cfg if info else None)
+
+    def model_thresholds(self, info: ModelInfo | None) -> tuple[float, float]:
+        """(long, short) probability thresholds: the Settings for classic per-symbol models (as always), the
+        artifact's own ``thresholds`` for the V3 kinds (falling back to the Settings when it has none)."""
+        cfg = self.cfg
+        if info is None or info.kind == KIND_PER_SYMBOL:
+            return cfg.prob_threshold_long, cfg.prob_threshold_short
+        return (info.threshold_long if info.threshold_long is not None else cfg.prob_threshold_long,
+                info.threshold_short if info.threshold_short is not None else cfg.prob_threshold_short)
+
+    def recompute_history_need(self) -> None:
+        need = FIRST_FETCH
+        for _, _, info, _ in self.all_models():
+            need = max(need, int(info.history_bars_5m or 0) + self.model_spec(info).history_bars())
+        if need != self.hist_need:
+            log.info("5m history needed per symbol: %d bars (was %d)", need, self.hist_need)
+            self.hist_need = need
+
+    def deriv_lookback_h(self) -> float:
+        if self.hist_need <= FIRST_FETCH:
+            return 26.0
+        return min(max(26.0, self.hist_need * 5.0 / 60.0 + 2.0), 28 * 24.0)       # REST serves <= 29 days of metrics
+
+    def seed_live_gate(self) -> None:
+        """Cooldown / trades-per-day bookkeeping of the real account from the DB (restart-safe)."""
+        g = EntryGate()
+        d0 = day_start(self.clock()) - 2 * 86400
+        for r in self.store.query("SELECT symbol, opened_at, closed_at FROM trades WHERE closed_at>=?", (d0,)):
+            g.record_entry(r["symbol"], r["opened_at"])
+            g.record_exit(r["symbol"], r["closed_at"])
+        for p in self._db_positions():
+            g.record_entry(p["symbol"], p["opened_at"])
+        self.live_gate = g
+
+    def shadow_gate(self, name: str) -> EntryGate:
+        g = self.shadow_gates.get(name)
+        if g is None:
+            g = self.shadow_gates[name] = EntryGate()
+            d0 = day_start(self.clock()) - 2 * 86400
+            for t in self.store.get_shadow_trades(name, int(d0)):
+                g.record_entry(t["symbol"], t["entry_time"])
+                g.record_exit(t["symbol"], t["exit_time"])
+            for p in self.shadow.pos.values():
+                if p.model == name:
+                    g.record_entry(p.symbol, p.opened_at)
+        return g
+
+    def cancel_stale_entries(self) -> None:
+        """A resting maker entry left by a crashed / restarted engine could fill later with no stop: cancel it."""
+        if self.paper:
+            return
+        try:
+            for sym, oid in self.ex.open_entry_orders():
+                self.ex.cancel_order(sym, oid)
+                log.warning("cancelled a stale resting entry order %s on %s from before the restart", oid, sym)
+        except ExchangeError as e:
+            log.warning("could not check for stale entry orders: %s", e)
 
     def model_status_list(self) -> list[tuple[str, str]]:
         return [(e.name, e.status) for e in scan_models(self.models_path, self.registry.overrides)]
@@ -378,6 +514,9 @@ class Engine:
             self.store.kv_set("kill", self.kill)
             self.store.kv_set("running", self.running)
             self.store.kv_set("shadow_open", self.shadow.export_state())
+            self.store.kv_set("xsec_book", self.xsec_book)
+            self.store.kv_set("xsec_slots", self.xsec_slots)
+            self.store.kv_set("maker_stats", self.maker_stats)
         except Exception:
             log.exception("persist failed")
 
@@ -433,7 +572,7 @@ class Engine:
                 self._finalize(pos, info, info.reason)
         known = {p["symbol"] for p in self._db_positions()}
         for sym, xp in xpos.items():
-            if sym in known:
+            if sym in known or sym in self.pending:          # (a pending maker entry's fill is protected by its own flow)
                 continue
             log.error("reconcile: exchange position %s %s qty=%s has no record; adopting", sym, xp.side, xp.qty)
             orders = self.ex.open_conditional_orders(sym)
@@ -467,6 +606,8 @@ class Engine:
                  "funding": info.funding_cost, "exit_reason": reason, "prob": pos.get("prob")}
         tid = self.store.insert_trade(trade)
         self.store.delete_position(pos["id"])
+        self.live_gate.record_exit(pos["symbol"], t)
+        self.xsec_book.pop(pos["symbol"], None)
         self.event("position_closed", {**trade, "id": tid})
         log.info("closed %s %s %s: net pnl %+.3f (gross %+.3f, fees %.3f, funding cost %+.3f) %s", pos["symbol"], pos["side"],
                  pos["qty"], net, info.pnl, info.fees, info.funding_cost, reason)
@@ -531,18 +672,15 @@ class Engine:
         return n
 
     # ================================================================== opening
-    async def open_position(self, sym: str, side: str, sz, prob: float, reasons: list, atr: float | None,
-                            ref_price: float, mult: float) -> bool:
-        cfg = self.cfg
+    async def _prepare_symbol(self, sym: str, want_lev: int) -> int | None:
+        """Isolated margin + leverage before an entry (a lower leverage is always safer than the chosen one)."""
         ex = self.ex
-        osd = order_side(side)
-        lev = sz.leverage
         try:
             await self.io(ex.set_isolated, sym)
         except ExchangeError as e:
             log.error("cannot set isolated margin for %s: %s; skipping entry", sym, e)
-            return False
-        for attempt in (lev, max(1, lev // 2), 1):       # a lower leverage is always safer than the chosen one
+            return None
+        for attempt in (want_lev, max(1, want_lev // 2), 1):
             try:
                 await self.io(ex.set_leverage, sym, attempt)
                 lev = attempt
@@ -551,23 +689,76 @@ class Engine:
                 log.warning("set_leverage(%s, %dx) failed: %s", sym, attempt, e)
         else:
             log.error("cannot set leverage for %s; skipping entry", sym)
-            return False
-        if lev != sz.leverage:
-            log.warning("%s: leverage lowered from %dx to %dx", sym, sz.leverage, lev)
+            return None
+        if lev != want_lev:
+            log.warning("%s: leverage lowered from %dx to %dx", sym, want_lev, lev)
+        return lev
+
+    async def _flatten_fill(self, sym: str, side: str, qty: float, fill: float, prob: float | None) -> bool:
+        """Market-close an unprotected / unwanted fill and record the flat round trip (fees are real). True if flat."""
+        ex = self.ex
+        close_side = opposite(order_side(side))
         try:
-            res = await self.io(ex.market_order, sym, osd, sz.qty, False)
+            await self.io(ex.market_order, sym, close_side, qty, True)
+            await self.io(ex.cancel_all, sym)
         except ExchangeError as e:
-            log.error("entry order failed for %s: %s", sym, e)
+            log.error("EMERGENCY CLOSE of unprotected %s failed: %s", sym, e)
+            self.alerts.engine_error("emergency_close", f"{sym}: {e}")
+            self.kill = {"tripped": True, "reason": f"unprotected position {sym} could not be closed", "t": int(self.clock())}
             return False
-        fill = res.avg_price or ref_price
-        qty = res.qty or sz.qty
+        info = None
+        try:
+            info = await self.io(ex.last_close, sym, side, int(self.clock() * 1000) - 60_000)
+        except ExchangeError:
+            pass
+        if info:
+            t = int(self.clock())
+            self.store.insert_trade({"symbol": sym, "side": side, "entry_price": fill, "exit_price": info.exit_price,
+                                     "qty": qty, "opened_at": t, "closed_at": t, "pnl": info.net_pnl, "fees": info.fees,
+                                     "funding": info.funding_cost, "exit_reason": "manual", "prob": prob})
+        return True
+
+    async def open_position(self, sym: str, side: str, sz, prob: float, reasons: list, atr: float | None,
+                            ref_price: float, mult: float, *, spec: ExitSpec | None = None,
+                            fill: "MakerFill | None" = None, lev: int | None = None) -> bool:
+        """Enter (market order, or the already-filled ``fill`` of a maker entry), then place the exchange-side stop /
+        take-profit. The stop is placed only AFTER the fill; if that fails the position is closed at once."""
+        cfg = self.cfg
+        ex = self.ex
+        spec = spec or SETTINGS_SPEC
+        eff = spec.effective(cfg)
+        osd = order_side(side)
+        if fill is None:
+            lev = await self._prepare_symbol(sym, sz.leverage)
+            if lev is None:
+                return False
+            try:
+                res = await self.io(ex.market_order, sym, osd, sz.qty, False)
+            except ExchangeError as e:
+                log.error("entry order failed for %s: %s", sym, e)
+                return False
+            fill_px = res.avg_price or ref_price
+            qty = res.qty or sz.qty
+            entry_fee = res.fee or 0.0
+            opened_ts = int(self.clock())
+            via_maker = False
+        else:
+            lev = lev or sz.leverage
+            fill_px, qty, entry_fee, opened_ts = fill.avg_price, fill.qty, fill.fee, fill.opened_ts
+            via_maker = fill.mode == "maker"
+            if not self.entry_allowed(sym):          # kill / stop / degraded / paused while the order rested
+                log.warning("entry %s %s filled but entries are no longer allowed; closing the fill", side, sym)
+                await self._flatten_fill(sym, side, qty, fill_px, prob)
+                return False
         f = await self.io(ex.filters, sym)
-        lv = levels(cfg, side, fill, qty, atr, f, risk_mult=mult)
+        lv = levels(eff, side, fill_px, qty, spec.atr_arg(atr, fill_px), f, risk_mult=mult)
         close_side = opposite(osd)
         sl_id = tp_id = None
         sl = tp = None
         if lv is not None:
             sl, tp = lv
+            if not spec.tp_enabled:
+                tp = None
             if not self.paper:
                 # never send a stop computed from one price level that sits on the wrong side of the venue's mark
                 try:
@@ -578,7 +769,7 @@ class Engine:
                 if vm and (vm - sl) * d <= 0:
                     log.error("computed SL %s for %s is on the wrong side of the venue mark %s; closing the fill", sl, sym, vm)
                     lv = None
-                elif vm and (tp - vm) * d <= 0:
+                elif vm and tp is not None and (tp - vm) * d <= 0:
                     log.warning("computed TP %s for %s is already through the venue mark %s; no TP order, engine exits itself",
                                 tp, sym, vm)
         if lv is not None:
@@ -588,56 +779,179 @@ class Engine:
                 log.error("SL placement FAILED for %s (%s); closing the position at market", sym, e)
                 self.alerts.engine_error("sl_placement", f"{sym}: {e}")
         if sl_id is None:
-            try:
-                await self.io(ex.market_order, sym, close_side, qty, True)
-                await self.io(ex.cancel_all, sym)
-            except ExchangeError as e:
-                log.error("EMERGENCY CLOSE of unprotected %s failed: %s", sym, e)
-                self.alerts.engine_error("emergency_close", f"{sym}: {e}")
-                self.kill = {"tripped": True, "reason": f"unprotected position {sym} could not be closed", "t": int(self.clock())}
-            else:
-                # record the flat round trip so fees are not lost
-                info = None
-                try:
-                    info = await self.io(ex.last_close, sym, side, int(self.clock() * 1000) - 60_000)
-                except ExchangeError:
-                    pass
-                if info:
-                    t = int(self.clock())
-                    self.store.insert_trade({"symbol": sym, "side": side, "entry_price": fill, "exit_price": info.exit_price,
-                                             "qty": qty, "opened_at": t, "closed_at": t, "pnl": info.net_pnl, "fees": info.fees,
-                                             "funding": info.funding_cost, "exit_reason": "manual", "prob": prob})
+            await self._flatten_fill(sym, side, qty, fill_px, prob)
             return False
-        try:
-            tp_id = await self.io(ex.place_take_profit, sym, close_side, tp, qty)
-        except ExchangeError as e:
-            log.warning("TP placement failed for %s (%s); the engine will close at TP itself", sym, e)
-        pos = {"symbol": sym, "side": side, "entry_price": fill, "qty": qty, "notional": qty * fill,
-               "leverage": lev, "margin": qty * fill / lev, "sl_price": sl, "tp_price": tp,
-               "init_sl_price": sl, "atr": atr, "trail_active": False, "trail_price": None, "best_price": fill,
-               "mark_price": fill, "upnl": 0.0, "opened_at": int(self.clock()), "prob": prob,
-               "reasons": reasons, "sl_order_id": sl_id, "tp_order_id": tp_id, "entry_fee": res.fee or 0.0,
-               "funding": 0.0, "exit_mode": cfg.exit_mode,
+        if tp is not None:
+            try:
+                tp_id = await self.io(ex.place_take_profit, sym, close_side, tp, qty)
+            except ExchangeError as e:
+                log.warning("TP placement failed for %s (%s); the engine will close at TP itself", sym, e)
+        mode_label = cfg.exit_mode if spec.mode == "settings" else ("pct" if spec.mode == "pct" else f"atr:{spec.atr_tf}")
+        pos = {"symbol": sym, "side": side, "entry_price": fill_px, "qty": qty, "notional": qty * fill_px,
+               "leverage": lev, "margin": qty * fill_px / lev, "sl_price": sl, "tp_price": tp,
+               "init_sl_price": sl, "atr": atr, "trail_active": False, "trail_price": None, "best_price": fill_px,
+               "mark_price": fill_px, "upnl": 0.0, "opened_at": opened_ts, "prob": prob,
+               "reasons": reasons, "sl_order_id": sl_id, "tp_order_id": tp_id, "entry_fee": entry_fee,
+               "funding": 0.0, "exit_mode": mode_label,
                "liq_price": next((p.liq_price for p in await self.io(ex.positions) if p.symbol == sym), None)}
         pid = self.store.insert_position(pos)
-        slip_pct = (fill - ref_price) / ref_price * 100.0 * (1 if side == "long" else -1)
-        self.slips.append(slip_pct)
-        was = self.slip_alarm
-        self.slip_alarm = slippage_drift(list(self.slips), cfg.slippage_pct * 100.0, cfg.slippage_drift_mult)
-        if self.slip_alarm and not was:
-            msg = f"entry slippage drift: mean {np.mean(self.slips):.3f}% vs assumed {cfg.slippage_pct * 100:.3f}%"
-            log.warning(msg)
-            self.alerts.send(f"[{self.mode}] {msg}", dedupe_key="slipdrift")
-        elif was and not self.slip_alarm:
-            log.info("entry slippage back within %.1fx the assumption", cfg.slippage_drift_mult)
+        self.live_gate.record_entry(sym, opened_ts)
+        if not via_maker:        # (a maker fill is a price improvement, not a slippage sample)
+            slip_pct = (fill_px - ref_price) / ref_price * 100.0 * (1 if side == "long" else -1)
+            self.slips.append(slip_pct)
+            was = self.slip_alarm
+            self.slip_alarm = slippage_drift(list(self.slips), cfg.slippage_pct * 100.0, cfg.slippage_drift_mult)
+            if self.slip_alarm and not was:
+                msg = f"entry slippage drift: mean {np.mean(self.slips):.3f}% vs assumed {cfg.slippage_pct * 100:.3f}%"
+                log.warning(msg)
+                self.alerts.send(f"[{self.mode}] {msg}", dedupe_key="slipdrift")
+            elif was and not self.slip_alarm:
+                log.info("entry slippage back within %.1fx the assumption", cfg.slippage_drift_mult)
         if self.mode == "live":
             self.store.kv_set("live_trades_opened", int(self.store.kv_get("live_trades_opened", 0) or 0) + 1)
         self.event("position_opened", {**pos, "id": pid})
-        log.info("opened %s %s qty=%s @ %s SL %s TP %s prob=%.3f mult=%.2f", side, sym, qty, fill, sl, tp, prob, mult)
-        self.alerts.trade_opened(sym, side, fill, qty, qty * fill, sl, tp or 0.0, prob, self.mode)
+        log.info("opened %s %s qty=%s @ %s SL %s TP %s prob=%.3f mult=%.2f%s", side, sym, qty, fill_px, sl, tp, prob, mult,
+                 " (maker)" if via_maker else "")
+        self.alerts.trade_opened(sym, side, fill_px, qty, qty * fill_px, sl, tp or 0.0, prob, self.mode)
         self.persist_state(force=True)
         await self.io(self._refresh_account)
         return True
+
+    # ---- maker (post-only) entries
+    TERMINAL = ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH")
+
+    async def _settle_order(self, sym: str, oid: str, cur):
+        """Cancel a resting entry and return its FINAL state (a cancel can race a fill: the lookup decides)."""
+        ex = self.ex
+        try:
+            await self.io(ex.cancel_order, sym, oid)
+        except ExchangeError as e:
+            log.warning("cancel of entry order %s on %s failed: %s", oid, sym, e)
+        for i in range(3):
+            try:
+                return await self.io(ex.get_order, sym, oid)
+            except ExchangeError as e:
+                log.warning("entry order lookup %s on %s failed: %s", oid, sym, e)
+                await self.maker_sleep(0.3)
+        try:
+            await self.io(ex.cancel_all, sym)           # state unknown: make sure nothing keeps resting
+        except ExchangeError:
+            pass
+        return None
+
+    async def maker_fill(self, sym: str, side: str, sz, f, entry: EntryCfg, ref: float) -> "MakerFill | None":
+        """Rest a post-only (GTX) limit at the best bid (long) / ask (short); every ``maker_timeout_s`` re-price it
+        (cancel + repost at the new best) up to ``maker_reprices`` times. A rejection with -5022 (it would have taken
+        liquidity) just re-prices. The first fill ends the attempt: whatever filled (partial or full) is returned so its
+        stop is placed at once and the remainder is cancelled. Nothing filled -> taker order or skip per
+        ``maker_on_timeout``. Aborts (cancelling the order) as soon as entries stop being allowed."""
+        cfg = self.cfg
+        ex = self.ex
+        osd = order_side(side)
+        long = side == "long"
+        ms = self.maker_stats
+        ms["entries"] += 1
+        want = sz.qty
+        got_q = got_n = 0.0
+        t0 = int(self.clock())
+        polls = max(1, math.ceil(entry.maker_timeout_s / self.maker_poll_s))
+        oid: str | None = None
+        aborted = uncertain = False
+        try:
+            for attempt in range(entry.maker_reprices + 1):
+                if not self.entry_allowed(sym):
+                    aborted = True
+                    break
+                if attempt:
+                    ms["reprices"] += 1
+                try:
+                    bid, ask = await self.io(ex.best_bid_ask, sym)
+                except ExchangeError as e:
+                    log.warning("maker entry %s: no best bid/ask (%s)", sym, e)
+                    await self.maker_sleep(self.maker_poll_s)
+                    continue
+                px = f.round_price(bid if long else ask)
+                rq = f.round_qty(want - got_q)
+                if rq < f.min_qty or rq * px < f.min_notional:
+                    break
+                try:
+                    res = await self.io(ex.limit_order, sym, osd, rq, px, True)
+                except ExchangeError as e:
+                    if e.code == -5022:                    # post-only would have taken liquidity: the book moved
+                        ms["gtx_rejects"] += 1
+                        log.info("maker %s %s @ %s rejected (-5022, would take); re-pricing", side, sym, px)
+                        await self.maker_sleep(0.5)
+                        continue
+                    log.error("maker entry order for %s failed: %s", sym, e)
+                    break
+                oid = res.order_id
+                cur = res
+                for _ in range(polls):
+                    if cur.filled > 0 or cur.status in self.TERMINAL:
+                        break
+                    await self.maker_sleep(self.maker_poll_s)
+                    if not self.entry_allowed(sym):
+                        break
+                    try:
+                        cur = await self.io(ex.get_order, sym, oid)
+                    except ExchangeError as e:
+                        log.warning("entry order lookup %s on %s failed: %s", oid, sym, e)
+                if cur.status != "FILLED":
+                    cur = await self._settle_order(sym, oid, cur)
+                    if cur is None:
+                        uncertain = True
+                oid = None
+                if cur is not None:
+                    got_q += cur.filled
+                    got_n += cur.filled * (cur.avg_price or px)
+                    if cur.filled > 0:
+                        break                              # protect what filled; do not chase the remainder
+                elif uncertain:
+                    break
+                if not self.entry_allowed(sym):
+                    aborted = True
+                    break
+        except Exception:
+            log.exception("maker entry for %s failed unexpectedly", sym)
+            uncertain = True
+        finally:
+            if oid is not None:                            # an order may still rest: never leave it
+                try:
+                    await self.io(ex.cancel_all, sym)
+                except Exception:
+                    log.exception("could not cancel the resting entry order on %s", sym)
+        if got_q <= 0 and uncertain and not self.paper:     # order state unknown: the exchange position is the truth
+            try:
+                xp = next((p for p in await self.io(ex.positions) if p.symbol == sym and p.side == side), None)
+            except ExchangeError:
+                xp = None
+            if xp is not None and xp.qty > 0:
+                log.warning("maker entry %s: order state unknown but the exchange holds %s %s; protecting it", sym, xp.qty, side)
+                got_q, got_n = xp.qty, xp.qty * xp.entry_price
+        if got_q > 0:
+            ms["filled"] += 1
+            if got_q < want * 0.999:
+                ms["partial"] += 1
+            avg = got_n / got_q
+            return MakerFill(got_q, avg, got_q * avg * cfg.fee_maker, t0, "maker")
+        if aborted:
+            ms["aborted"] += 1
+            return None
+        ms["timeouts"] += 1
+        if entry.maker_on_timeout == "taker" and self.entry_allowed(sym):
+            try:
+                res = await self.io(ex.market_order, sym, osd, want, False)
+            except ExchangeError as e:
+                log.error("taker fallback for %s failed: %s", sym, e)
+                ms["skipped"] += 1
+                return None
+            ms["taker_fallback"] += 1
+            px = res.avg_price or ref
+            q = res.qty or want
+            return MakerFill(q, px, res.fee or q * px * cfg.fee_taker, t0, "taker")
+        ms["skipped"] += 1
+        log.info("maker entry %s %s: no fill after %d attempt(s); skipped", side, sym, entry.maker_reprices + 1)
+        return None
 
     async def get_brackets(self, sym: str):
         """Maintenance-margin tiers for ``sym`` (cached ~1 h). None = unknown -> ``cfg.maint_margin_rate`` is used."""
@@ -653,64 +967,102 @@ class Engine:
         return tiers
 
     def book(self) -> Book:
-        """Account aggregates over the open positions (cached brackets; no I/O)."""
+        """Account aggregates over the open positions AND the in-flight maker entries (cached brackets; no I/O)."""
         n = mm = risk = 0.0
         for p in self._db_positions():
             ent = self.brackets.get(p["symbol"])
             n += p["notional"]
             mm += maintenance_margin(p["notional"], ent[1] if ent else None, self.cfg.maint_margin_rate)
             risk += sl_loss(self.cfg, p["qty"], p["entry_price"], p["sl_price"], p["side"])
-        return Book(self.equity, self.available, n, mm, risk)
+        reserved = 0.0
+        for r in self.pending.values():          # a resting post-only entry already counts against every cap
+            n += r["notional"]
+            mm += r["mm"]
+            risk += r["risk"]
+            reserved += r["margin"]
+        return Book(self.equity, self.available - reserved, n, mm, risk)
 
-    async def try_open(self, sym: str, side: str, prob: float, reasons: list, closed: pd.DataFrame) -> None:
+    async def try_open(self, sym: str, side: str, prob: float, reasons: list, closed: pd.DataFrame, *,
+                       neutral: bool = False, spec: ExitSpec | None = None, entry: EntryCfg | None = None) -> bool:
+        """Size, check every cap and open ``sym``. ``neutral`` = a leg of a market-neutral book (the correlation cap is
+        not applied; all other caps are). ``spec`` / ``entry`` default to the champion's exit / entry template.
+        A maker entry waits for its fill OUTSIDE the trade lock (kill / close_all / stop checks keep running)."""
+        cfg = self.cfg
+        spec = spec or self.model_spec(self.model_info)
+        entry = entry or self.model_entry(self.model_info)
+        spec = bind_exit(spec, closed, self.now_ms())
+        if spec is None:
+            log.info("skip %s %s: not enough hourly history for the volatility-scaled stop", side, sym)
+            return False
         async with self.tlock:
-            cfg = self.cfg
-            if not self.entry_allowed(sym):
-                return
+            if not self.entry_allowed(sym) or sym in self.pending:
+                return False
             if not await self.io(self.venue_tradable, sym):
                 log.info("skip %s %s: not TRADING on the order venue (%s)", side, sym, self.mode)
-                return
+                return False
             positions = self._db_positions()
             if any(p["symbol"] == sym for p in positions):
-                return
-            if cfg.max_positions is not None and len(positions) >= cfg.max_positions:
+                return False
+            if cfg.max_positions is not None and len(positions) + len(self.pending) >= cfg.max_positions:
                 log.info("skip %s %s: blocked by max_positions=%d", side, sym, cfg.max_positions)
-                return
-            atr = atr14(closed["high"].to_numpy(), closed["low"].to_numpy(), closed["close"].to_numpy())
+                return False
+            atr = exit_atr(spec, closed, self.now_ms())
             ref = self.marks.get(sym) or float(closed["close"].iloc[-1])
             if not self.paper:
                 # size on the ORDER VENUE's price; scale the prod-derived ATR to the venue's price level
                 vref = self.vmarks.get(sym)
                 if not vref:
                     log.info("skip %s %s: no order-venue mark price yet", side, sym)
-                    return
+                    return False
                 atr = atr * vref / ref if atr else atr
                 ref = vref
-            # correlation cap
-            others = []
-            for p in positions:
-                k = self.kl.get(p["symbol"])
-                if k is not None:
-                    others.append((p["symbol"], p["side"], k.set_index("open_time")["close"]))
-            cand = closed.set_index("open_time")["close"]
-            ok, hot = correlation_gate(side, cand, others, cfg.corr_cap)
-            if not ok:
-                log.info("skip %s %s: correlated with %s", side, sym, hot)
-                return
+            # correlation cap (not inside a market-neutral book: its legs hedge each other)
+            if not neutral:
+                others = []
+                for p in positions:
+                    k = self.kl.get(p["symbol"])
+                    if k is not None:
+                        others.append((p["symbol"], p["side"], k.set_index("open_time")["close"]))
+                cand = closed.set_index("open_time")["close"]
+                ok, hot = correlation_gate(side, cand, others, cfg.corr_cap)
+                if not ok:
+                    log.info("skip %s %s: correlated with %s", side, sym, hot)
+                    return False
             mult, parts = self.risk_multiplier()
             f = await self.io(self.ex.filters, sym)
             brackets = await self.get_brackets(sym)
-            sz = size_trade(cfg, side, ref, atr, f, self.available, risk_mult=mult, brackets=brackets)
+            bk = self.book()
+            eff = spec.effective(cfg)
+            sz = size_trade(eff, side, ref, spec.atr_arg(atr, ref), f, bk.available, risk_mult=mult, brackets=brackets)
             if not sz.ok:
                 log.info("skip %s %s: %s (risk mult %.2f)", side, sym, sz.reason, mult)
-                return
+                return False
             fee = sz.notional * cfg.fee_taker
             new_risk = sl_loss(cfg, sz.qty, sz.entry, sz.sl_price, side, entry_fee=True)
-            chk = check_entry(cfg, self.book(), sz.notional, sz.mm, new_risk, sz.margin, fee)
+            chk = check_entry(cfg, bk, sz.notional, sz.mm, new_risk, sz.margin, fee)
             if not chk.ok:
                 log.info("skip %s %s: blocked by rule %s (%s)", side, sym, chk.rule, chk.detail)
-                return
-            await self.open_position(sym, side, sz, prob, reasons, atr, ref, mult)
+                return False
+            if entry.entry_mode != "maker":
+                return await self.open_position(sym, side, sz, prob, reasons, atr, ref, mult, spec=spec)
+            lev = await self._prepare_symbol(sym, sz.leverage)
+            if lev is None:
+                return False
+            self.pending[sym] = {"notional": sz.notional, "mm": sz.mm, "risk": new_risk, "margin": sz.margin, "side": side,
+                                 "t": self.clock()}
+        # ---- maker entry: post-only limit at the best bid / ask, outside the trade lock
+        fill = None
+        try:
+            fill = await self.maker_fill(sym, side, sz, f, entry, ref)
+        except Exception:
+            log.exception("maker entry %s %s failed", side, sym)
+        async with self.tlock:
+            try:
+                if fill is None:
+                    return False
+                return await self.open_position(sym, side, sz, prob, reasons, atr, ref, mult, spec=spec, fill=fill, lev=lev)
+            finally:
+                self.pending.pop(sym, None)
 
     def venue_tradable(self, sym: str) -> bool:
         """True when the symbol is TRADING on the order venue (always true for the paper venue = prod)."""
@@ -911,7 +1263,7 @@ class Engine:
             db = self._db_positions()
             known = {p["symbol"] for p in db}
             for sym, xp in xpos.items():
-                if sym not in known and not self.paper:
+                if sym not in known and not self.paper and sym not in self.pending:
                     log.error("untracked exchange position %s; reconciling", sym)
                     await self.io(self.reconcile_sync)
                     db = self._db_positions()
@@ -935,7 +1287,7 @@ class Engine:
                 await self.close_position({**pos, **upd}, "sl")
                 continue
             # trailing stop
-            if cfg.trail.enabled:
+            if cfg.trail.enabled and str(pos.get("exit_mode") or "") in ("fixed", "atr", ""):   # (model-driven exits: no trail)
                 a_prod = atr14(*self._hlc(sym))
                 atr = a_prod * self.venue_scale(sym) if a_prod else pos.get("atr")
                 active, new_sl = trail_update(pos["side"], pos["entry_price"], pos["init_sl_price"], pos["sl_price"], best,
@@ -993,6 +1345,7 @@ class Engine:
             except ExchangeError:
                 pass
         errs = 0
+        self._backfill_budget = HISTORY_PAGES_PER_CYCLE
         for sym in watch:
             try:
                 await self.update_symbol(sym)
@@ -1006,27 +1359,56 @@ class Engine:
                 log.exception("bar processing failed for %s", sym)
         if watch:
             self.faults.observe_exchange(errs >= max(1, len(watch) // 2))
+        try:
+            await self.universe_models_cycle()
+        except Exception:
+            self.stats["errors"] += 1
+            log.exception("cross-sectional cycle failed")
+
+    async def backfill_history(self, sym: str, merged: pd.DataFrame) -> pd.DataFrame:
+        """Prepend ONE page of older 5m bars (REST ``endTime`` paging) when the cache holds fewer bars than the
+        loaded models need. Budgeted: a few symbols per cycle and only while the minute's request weight is low."""
+        if self._backfill_budget <= 0 or getattr(self.data, "used_weight", 0) > HISTORY_WEIGHT_CEILING:
+            return merged
+        self._backfill_budget -= 1
+        missing = self.hist_need + 40 - len(merged)
+        n = int(min(HISTORY_PAGE, max(missing + 5, 100)))
+        first = int(merged["open_time"].iloc[0])
+        older = await self.io(self.data.klines, sym, "5m", n, None, first - 1)
+        older = older[older["open_time"] < first] if len(older) else older
+        if older.empty:
+            self.hist_done.add(sym)                      # (a young listing has no older bars)
+            log.info("%s: no older 5m history available (have %d bars)", sym, len(merged))
+            return merged
+        if len(older) < min(n, missing) * 0.5:
+            self.hist_done.add(sym)
+        return pd.concat([older, merged], ignore_index=True).drop_duplicates("open_time", keep="last") \
+            .sort_values("open_time").reset_index(drop=True)
 
     async def update_symbol(self, sym: str) -> None:
         cfg = self.cfg
         cache = self.kl.get(sym)
-        limit = FIRST_FETCH if cache is None else 6
+        first_n = int(min(HISTORY_PAGE, max(FIRST_FETCH, self.hist_need)))
+        limit = first_n if cache is None else 6
         df = await self.io(self.data.klines, sym, "5m", limit)
         if df.empty:
             return
         if cache is not None and int(df["open_time"].iloc[0]) > int(cache["open_time"].iloc[-1]) + BAR_MS:
-            df = await self.io(self.data.klines, sym, "5m", FIRST_FETCH)      # gap: refetch the whole window
+            df = await self.io(self.data.klines, sym, "5m", first_n)      # gap: refetch the whole window
             cache = None
         if cache is None:
             merged = df
         else:
             merged = pd.concat([cache[cache["open_time"] < df["open_time"].iloc[0]], df], ignore_index=True)
-        merged = merged.tail(CACHE_BARS).reset_index(drop=True)
+        cache_bars = max(CACHE_BARS, self.hist_need + 40)
+        if len(merged) < self.hist_need and sym not in self.hist_done:
+            merged = await self.backfill_history(sym, merged)
+        merged = merged.tail(cache_bars).reset_index(drop=True)
         self.kl[sym] = merged
         now_ms = self.now_ms()
         # candles -> store (+ live event)
         first = cache is None
-        rows = merged if first else merged.tail(3)
+        rows = merged.tail(1500) if first else merged.tail(3)
         self.store.upsert_candles(sym, "5m", [(r.open_time // 1000, r.open, r.high, r.low, r.close, r.volume)
                                               for r in rows.itertuples()])
         last = merged.iloc[-1]
@@ -1076,70 +1458,308 @@ class Engine:
         w = np.asarray(feats[-features.WINDOW:], dtype="float32")
         return np.nan_to_num(w)
 
+    # ---- model scoring (any kind)
+    def bundle_for(self, sym: str, closed: pd.DataFrame) -> FrameBundle:
+        """The ``FrameBundle`` (scorer interface v2) for ``sym``: closed 5m bars + derivatives (+ depth when a model uses it)."""
+        btc = self.kl.get("BTCUSDT")
+        btc_closed = btc[btc["open_time"] + BAR_MS <= self.now_ms()] if btc is not None else closed
+        depth = None
+        if any("depth" in (info.meta.get("feature_groups") or ()) for _, _, info, _ in self.all_models()):
+            try:
+                from . import orderbook as ob
+
+                depth = ob.depth_frame(sym, self.store)
+            except Exception:
+                depth = None
+        return FrameBundle(sym, closed.reset_index(drop=True), self.feed.metrics.get(sym), self.feed.funding.get(sym), depth,
+                           btc_closed.reset_index(drop=True))
+
+    def _model_error(self, name: str, what: str) -> None:
+        """One model failing must never take the engine (or the other models) down: log, count, rate-limit."""
+        self.stats["errors"] += 1
+        if self.clock() - self.model_gaps.get(name, -1e9) > 600:
+            self.model_gaps[name] = self.clock()
+            log.exception("model %s failed (%s); skipped for this bar", name, what)
+
+    async def score_one(self, scorer: Scorer, info: ModelInfo | None, sym: str, closed: pd.DataFrame,
+                        cache: dict) -> Score | None:
+        """One model's Score for ``sym`` on its newest closed bar; None = not enough history / unusable inputs / model error.
+        The classic per-symbol 5m path builds the ``[T, F]`` window once per bar (``cache``) and calls ``score`` exactly
+        as before; the V3 kinds go through ``score_frames`` (``score_universe`` / ``build_for_model``)."""
+        kind = info.kind if info else KIND_PER_SYMBOL
+        name = info.name if info else getattr(scorer, "name", "?")
+        try:
+            if kind == KIND_PER_SYMBOL:
+                if "window" not in cache:
+                    cache["window"] = await self.io(self.build_window, sym, closed)
+                w = cache["window"]
+                return None if w is None else await self.io(scorer.score, sym, w)
+            if kind == "xsec":
+                return None                                   # ranks the whole universe at once: see universe_models_cycle
+            need = int(info.history_bars_5m or 0) if info else 0
+            if need and len(closed) < need:
+                if self.clock() - self.hist_warned.get(f"{name}|{sym}", -1e9) > 1800:
+                    self.hist_warned[f"{name}|{sym}"] = self.clock()
+                    log.info("model %s: %s has %d of the %d 5m bars it needs (history is still loading)", name, sym,
+                             len(closed), need)
+                return None
+            res = await self.io(score_frames, scorer, info, {sym: self.bundle_for(sym, closed)})
+            return res.get(sym)
+        except Exception:
+            self._model_error(name, f"{kind} score {sym}")
+            return None
+
+    def pick_side(self, sc: Score | None, info: ModelInfo | None) -> tuple[str | None, float]:
+        """('long'|'short'|None, prob) for a Score under the model's thresholds (long wins a tie; shorts need short_enabled)."""
+        if sc is None:
+            return None, 0.0
+        tl, ts = self.model_thresholds(info)
+        pl, ps = float(sc.prob_long), float(sc.prob_short)
+        cand_l = pl >= tl
+        cand_s = self.cfg.short_enabled and ps >= ts
+        if cand_l and (not cand_s or pl >= ps):
+            return "long", pl
+        if cand_s:
+            return "short", ps
+        return None, 0.0
+
     async def on_new_bar(self, sym: str, closed: pd.DataFrame, fresh: bool) -> None:
         cfg = self.cfg
         bar = closed.iloc[-1]
-        # paper: replay the completed bar's wicks against simulated stops, shadow too
-        if self.paper and any(p["symbol"] == sym for p in self._db_positions()):
+        # paper: replay the completed bar's wicks against simulated stops / resting maker entries, shadow too
+        if self.paper and (sym in self.pending or any(p["symbol"] == sym for p in self._db_positions())):
             self.ex.check_range(sym, float(bar.low), float(bar.high), int(bar.open_time))
-        if self.shadow.pos:
-            for tr in self.shadow.on_bar(sym, int(bar.open_time), float(bar.low), float(bar.high), self.clock()):
+        if self.shadow.pos or self.shadow.pending:
+            for tr in self.shadow.on_bar(sym, int(bar.open_time), float(bar.low), float(bar.high), self.clock(), frame=closed):
                 self._record_shadow(tr)
         if sym not in self.trade_symbols():
             return
+        info = self.model_info
         active = not isinstance(self.scorer, NullScorer)
+        ent = self.model_entry(info)
+        xsec_champ = active and info is not None and info.kind == "xsec"
+        decision = is_decision_bar(int(bar.open_time), ent.decision_every_bars)
+        cache: dict = {}
+        sc: Score | None = None
         prob_l = prob_s = 0.0
         reasons: list = []
-        window = None
-        if active or self.challengers:
-            window = await self.io(self.build_window, sym, closed)
-        if window is not None and active:
-            sc = await self.io(self.scorer.score, sym, window)
-            prob_l, prob_s, reasons = float(sc.prob_long), float(sc.prob_short), reasons_to_dicts(sc.reasons)
-        action = "none"
-        cand_l = prob_l >= cfg.prob_threshold_long
-        cand_s = cfg.short_enabled and prob_s >= cfg.prob_threshold_short
-        if cand_l and (not cand_s or prob_l >= prob_s):
-            action = "long"
-        elif cand_s:
-            action = "short"
-        t = int(bar.open_time // 1000) + 300
-        self.store.add_signal(t, sym, prob_l, prob_s, action, reasons)
-        self.event("signal", {"t": t, "symbol": sym, "prob_long": prob_l, "prob_short": prob_s, "action": action,
-                              "reasons": reasons})
-        # shadow mode: every model (champion + challengers) takes its would-be trades
-        if window is not None and self.challengers:
-            await self.shadow_signals(sym, closed, window, prob_l, prob_s)
+        if active and decision and not xsec_champ:
+            sc = await self.score_one(self.scorer, info, sym, closed, cache)
+            if sc is not None:
+                prob_l, prob_s, reasons = float(sc.prob_long), float(sc.prob_short), reasons_to_dicts(sc.reasons)
+        action, prob = self.pick_side(sc, info)
+        action = action or "none"
+        if not active or (decision and not xsec_champ):          # (cadence > 1: signals only at decision points)
+            t = int(bar.open_time // 1000) + 300
+            self.store.add_signal(t, sym, prob_l, prob_s, action, reasons)
+            self.event("signal", {"t": t, "symbol": sym, "prob_long": prob_l, "prob_short": prob_s, "action": action,
+                                  "reasons": reasons})
+        # shadow mode: every model (champion + challengers) takes its would-be trades with its own entry / exit template
+        if self.challengers:
+            await self.shadow_signals(sym, closed, bar, cache, sc if (active and decision and not xsec_champ) else None)
         if action != "none":
             if fresh:
-                await self.try_open(sym, action, prob_l if action == "long" else prob_s, reasons, closed)
+                ok, why = self.live_gate.check(sym, self.clock(), ent)
+                if ok:
+                    await self.try_open(sym, action, prob, reasons, closed)
+                else:
+                    log.info("signal %s %s skipped: %s", action, sym, why)
             else:
                 log.info("signal %s %s ignored: bar not fresh", action, sym)
 
-    async def shadow_signals(self, sym: str, closed: pd.DataFrame, window: np.ndarray, champ_l: float, champ_s: float) -> None:
+    async def shadow_signals(self, sym: str, closed: pd.DataFrame, bar, cache: dict, champ_sc: Score | None) -> None:
         cfg = self.cfg
         f = await self.io(self.ex.filters, sym)
-        atr = atr14(closed["high"].to_numpy(), closed["low"].to_numpy(), closed["close"].to_numpy())
         price = self.marks.get(sym) or float(closed["close"].iloc[-1])
-        models: list[tuple[str, float, float]] = []
+        now = self.clock()
+        models: list[tuple[str, ModelInfo | None, Score | None, EntryCfg]] = []
         if self.model_info:
-            models.append((self.model_info.name, champ_l, champ_s))
-        for name, (sc, _) in self.challengers.items():
-            s = await self.io(sc.score, sym, window)
-            models.append((name, float(s.prob_long), float(s.prob_short)))
-        for name, pl, ps in models:
-            side = None
-            if pl >= cfg.prob_threshold_long and (not (cfg.short_enabled and ps >= cfg.prob_threshold_short) or pl >= ps):
-                side, prob = "long", pl
-            elif cfg.short_enabled and ps >= cfg.prob_threshold_short:
-                side, prob = "short", ps
-            if side:
-                self.shadow.open(name, sym, side, prob, price, self.clock(), atr, f)
+            models.append((self.model_info.name, self.model_info, champ_sc, self.model_entry(self.model_info)))
+        for name, (sc_obj, info) in self.challengers.items():
+            if info.kind == "xsec":
+                continue                                       # rebalanced in universe_models_cycle
+            ent = self.model_entry(info)
+            if not is_decision_bar(int(bar.open_time), ent.decision_every_bars):
+                continue
+            models.append((name, info, await self.score_one(sc_obj, info, sym, closed, cache), ent))
+        for name, info, sc, ent in models:
+            side, prob = self.pick_side(sc, info)
+            if not side:
+                continue
+            gate = self.shadow_gate(name)
+            ok, _ = gate.check(sym, now, ent)
+            if not ok or self.shadow.has(name, sym):
+                continue
+            spec = bind_exit(self.model_spec(info), closed, self.now_ms())
+            if spec is None:
+                continue
+            atr = exit_atr(spec, closed, self.now_ms())
+            maker = ent.entry_mode == "maker"
+            if self.shadow.open(name, sym, side, prob, float(closed["close"].iloc[-1]) if maker else price, now, atr, f,
+                                spec=spec, entry=ent, decision_open_ms=int(bar.open_time)):
+                gate.record_entry(sym, now)
 
     def _record_shadow(self, tr: dict) -> None:
         self.store.add_shadow_trade(tr)
+        self.shadow_gate(tr["model"]).record_exit(tr["symbol"], tr["exit_time"])
         self.event("shadow_trade", tr)
         log.info("shadow %s %s %s pnl %+.3f (%s)", tr["model"], tr["side"], tr["symbol"], tr["pnl"], tr["exit_reason"])
+
+    # ================================================================== cross-sectional (xsec) models
+    @staticmethod
+    def xsec_targets(scores: dict[str, Score], xc: XsecCfg, short_enabled: bool) -> dict[str, str]:
+        """Target legs from a ranking: the ``top_k`` highest ``prob_long`` go long, of the rest the ``bottom_k`` highest
+        ``prob_short`` go short (only with ``short_enabled``). Ties break by symbol name (deterministic)."""
+        ok = {s: sc for s, sc in scores.items() if math.isfinite(float(sc.prob_long)) and math.isfinite(float(sc.prob_short))
+              and (float(sc.prob_long) > 0 or float(sc.prob_short) > 0)}      # (0 / 0 = not tradable for the ranker)
+        longs = sorted(ok, key=lambda s: (-float(ok[s].prob_long), s))[:xc.top_k]
+        out = {s: "long" for s in longs}
+        if short_enabled:
+            rest = [s for s in ok if s not in out]
+            out.update({s: "short" for s in sorted(rest, key=lambda s: (-float(ok[s].prob_short), s))[:xc.bottom_k]})
+        return out
+
+    def universe_frames(self, info: ModelInfo, boundary_ms: int) -> dict[str, FrameBundle]:
+        """Bundles of the universe symbols whose newest closed bar is at/after ``boundary_ms`` and long enough."""
+        out: dict[str, FrameBundle] = {}
+        now_ms = self.now_ms()
+        for sym in dict.fromkeys([*self.universe, "BTCUSDT"]):          # (BTC: the market reference of the ranker)
+            k = self.kl.get(sym)
+            if k is None or self.faults.excluded(sym):
+                continue
+            closed = k[k["open_time"] + BAR_MS <= now_ms]
+            if closed.empty or int(closed["open_time"].iloc[-1]) + BAR_MS < boundary_ms:
+                continue
+            if info.history_bars_5m and len(closed) < info.history_bars_5m:
+                continue
+            out[sym] = self.bundle_for(sym, closed)
+        return out
+
+    async def universe_models_cycle(self) -> None:
+        """Rebalance every cross-sectional model (champion for real, challengers in shadow) at its slot boundary."""
+        for name, scorer, info, is_champ in self.all_models():
+            if info.kind != "xsec":
+                continue
+            try:
+                await self.xsec_rebalance(name, scorer, info, is_champ)
+            except RateLimitError:
+                raise
+            except Exception:
+                self._model_error(name, "xsec rebalance")
+
+    async def xsec_rebalance(self, name: str, scorer: Scorer, info: ModelInfo, is_champ: bool) -> None:
+        xc = XsecCfg.resolve(info.entry_cfg, info.meta)
+        now_ms = self.now_ms()
+        slot = rebalance_slot(now_ms, xc.rebalance_every_h)
+        last = self.xsec_slots.get(name)
+        if last is None:                 # first time this model is seen: wait for the next boundary
+            self.xsec_slots[name] = slot
+            log.info("xsec model %s: first rebalance at slot boundary in %.0f min", name,
+                     (next_rebalance_ms(now_ms, xc.rebalance_every_h) - now_ms) / 60000)
+            return
+        if slot <= last or not self.universe:
+            return
+        boundary_ms = slot * xc.rebalance_every_h * 3_600_000
+        if now_ms - boundary_ms > XSEC_FRESH_S * 1000:
+            self.xsec_slots[name] = slot
+            log.warning("xsec model %s: missed the rebalance at slot %d (inputs not ready within %d s)", name, slot,
+                        XSEC_FRESH_S)
+            return
+        frames = self.universe_frames(info, boundary_ms)
+        if sum(1 for s in frames if s in self.universe) < max(2, math.ceil(0.8 * len(self.universe))):
+            return                        # bars still arriving: retried on the next bars cycle until the slot goes stale
+        self.xsec_slots[name] = slot
+        scores = await self.io(score_frames, scorer, info, frames)
+        scores = {s: sc for s, sc in scores.items() if s in self.universe and s in frames}
+        targets = self.xsec_targets(scores, xc, self.cfg.short_enabled)
+        t_dec = boundary_ms // 1000
+        if is_champ:
+            for s, sc in scores.items():
+                self.store.add_signal(t_dec, s, float(sc.prob_long), float(sc.prob_short), targets.get(s, "none"),
+                                      reasons_to_dicts(sc.reasons))
+        log.info("xsec %s rebalance %s: long %s | short %s", name, "LIVE" if is_champ else "shadow",
+                 [s for s, v in targets.items() if v == "long"], [s for s, v in targets.items() if v == "short"])
+        if is_champ:
+            await self.xsec_execute(info, frames, scores, targets)
+        else:
+            await self.xsec_shadow(name, info, frames, scores, targets)
+        self.persist_state(force=True)
+
+    async def xsec_execute(self, info: ModelInfo, frames: dict[str, FrameBundle], scores: dict[str, Score],
+                           targets: dict[str, str]) -> None:
+        """Move the real book to the target legs: close legs no longer targeted, open the new ones under ALL the usual
+        caps (open-risk, total leverage, margin ratio, free margin, kill, safety state, derating); each leg gets its
+        exchange-side stop. The correlation cap is not applied inside the neutral book."""
+        if not self.running or self.kill.get("tripped"):
+            log.warning("xsec rebalance skipped: engine stopped or kill switch tripped")
+            return
+        spec = self.model_spec(info)
+        ent = self.model_entry(info)
+        gate_cfg = replace(ent, cooldown_bars=0)
+        async with self.tlock:
+            for sym in list(self.xsec_book):
+                pos = next((p for p in self._db_positions() if p["symbol"] == sym), None)
+                if pos is None:
+                    self.xsec_book.pop(sym, None)
+                elif targets.get(sym) != pos["side"]:
+                    log.info("xsec: closing %s %s (no longer targeted)", pos["side"], sym)
+                    await self.close_position(pos, "rebalance")
+        longs = [s for s, v in targets.items() if v == "long"]
+        shorts = [s for s, v in targets.items() if v == "short"]
+        legs: list[tuple[str, str]] = []
+        for i in range(max(len(longs), len(shorts))):          # alternate so a binding cap cannot starve one side
+            if i < len(longs):
+                legs.append((longs[i], "long"))
+            if i < len(shorts):
+                legs.append((shorts[i], "short"))
+        for sym, side in legs:
+            if self.xsec_book.get(sym) == side:
+                continue
+            if any(p["symbol"] == sym for p in self._db_positions()):
+                log.info("xsec: %s already has a position outside the book; leg skipped", sym)
+                continue
+            ok, why = self.live_gate.check(sym, self.clock(), gate_cfg)
+            if not ok:
+                log.info("xsec: leg %s %s skipped: %s", side, sym, why)
+                continue
+            sc = scores[sym]
+            prob = float(sc.prob_long if side == "long" else sc.prob_short)
+            if await self.try_open(sym, side, prob, reasons_to_dicts(sc.reasons), frames[sym].kl, neutral=True, spec=spec,
+                                   entry=ent):
+                self.xsec_book[sym] = side
+        self.store.kv_set("xsec_book", self.xsec_book)
+
+    async def xsec_shadow(self, name: str, info: ModelInfo, frames: dict[str, FrameBundle], scores: dict[str, Score],
+                          targets: dict[str, str]) -> None:
+        spec = self.model_spec(info)
+        ent = self.model_entry(info)
+        gate = self.shadow_gate(name)
+        now = self.clock()
+        for key, p in [(k, p) for k, p in self.shadow.pos.items() if p.model == name]:
+            if targets.get(p.symbol) != p.side:
+                px = self.marks.get(p.symbol) or (float(frames[p.symbol].kl["close"].iloc[-1]) if p.symbol in frames else p.entry)
+                tr = self.shadow.close_leg(name, p.symbol, px, now, "rebalance")
+                if tr:
+                    self._record_shadow(tr)
+        for sym, side in targets.items():
+            if self.shadow.has(name, sym):
+                continue
+            ok, _ = gate.check(sym, now, replace(ent, cooldown_bars=0))
+            if not ok:
+                continue
+            closed = frames[sym].kl
+            spec = bind_exit(self.model_spec(info), closed, self.now_ms())
+            if spec is None:
+                continue
+            f = await self.io(self.ex.filters, sym)
+            sc = scores[sym]
+            px = self.marks.get(sym) or float(closed["close"].iloc[-1])
+            maker = ent.entry_mode == "maker"
+            if self.shadow.open(name, sym, side, float(sc.prob_long if side == "long" else sc.prob_short),
+                                float(closed["close"].iloc[-1]) if maker else px, now,
+                                exit_atr(spec, closed, self.now_ms()), f, spec=spec, entry=ent,
+                                decision_open_ms=int(closed["open_time"].iloc[-1])):
+                gate.record_entry(sym, now)
 
     # ================================================================== universe
     async def universe_cycle(self) -> None:
@@ -1212,7 +1832,7 @@ class Engine:
             return
         due = [s for s in self.trade_symbols() if self.clock() - self.feed.metrics_at.get(s, 0) > 300]
         if due:
-            await self.io(self.feed.refresh, due[0])
+            await self.io(self.feed.refresh, due[0], self.deriv_lookback_h())
 
     # ================================================================== status / housekeeping
     def market_snapshot(self) -> dict:
@@ -1249,9 +1869,58 @@ class Engine:
                 "margin_ratio": b.open_mm / eq if eq == eq else 0.0, "max_margin_ratio": cfg.max_margin_ratio,
                 "open_risk_pct": b.open_risk / eq * 100.0 if eq == eq else 0.0, "max_open_risk_pct": cfg.max_open_risk_pct}
 
+    def models_status(self) -> list[dict]:
+        """Loaded models for the status page: kind, role, history need, decision cadence, entry / exit template."""
+        out = []
+        now_ms = self.now_ms()
+        for name, _, info, is_champ in self.all_models():
+            ent = self.model_entry(info)
+            spec = self.model_spec(info)
+            row: dict[str, Any] = {"name": name, "kind": info.kind, "role": "champion" if is_champ else "challenger",
+                                   "history_bars_5m": info.history_bars_5m, "timeframes": list(info.timeframes),
+                                   "entry_mode": ent.entry_mode, "decision_every_bars": ent.decision_every_bars,
+                                   "cooldown_bars": ent.cooldown_bars, "max_trades_per_day": ent.max_trades_per_day,
+                                   "exit_mode": spec.mode if spec.mode != "atr" else f"atr:{spec.atr_tf}"}
+            if info.kind == "xsec":
+                xc = XsecCfg.resolve(info.entry_cfg, info.meta)
+                row.update(rebalance_every_h=xc.rebalance_every_h, top_k=xc.top_k, bottom_k=xc.bottom_k,
+                           next_decision_t=next_rebalance_ms(now_ms, xc.rebalance_every_h) / 1000.0)
+            else:
+                row["next_decision_t"] = next_decision_ms(now_ms, ent.decision_every_bars) / 1000.0
+            sh = self.shadow.stats.get(name)
+            if sh:
+                row["shadow_maker"] = dict(sh)
+            out.append(row)
+        return out
+
+    def decisions_status(self) -> dict:
+        """Champion decision cadence / entry limits for the status page."""
+        info = self.model_info
+        active = info is not None and not isinstance(self.scorer, NullScorer)
+        ent = self.model_entry(info if active else None)
+        now_ms = self.now_ms()
+        nxt = None
+        if active:
+            assert info is not None
+            nxt = (next_rebalance_ms(now_ms, XsecCfg.resolve(info.entry_cfg, info.meta).rebalance_every_h) if info.kind == "xsec"
+                   else next_decision_ms(now_ms, ent.decision_every_bars)) / 1000.0
+        return {"kind": info.kind if active and info else None, "next_decision_t": nxt,
+                "decision_every_bars": ent.decision_every_bars, "cooldown_bars": ent.cooldown_bars,
+                "trades_today": self.live_gate.trades_today(self.clock()), "max_trades_per_day": ent.max_trades_per_day,
+                "entry_mode": ent.entry_mode, "history_bars_5m": self.hist_need,
+                "history_ready": sum(1 for s in self.universe if len(self.kl.get(s, ())) >= self.hist_need)}
+
+    def maker_status(self) -> dict:
+        m = dict(self.maker_stats)
+        m["fill_rate"] = (m["filled"] / m["entries"]) if m["entries"] else None
+        m["in_flight"] = sorted(self.pending)
+        return m
+
     def write_status(self) -> None:
         cfg = self.cfg
         self.store.kv_set("status", {
+            "models": self.models_status(), "decisions": self.decisions_status(), "maker": self.maker_status(),
+            "xsec_legs": dict(self.xsec_book),
             "mode": self.mode, "running": self.running, "equity": self.equity, "wallet_equity": self.wallet_equity,
             "capital_usd": self.cfg.capital_usd if cap.is_active(self.cfg, self.mode) else None,
             "start_equity": self.start_equity,
@@ -1262,7 +1931,9 @@ class Engine:
             "model": {"name": self.model_info.name if self.model_info else "null",
                       "version": self.model_info.version if self.model_info else "0",
                       "trained_at": self.model_info.trained_at if self.model_info else None,
-                      "threshold_long": cfg.prob_threshold_long, "threshold_short": cfg.prob_threshold_short},
+                      "kind": self.model_info.kind if self.model_info else None,
+                      "threshold_long": self.model_thresholds(self.model_info)[0],
+                      "threshold_short": self.model_thresholds(self.model_info)[1]},
             "universe_updated_at": int(self.universe_at) if self.universe_at else None,
             "t": self.clock()})
 

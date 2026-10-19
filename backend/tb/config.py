@@ -173,6 +173,8 @@ CONTRACT_KEYS = (
     "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
     "universe_size", "universe_refresh_s", "kill_dd_pct", "fee_taker", "sound", "capital_usd",
+    "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
+    "maker_reprices", "maker_on_timeout",
 )
 
 
@@ -201,6 +203,14 @@ class Settings:
     fee_taker: float = 0.0005
     sound: bool = True
     capital_usd: float | None = 100.0   # bot stake in binance_demo/live (null = whole wallet); see tb.capital
+    # ---- entry controls (V3). Defaults for every model; a champion's / challenger's own ``entry_cfg`` overrides per key.
+    decision_every_bars: int = 1        # decide only on every N-th closed 5m bar, aligned to the UTC grid (12 = hourly)
+    cooldown_bars: int = 0              # per coin: no new entry for N 5m bars after its last entry / exit
+    max_trades_per_day: int | None = None   # entries per UTC day, all coins (null = unlimited)
+    entry_mode: str = "taker"           # taker (market) | maker (post-only GTX limit at best bid/ask)
+    maker_timeout_s: int = 60           # how long one resting post-only order may wait before it is re-priced
+    maker_reprices: int = 2             # re-price (cancel + repost at the new best bid/ask) at most this many times
+    maker_on_timeout: str = "skip"      # skip | taker: what to do when no maker order filled at all
     # ---- engine-internal (not part of the API contract; stored but not exposed)
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
@@ -222,6 +232,7 @@ class Settings:
     live_stage_trades: int = 20         # first N live trades run at live_stage_mult x size
     live_stage_mult: float = 0.5
     shadow_min_trades: int = 50         # promotion needs this many shadow trades
+    fee_maker: float = 0.0002           # maker fee per side (fraction); used by the paper venue and the shadow simulator
 
     # -- helpers
     @property
@@ -279,6 +290,14 @@ class Settings:
         chk(0.05 <= self.max_margin_ratio <= 0.9, "max_margin_ratio must be 0.05..0.9")
         chk(1 <= self.max_open_risk_pct <= 100, "max_open_risk_pct must be 1..100")
         chk(self.exit_mode in ("fixed", "atr"), "exit_mode must be fixed|atr")
+        chk(1 <= self.decision_every_bars <= 4032, "decision_every_bars must be 1..4032")
+        chk(0 <= self.cooldown_bars <= 100_000, "cooldown_bars must be >= 0")
+        chk(self.max_trades_per_day is None or 1 <= self.max_trades_per_day <= 1000, "max_trades_per_day must be 1..1000 or null")
+        chk(self.entry_mode in ("taker", "maker"), "entry_mode must be taker|maker")
+        chk(5 <= self.maker_timeout_s <= 900, "maker_timeout_s must be 5..900")
+        chk(0 <= self.maker_reprices <= 10, "maker_reprices must be 0..10")
+        chk(self.maker_on_timeout in ("skip", "taker"), "maker_on_timeout must be skip|taker")
+        chk(0 <= self.fee_maker < 0.01, "fee_maker must be a fraction in [0, 0.01)")
         chk(self.tp_usd > 0 and self.sl_usd > 0, "tp_usd/sl_usd must be > 0")
         chk(self.tp_atr > 0 and self.sl_atr > 0, "tp_atr/sl_atr must be > 0")
         chk(self.trail.activate_r > 0 and self.trail.distance_atr > 0, "trail values must be > 0")

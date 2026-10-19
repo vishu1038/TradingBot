@@ -31,6 +31,7 @@ from .base import (KLINE_COLUMNS, Balance, CloseInfo, ConditionalOrder, Exchange
 log = logging.getLogger("tb.binance")
 
 ALGO_SWITCH_CODE = -4120
+POST_ONLY_REJECT = -5022           # GTX order that would have executed as taker
 RECV_WINDOW = 5000
 WEIGHT_SOFT_LIMIT = 2000          # of 2400 / minute
 _SIG_RE = re.compile(r"signature=[0-9a-fA-F]+")
@@ -264,6 +265,57 @@ class BinanceExchange(Exchange):
             r = self._request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": r["orderId"]}, signed=True)
         return OrderResult(f"o:{r['orderId']}", symbol, side.upper(), float(r.get("executedQty") or qty),
                            float(r.get("avgPrice") or 0), r.get("status", ""))
+
+    # ---- maker (post-only) entries
+    def best_bid_ask(self, symbol: str) -> tuple[float, float]:
+        r = self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})        # weight 2
+        if isinstance(r, list):
+            r = next((x for x in r if x.get("symbol") == symbol), {})
+        bid, ask = float(r.get("bidPrice") or 0), float(r.get("askPrice") or 0)
+        if bid <= 0 or ask <= 0:
+            raise ExchangeError(f"no book for {symbol}")
+        return bid, ask
+
+    @staticmethod
+    def _order_result(r: dict, symbol: str, side: str, price: float = 0.0) -> OrderResult:
+        ex = float(r.get("executedQty") or 0)
+        return OrderResult(f"o:{r['orderId']}", symbol, str(r.get("side") or side).upper(), float(r.get("origQty") or ex),
+                           float(r.get("avgPrice") or 0), str(r.get("status", "")), 0.0, ex,
+                           float(r.get("price") or price or 0))
+
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
+                    reduce_only: bool = False) -> OrderResult:
+        f = self.filters(symbol)
+        q = f.round_qty(qty)
+        if q < f.min_qty or q <= 0:
+            raise ExchangeError(f"qty {qty} below min_qty {f.min_qty} for {symbol}")
+        cid = f"tbm{uuid.uuid4().hex[:23]}"           # tbm... = maker entry (stale ones are cancelled at engine start)
+        p: dict[str, Any] = {"symbol": symbol, "side": side.upper(), "type": "LIMIT", "quantity": f.qty_str(qty),
+                             "price": f.price_str(price), "timeInForce": "GTX" if post_only else "GTC",
+                             "newOrderRespType": "RESULT", "newClientOrderId": cid}
+        if reduce_only:
+            p["reduceOnly"] = True
+        try:
+            r = self._request("POST", "/fapi/v1/order", p, signed=True)
+        except NetworkError:
+            r = self._request("GET", "/fapi/v1/order", {"symbol": symbol, "origClientOrderId": cid}, signed=True)
+        res = self._order_result(r, symbol, side, price)
+        if post_only and res.status == "EXPIRED" and res.filled <= 0:      # a GTX that would have taken: expired unfilled
+            raise ExchangeError("Post Only order rejected (would take liquidity)", code=POST_ONLY_REJECT)
+        return res
+
+    def get_order(self, symbol: str, order_id: str) -> OrderResult:
+        _, _, oid = order_id.partition(":")
+        r = self._request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": oid or order_id}, signed=True)
+        return self._order_result(r, symbol, "")
+
+    def open_entry_orders(self, symbol: str | None = None) -> list[tuple[str, str]]:
+        out = []
+        for r in self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol} if symbol else {}, signed=True):
+            if r.get("type") == "LIMIT" and not r.get("reduceOnly") \
+                    and str(r.get("clientOrderId", "")).startswith("tbm"):
+                out.append((r["symbol"], f"o:{r['orderId']}"))
+        return out
 
     def conditional_params(self, kind: str, symbol: str, side: str, price: float, qty: float,
                            algo: bool) -> dict[str, Any]:
