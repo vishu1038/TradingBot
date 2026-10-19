@@ -67,13 +67,14 @@ export function mount(root) {
   if (!handheld) {
     const left = document.createElement('div');
     left.className = 'live-left';
+    // the chart gets the whole upper left; live trades and the engine log share the row under it (user 2026-10-19)
     const row1 = document.createElement('div');
     row1.className = 'live-row1';
-    row1.append(hero.el, logCard);
-    left.append(row1, chartCard, trades.el);
+    row1.append(trades.el, logCard);
+    left.append(chartCard, row1);
     const right = document.createElement('div');
     right.className = 'live-right';
-    right.append(depth.el, bot.el, market.el);
+    right.append(hero.el, depth.el, bot.el, market.el);
     wrap.append(symbar, left, right);
   } else {
     const top = document.createElement('div');
