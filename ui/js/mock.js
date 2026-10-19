@@ -1404,6 +1404,10 @@ export class MockServer {
         return ok(this._shadowEquity(limit(5000)));
       case 'GET /api/lab/reports':
         return ok(this.labReports);
+      case 'GET /api/mirror':
+        return ok(mockMirror());
+      case 'POST /api/mirror/retry':
+        return ok({ ok: true });
       default:
         return { status: 404, body: { error: `no route ${route}` } };
     }
@@ -1484,6 +1488,29 @@ export class MockServer {
 }
 
 /** Live runner: wraps a MockServer with a 1 s timer and a message callback. */
+// Mock /api/mirror: a healthy testnet mirror with a few events (the real one: backend/tb/mirror.py summary()).
+function mockMirror() {
+  const now = Date.now() / 1000;
+  const ev = (i, symbol, action, cls, code = null, msg = '', lat = 140) => ({ id: 100 - i, t: now - i * 47, symbol, action, paper_position_id: 7,
+    venue_order_id: cls === 'ok' ? `a:${9000 + i}` : null, ok: cls === 'ok' ? 1 : 0, error_code: code, error_msg: msg, latency_ms: lat, cls });
+  const events = [
+    ev(0, 'SOLUSDT', 'stop_move', 'ok'), ev(1, 'SOLUSDT', 'entry', 'ok', null, '', 131), ev(2, 'SOLUSDT', 'stop', 'ok', null, '', 152),
+    ev(3, 'SOLUSDT', 'take_profit', 'ok', null, '', 149), ev(4, 'WIFUSDT', 'close', 'venue_fault', 'http_503', 'close rejected: HTTP 503', 812),
+    ev(5, 'WIFUSDT', 'close', 'ok', null, 'flat (reason=tp)', 166), ev(6, 'PEPEUSDT', 'entry', 'skipped', 'not_trading', 'not TRADING on the testnet', null),
+  ];
+  return {
+    enabled: true, venue: 'binance_demo', size: 'min', account_state: 'ok',
+    account: { state: 'ok', reasons: [], margin_balance: 4998.7, available: 4931.2, wallet: 4999.1, can_trade: true, checked_at: now - 12 },
+    success_rate_1h: 0.94, success_rate_24h: 0.97, latency_p50_ms: 141, latency_p95_ms: 390,
+    counts: { by_cls: { ok: 61, venue_fault: 2, skipped: 3 }, by_error_code: { http_503: 2, not_trading: 3 } },
+    counts_1h: { by_cls: { ok: 16, venue_fault: 1 }, by_error_code: { http_503: 1 } }, calls_1h: 17, calls_24h: 63,
+    divergences: { '1h': 0, '24h': 1, by_kind_24h: { closed_early: 1 } },
+    open_positions: [{ paper_position_id: 7, symbol: 'SOLUSDT', side: 'long', qty: 0.06, state: 'open', venue_entry: 104.2, sl_paper: 102.9,
+      has_stop: true, has_tp: true, paper_open: true }],
+    events,
+  };
+}
+
 export function startMock({ ticksPerBar = 30, seed } = {}) {
   const server = new MockServer({ ticksPerBar, seed });
   const listeners = new Set();

@@ -6,7 +6,7 @@ import * as fx from './fx.js';
 import * as sound from './sound.js';
 import * as A from './actions.js';
 
-const PAGES = { live: 'live', home: 'live', main: 'live', settings: 'settings', markets: 'markets', history: 'trades', trades: 'trades', bots: 'bots', equity: 'bots', lab: 'lab' };
+const PAGES = { live: 'live', home: 'live', main: 'live', settings: 'settings', markets: 'markets', history: 'trades', trades: 'trades', bots: 'bots', equity: 'bots', lab: 'lab', execution: 'execution', exec: 'execution', mirror: 'execution' };
 
 /** name, argument hint, description, handler(arg) */
 const COMMANDS = [
@@ -20,6 +20,7 @@ const COMMANDS = [
   ['history', '', 'trades history', () => A.goPage('trades')],
   ['bots', '', 'bots / equity / shadow models', () => A.goPage('bots')],
   ['lab', '', 'lab reports', () => A.goPage('lab')],
+  ['mirror', '', 'execution: testnet mirror health', () => A.goPage('execution')],
   ['coin', 'SOL', 'show a coin on the main chart', (a) => !A.selectCoin(a) && fx.toast(`no coin matching "${a}"`, 'loss')],
   ['pause', '[COIN]', 'pause a coin (no new entries)', (a) => withCoin(a, (s) => !A.pausedSet().has(s) && A.togglePause(s))],
   ['unpause', '[COIN]', 'resume a paused coin', (a) => withCoin(a, (s) => A.pausedSet().has(s) && A.togglePause(s))],

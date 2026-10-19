@@ -401,3 +401,22 @@ code { color: var(--amber); }
 .pal-item b { display: inline-flex; align-items: center; gap: 6px; color: var(--cc, var(--text)); }
 .pal-item.on { background: rgba(217, 119, 87, 0.18); outline: 1px solid color-mix(in srgb, var(--coral) 60%, transparent); }
 .pal-foot { font-size: 10.5px; padding: 6px 4px 0; }
+
+/* EXECUTION (testnet mirror) */
+.exec .card { margin-bottom: 14px; }
+.exec-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+.exec-state { color: var(--chip); font-weight: 750; letter-spacing: 0.08em; text-shadow: 0 0 10px color-mix(in srgb, var(--chip) 45%, transparent); }
+.exec-head .btn { margin-left: auto; }
+.exec-hot { border-color: var(--down); color: var(--down); box-shadow: 0 0 14px -4px var(--down); }
+.exec-chip { display: inline-block; padding: 0 6px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+  color: var(--chip); border: 1px solid color-mix(in srgb, var(--chip) 55%, transparent); background: color-mix(in srgb, var(--chip) 12%, transparent); }
+.exec-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 14px; }
+.exec-bars { display: grid; gap: 6px; margin-bottom: 10px; }
+.exec-bar { display: grid; grid-template-columns: 104px 1fr 40px; gap: 8px; align-items: center; }
+.exec-bar i { display: block; height: 8px; width: var(--w); min-width: 2px; border-radius: 4px; background: var(--chip); box-shadow: 0 0 8px -2px var(--chip); }
+.exec-bar b { text-align: right; }
+.exec-warn td { background: color-mix(in srgb, var(--down) 10%, transparent); }
+.exec-div { margin-top: 8px; font-size: 11px; }
+.exec-log .exec-msg { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exec .tiles.t7 { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+@media (max-width: 860px) { .exec-grid { grid-template-columns: 1fr; } .exec-log .exec-msg { max-width: 180px; } }

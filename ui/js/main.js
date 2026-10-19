@@ -14,6 +14,7 @@ import * as bots from './views/bots.js';
 import * as trades from './views/trades.js';
 import * as lab from './views/lab.js';
 import * as settings from './views/settings.js';
+import * as execution from './views/execution.js';
 
 const ICON = {
   live: '<path d="M2 12h5l3-8 4 16 3-8h5"/>',
@@ -22,6 +23,7 @@ const ICON = {
   trades: '<path d="M4 6h16M4 12h16M4 18h10"/>',
   bots: '<path d="M5 8h14v11H5zM12 4v4M9 13h.01M15 13h.01M9 16h6"/>',
   lab: '<path d="M9 3h6M10 3v6L4 20h16L14 9V3M7 15h10"/>',
+  execution: '<path d="M4 12h4l2-5 4 10 2-5h4M4 5h16M4 19h16"/>',
 };
 
 // page 1 = main, page 2 = bot settings, then the extra tabs
@@ -32,6 +34,7 @@ const VIEWS = [
   { id: 'trades', label: 'HISTORY', short: 'History', mod: trades },
   { id: 'bots', label: 'BOTS', short: 'Bots', mod: bots },
   { id: 'lab', label: 'LAB', short: 'Lab', mod: lab },
+  { id: 'execution', label: 'EXECUTION', short: 'Exec', mod: execution },
 ];
 
 let unmount = null;
@@ -96,7 +99,7 @@ function initialView() {
 }
 
 const HELP = [
-  ['1 … 6', 'pages: Live, Bot settings, Markets, History, Bots, Lab'],
+  ['1 … 7', 'pages: Live, Bot settings, Markets, History, Bots, Lab, Execution'],
   ['/', 'command palette (/kill /history /lab /coin SOL /pause WIF …)'],
   ['j / k', 'next / previous coin'],
   ['[ / ]', 'flip the hero card'],
