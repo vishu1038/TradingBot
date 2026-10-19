@@ -5,6 +5,6 @@ cd "$(dirname "$0")/.." || exit 1
 export PYTHONPATH=backend
 SYMS=1000BONKUSDT,1000PEPEUSDT,ADAUSDT,APTUSDT,ARBUSDT,AVAXUSDT,BNBUSDT,BTCUSDT,DOGEUSDT,ENAUSDT,ETHUSDT,FETUSDT,INJUSDT,LINKUSDT,NEARUSDT,OPUSDT,ORDIUSDT,SEIUSDT,SOLUSDT,SUIUSDT,TAOUSDT,TIAUSDT,WIFUSDT,WLDUSDT,XRPUSDT
 LOG=var/retrain_$(date +%Y%m%d_%H%M).log
-nice -n 10 .venv-ml/bin/python ml/walkforward.py final --symbols "$SYMS" --archs cnn --modes atr32 > "$LOG" 2>&1
+nice -n 10 .venv-ml/bin/python ml/walkforward.py final --symbols "$SYMS" --archs cnn --modes atr32 --tag a0s1_25 > "$LOG" 2>&1
 RC=$?
 .venv/bin/python ml/notify_text.py "Drift-triggered retrain finished (exit $RC). Exported as CHALLENGER (shadow mode only). Log: $LOG" "$LOG"
