@@ -336,9 +336,19 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
             if killed:
                 stats["skip_kill"] += 1
                 continue
-            if cfg.one_per_symbol and any(p.sidx == k for p in open_pos):
-                stats["skip_has_position"] += 1
-                continue
+            held = next((p for p in open_pos if p.sidx == k), None) if cfg.one_per_symbol else None
+            if held is not None:
+                # reversal (as the engine): an opposite model signal clearing its threshold + margin closes the held position
+                # at this bar's open (market exit) and the new side goes through every check below
+                thr = cfg.thr_long if side > 0 else cfg.thr_short
+                if (cfg.reverse_enabled and use_probs and not held.shadow and held.side != side
+                        and prob >= thr + cfg.reverse_margin):
+                    close(held, O[k][r] * (1.0 - held.side * slip), "reverse", T0)
+                    open_pos.remove(held)
+                    stats["reversals"] = stats.get("reversals", 0) + 1
+                else:
+                    stats["skip_has_position"] += 1
+                    continue
             if EXC[k][r - 1]:
                 stats["skip_fault"] += 1
                 continue

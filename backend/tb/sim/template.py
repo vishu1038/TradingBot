@@ -68,6 +68,8 @@ class SimConfig:
     drift_n: int = 30
     atr_period: int = 14
     one_per_symbol: bool = True
+    reverse_enabled: bool = True        # model signals: an opposite signal >= threshold + reverse_margin reverses a held coin
+    reverse_margin: float = 0.0
     apply_funding: bool = True
 
     @property

@@ -1308,12 +1308,12 @@ class Engine:
         v, p = self.vmarks.get(sym), self.marks.get(sym)
         return v / p if v and p else 1.0
 
-    def _reverse_ok(self, side: str, prob: float) -> bool:
-        """An opposite-side signal on a held coin may reverse it: enabled, and ``prob`` clears the new side's threshold plus
-        ``reverse_min_prob_margin``."""
+    def _reverse_ok(self, side: str, prob: float, info: ModelInfo | None = None) -> bool:
+        """An opposite-side signal on a held coin may reverse it: enabled, and ``prob`` clears the new side's threshold (of
+        ``info``, default the champion) plus ``reverse_min_prob_margin``."""
         if not getattr(self.cfg, "reverse_enabled", False):
             return False
-        th_long, th_short = self.model_thresholds(self.model_info)
+        th_long, th_short = self.model_thresholds(info or self.model_info)
         return prob >= (th_long if side == "long" else th_short) + float(getattr(self.cfg, "reverse_min_prob_margin", 0.0))
 
     def entry_allowed(self, sym: str | None = None) -> bool:
@@ -2073,6 +2073,11 @@ class Engine:
             gate = self.shadow_gate(name)
             n_open = sum(1 for k in (*self.shadow.pos, *self.shadow.pending) if k.startswith(f"{name}|"))
             ok, _ = gate.check(sym, now, ent, n_open)
+            held = self.shadow.pos.get(self.shadow._key(name, sym))
+            if ok and held is not None and held.side != side and self._reverse_ok(side, prob, info):
+                tr = self.shadow.close_leg(name, sym, price, now, "reverse")      # same reversal rule as the live book
+                if tr:
+                    self._record_shadow(tr)
             if not ok or self.shadow.has(name, sym):
                 continue
             spec = bind_exit(self.model_spec(info), closed, self.now_ms())

@@ -70,6 +70,7 @@ def build_cfg(a) -> SimConfig:
         tp_atr=a.tp_atr, sl_atr=a.sl_atr, trail_enabled=a.trail, trail_activate_r=a.activate_r,
         breakeven_r=a.breakeven_r, sl_cooldown_bars=a.sl_cooldown_bars, max_side_risk_pct=a.max_side_risk,
         max_open_risk_pct=a.max_open_risk, partial_tp_r=a.partial_r, partial_tp_frac=a.partial_frac,
+        reverse_enabled=a.reverse, reverse_margin=a.reverse_margin,
         trail_distance_atr=a.trail_atr, short_enabled=a.shorts or a.side in ("short", "both"),
         thr_long=a.thr_long, thr_short=a.thr_short, max_positions=a.max_positions,
         min_tp_usd=a.min_tp_usd, min_sl_usd=a.min_sl_usd, max_net_exposure_pct=a.max_net_exposure,
@@ -102,6 +103,9 @@ def main(argv=None) -> int:
     ap.add_argument("--max-open-risk", type=float, default=d.max_open_risk_pct)
     ap.add_argument("--partial-r", type=float, default=d.partial_tp_r, help="0 = off")
     ap.add_argument("--partial-frac", type=float, default=d.partial_tp_frac)
+    ap.add_argument("--reverse", action=argparse.BooleanOptionalAction, default=d.reverse_enabled,
+                    help="model signals: reverse a held coin on an opposite signal")
+    ap.add_argument("--reverse-margin", type=float, default=d.reverse_margin)
     ap.add_argument("--trail-atr", type=float, default=1.0)
     ap.add_argument("--shorts", action=argparse.BooleanOptionalAction, default=d.short_enabled)
     ap.add_argument("--thr-long", type=float, default=d.thr_long)
