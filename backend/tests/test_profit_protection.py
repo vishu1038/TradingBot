@@ -217,6 +217,9 @@ def pump(eng, data, price, dt=0.0, sym="AAAUSDT"):
 def _paper(store, tmp_path, **over):
     eng, data = mk_engine(store, tmp_path, settings={**ATR_EXITS, **over})
     eng.cfg = store.get_settings()
+    # funding settles on the real 00/08/16 UTC grid; pump() moves the clock forward, so a run shortly before a
+    # settlement would book funding mid-test. These tests assert funding == 0: keep the settlement out of reach.
+    eng.ex._slot = 1 << 40
     open_long(eng)
     return eng, data, store.get_positions()[0]
 
