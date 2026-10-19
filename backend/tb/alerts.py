@@ -203,9 +203,23 @@ class AlertDispatcher:
     def __init__(self, notifiers: Sequence[Notifier] | None = None, *, min_interval: float = 1.1,
                  max_attempts: int = 5, backoff_base: float = 1.0, backoff_max: float = 60.0,
                  dedupe_s: float = 600.0, max_queue: int = 500,
-                 stats: Callable[[], list[tuple[str, Any, str | None]]] | None = None):
+                 stats: Callable[[], list[tuple[str, Any, str | None]]] | None = None,
+                 digest_s: float | None = None):
+        from_env = notifiers is None
         self.notifiers = list(notifiers if notifiers is not None else notifier_from_env())
         self.stats = stats          # footer rows (equity, PnL, drawdown, open) added to every message
+        # Trade open/close alerts are batched into one digest card every digest_s (user: fewer Chat
+        # messages); kill / safety / errors / daily summary stay immediate. Production (notifiers from
+        # .env) reads TB_ALERT_DIGEST_MIN (default 60; 0 = one message per trade); injected notifiers
+        # (tests) default to immediate.
+        if digest_s is None:
+            digest_s = float(os.environ.get("TB_ALERT_DIGEST_MIN", "60")) * 60 if from_env else 0.0
+        self.digest_s = max(0.0, digest_s)
+        self._dig_lock = threading.Lock()
+        self._dig_open: list[tuple] = []
+        self._dig_closed: list[tuple] = []
+        self._dig_since = time.time()
+        self._dig_thread: threading.Thread | None = None
         self.min_interval = min_interval
         self.max_attempts = max_attempts
         self.backoff_base = backoff_base
@@ -245,8 +259,51 @@ class AlertDispatcher:
         except queue.Full:
             self.dropped += 1
 
+    # ------------------------------------------------------------------ digest (batched trade alerts)
+    def _digest_add(self, kind: str, item: tuple) -> bool:
+        """Buffer a trade event when digest mode is on; returns True if buffered."""
+        if self.digest_s <= 0 or not self.notifiers:
+            return False
+        with self._dig_lock:
+            (self._dig_open if kind == "open" else self._dig_closed).append(item)
+        if not (self._dig_thread and self._dig_thread.is_alive()):
+            self._dig_thread = threading.Thread(target=self._digest_loop, name="tb-alerts-digest", daemon=True)
+            self._dig_thread.start()
+        return True
+
+    def _digest_loop(self) -> None:
+        while not self._stop.wait(self.digest_s):
+            self.flush_digest()
+
+    def flush_digest(self) -> None:
+        """Send the buffered trades as one card (no-op when nothing happened)."""
+        with self._dig_lock:
+            opened, closed = self._dig_open, self._dig_closed
+            self._dig_open, self._dig_closed = [], []
+            since, self._dig_since = self._dig_since, time.time()
+        if not opened and not closed:
+            return
+        mode = (closed or opened)[-1][-1]
+        net = sum(c[2] for c in closed)
+        wins = sum(1 for c in closed if c[2] > 0)
+        mins = max(1, round((time.time() - since) / 60))
+        rows: list[tuple[str, Any, str | None]] = [
+            ("Period", f"last {mins} min", None),
+            ("Opened", f"{len(opened)}" + (": " + ", ".join(f"{'▲' if o[1] == 'long' else '▼'}{o[0]}"
+                                                          for o in opened[:12]) if opened else ""), None),
+            ("Closed", f"{len(closed)} · {wins} won / {len(closed) - wins} lost", None),
+            ("Net PnL (closed)", f"{net:+.2f} USDT", GREEN if net >= 0 else RED)]
+        for c in sorted(closed, key=lambda c: -abs(c[2]))[:8]:
+            rows.append((f"{c[0]} {c[1].upper()} · {c[3]}", f"{c[2]:+.2f}", GREEN if c[2] > 0 else RED))
+        head = f"🕐 Trades digest · {len(closed)} closed, net {net:+.2f}"
+        text = (f"[{mode}] DIGEST {mins} min: opened {len(opened)}, closed {len(closed)} "
+                f"({wins} won), net {net:+.2f}")
+        self.send(text, headline=head, card=build_card(head, mode, rows, "digest"))
+
     def trade_opened(self, symbol: str, side: str, entry: float, qty: float, notional: float,
                      sl: float, tp: float, prob: float | None = None, mode: str = "") -> None:
+        if self._digest_add("open", (symbol, side.lower(), entry, notional, mode)):
+            return
         p = f" p={prob:.2f}" if prob is not None else ""
         arrow = "▲" if side.lower() == "long" else "▼"
         rows = [("Entry", f"{entry:g}", None), ("Size", f"{qty:g} (${notional:.0f})", None),
@@ -263,6 +320,8 @@ class AlertDispatcher:
     def trade_closed(self, symbol: str, side: str, entry: float, exit_price: float, pnl: float,
                      fees: float, reason: str, mode: str = "") -> None:
         net = pnl                       # pnl is NET (after fees and funding)
+        if self._digest_add("close", (symbol, side.lower(), net, reason, mode)):
+            return
         label = {"tp": "✅ TP hit", "sl": "🛑 SL hit", "trail": "🪢 Trailing stop", "kill": "☠️ Kill close",
                  "liquidation": "💥 Liquidated", "manual": "✋ Closed manually"}.get(reason, f"Closed ({reason})")
         rows = [("Side", side.upper(), None),
@@ -307,6 +366,7 @@ class AlertDispatcher:
         return self._idle.wait(timeout)
 
     def close(self, timeout: float = 5.0) -> None:
+        self.flush_digest()             # don't lose buffered trades on shutdown
         self.flush(timeout)
         self._stop.set()
         if self._thread:

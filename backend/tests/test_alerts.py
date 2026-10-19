@@ -214,6 +214,32 @@ def test_every_message_carries_bot_stats_footer():
         assert "27.6 % of 50 % kill" in footer["widgets"][2]["decoratedText"]["text"]
 
 
+def test_trade_alerts_are_batched_into_one_digest_but_kill_is_immediate():
+    s = Sess()
+    d = AlertDispatcher([GoogleChatNotifier(URL, session=s)], min_interval=0, digest_s=3600)
+    d.trade_opened("ETHUSDT", "long", 2364.8, 0.067, 158.4, 2215.5, 2439.4, 0.81, "paper_local")
+    d.trade_opened("SOLUSDT", "short", 150.0, 1.0, 150.0, 156.0, 141.0, 0.7, "paper_local")
+    d.trade_closed("ETHUSDT", "long", 2364.8, 2439.4, 5.1, 0.16, "tp", "paper_local")
+    d.trade_closed("QUSDT", "long", 0.12, 0.117, -9.2, 0.16, "sl", "paper_local")
+    d.flush(2)
+    assert s.calls == []                                      # nothing per trade
+    d.kill("drawdown", 149.0, 25.5, "paper_local")
+    d.flush(3)
+    assert len(s.calls) == 1 and "KILL" in json.loads(s.calls[0]["data"])["text"]   # urgent: immediate
+    d.flush_digest()
+    d.flush(3)
+    d.close()
+    body = json.loads(s.calls[1]["data"])
+    card = body["cardsV2"][0]["card"]
+    assert card["header"]["title"].startswith("🕐 Trades digest · 2 closed, net -4.10")
+    rows = {w["decoratedText"]["topLabel"]: w["decoratedText"]["text"] for w in card["sections"][0]["widgets"]
+            if "decoratedText" in w}
+    assert rows["Opened"].startswith("2: ▲ETHUSDT, ▼SOLUSDT") and rows["Closed"] == "2 · 1 won / 1 lost"
+    d2 = AlertDispatcher([GoogleChatNotifier(URL, session=Sess())], min_interval=0, digest_s=3600)
+    d2.flush_digest()                                         # empty digest sends nothing
+    assert d2.sent == 0
+
+
 def test_stats_failure_never_blocks_alert():
     s = Sess()
     d = AlertDispatcher([GoogleChatNotifier(URL, session=s)], min_interval=0, stats=lambda: 1 / 0)
