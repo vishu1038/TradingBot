@@ -9,6 +9,9 @@ Template (docs/ARCHITECTURE.md "Trade template"):
 * ``exit_mode="atr"``: TP = entry +- ``tp_atr`` * ATR14, SL = entry -+ ``sl_atr`` * ATR14 with ATR14
   the Wilder ATR *at the signal bar i* (``features.atr``).  Position size is chosen so that the SL
   loses ~``sl_usd`` (capped by the slice notional);
+* ``exit_mode="pct"``: TP = fill * (1 +- ``tp_pct``/100), SL = fill * (1 -+ ``sl_pct``/100), notional = the slice notional;
+* ``atr_tf`` (atr mode): timeframe of the ATR - ``"5m"`` (default, ATR14 of the signal bar) or ``"1h"`` / ``"4h"`` /
+  ``"1d"``: SMA-ATR14 of the last CLOSED bar of that timeframe at the signal bar's close (``features_mtf.htf_atr_5m``);
 * both barriers inside the same 5m candle -> **SL first** (pessimistic);
 * the trade lives for at most ``horizon_bars`` bars (bars i+1 .. i+horizon).  A trade that hits
   neither barrier is a **timeout: label 0**, closed at the close of the last bar;
@@ -40,6 +43,9 @@ DEFAULT_EXIT_CFG: dict = {
     "sl_usd": 10.0,
     "tp_atr": 1.5,
     "sl_atr": 1.0,
+    "tp_pct": 3.0,              # exit_mode "pct": price-move targets in percent
+    "sl_pct": 6.0,
+    "atr_tf": "5m",             # timeframe of the ATR for exit_mode "atr": 5m | 1h | 4h | 1d
     "fee_taker": 0.0005,
     "slippage_pct": 0.0002,
     "stop_slippage_pct": 0.0005,
@@ -57,14 +63,26 @@ def full_cfg(exit_cfg: dict | None) -> dict:
         for alias, key in (("slippage", "slippage_pct"), ("stop_slippage_extra", "stop_slippage_pct")):
             if alias in exit_cfg and key not in exit_cfg:
                 cfg[key] = exit_cfg[alias]
-    if cfg["exit_mode"] not in ("fixed", "atr"):
-        raise ValueError(f"exit_mode must be fixed|atr, got {cfg['exit_mode']!r}")
+    if cfg["exit_mode"] not in ("fixed", "atr", "pct"):
+        raise ValueError(f"exit_mode must be fixed|atr|pct, got {cfg['exit_mode']!r}")
+    if cfg["atr_tf"] not in ("5m", "1h", "4h", "1d"):
+        raise ValueError(f"atr_tf must be 5m|1h|4h|1d, got {cfg['atr_tf']!r}")
     return cfg
 
 
+def exit_atr(kl: pd.DataFrame, cfg: dict) -> np.ndarray:
+    """ATR (price units) per 5m signal bar used to size ATR exits: Wilder ATR14 of the 5m bars (``atr_tf="5m"``) or
+    the SMA-ATR14 of the last closed ``atr_tf`` bar (see ``features_mtf.htf_atr_5m``)."""
+    if cfg.get("atr_tf", "5m") == "5m":
+        return _atr(kl["high"].to_numpy("float64"), kl["low"].to_numpy("float64"), kl["close"].to_numpy("float64"), 14)
+    from .features_mtf import htf_atr_5m
+    return htf_atr_5m(kl, cfg["atr_tf"], 14)
+
+
 def simulate_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: dict | None = None,
-                    horizon_bars: int = 288) -> dict[str, np.ndarray]:
-    """Resolve a hypothetical trade for every signal bar.
+                    horizon_bars: int = 288, rows: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    """Resolve a hypothetical trade for every signal bar (or only for ``rows`` - indices of signal bars - which
+    makes decision-cadence datasets cheap; all other entries of the returned arrays stay n/a).
 
     Returns arrays of length N:
       label    float32  1 TP first, 0 SL first / timeout, NaN not enough future
@@ -92,18 +110,28 @@ def simulate_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: 
     m = n - H                       # signal rows with a full horizon of future: i in [0, m)
     if m <= 0:
         return dict(label=label, outcome=outcome, exit_off=exit_off, pnl_usd=pnl, notional=notional)
+    sig = np.arange(m) if rows is None else np.unique(np.asarray(rows, dtype="int64"))
+    sig = sig[(sig >= 0) & (sig < m)]
+    ns = len(sig)
+    if ns == 0:
+        return dict(label=label, outcome=outcome, exit_off=exit_off, pnl_usd=pnl, notional=notional)
 
     slip = cfg["slippage_pct"]
     sslip = cfg["stop_slippage_pct"]
-    entry = o[1:m + 1] * (1.0 + sgn * slip)     # entry fill: open[i+1] with adverse slippage
+    entry = o[sig + 1] * (1.0 + sgn * slip)     # entry fill: open[i+1] with adverse slippage
     slice_notional = float(cfg["slice_margin_usd"]) * float(cfg["leverage"])
     if cfg["exit_mode"] == "fixed":
-        tp_d = np.full(m, cfg["tp_usd"] / slice_notional) * entry
-        sl_d = np.full(m, cfg["sl_usd"] / slice_notional) * entry
-        notl = np.full(m, slice_notional)
+        tp_d = np.full(ns, cfg["tp_usd"] / slice_notional) * entry
+        sl_d = np.full(ns, cfg["sl_usd"] / slice_notional) * entry
+        notl = np.full(ns, slice_notional)
+        ok = np.isfinite(entry) & (entry > 0)
+    elif cfg["exit_mode"] == "pct":
+        tp_d = cfg["tp_pct"] / 100.0 * entry
+        sl_d = cfg["sl_pct"] / 100.0 * entry
+        notl = np.full(ns, slice_notional)
         ok = np.isfinite(entry) & (entry > 0)
     else:
-        a = _atr(hi, lo, cl, 14)[:m]
+        a = exit_atr(kl, cfg)[sig]
         tp_d = cfg["tp_atr"] * a
         sl_d = cfg["sl_atr"] * a
         ok = np.isfinite(entry) & (entry > 0) & np.isfinite(a) & (a > 0)
@@ -113,14 +141,14 @@ def simulate_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: 
     sl = entry - sgn * sl_d
     ok &= sl > 0
 
-    tp_k = np.zeros(m, dtype="int32")     # first offset where TP touched (0 = not yet)
-    sl_k = np.zeros(m, dtype="int32")
+    tp_k = np.zeros(ns, dtype="int32")    # first offset where TP touched (0 = not yet)
+    sl_k = np.zeros(ns, dtype="int32")
     active = np.nonzero(ok)[0]
     for k in range(1, H + 1):
         if len(active) == 0:
             break
-        hk = hi[active + k]
-        lk = lo[active + k]
+        hk = hi[sig[active] + k]
+        lk = lo[sig[active] + k]
         if sgn > 0:
             t_hit = hk >= tp[active]
             s_hit = lk <= sl[active]
@@ -137,15 +165,15 @@ def simulate_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: 
     resolved_tp = tp_k > 0
     resolved_sl = sl_k > 0
 
-    out_code = np.full(m, OUT_NA, dtype="int8")
+    out_code = np.full(ns, OUT_NA, dtype="int8")
     out_code[ok] = OUT_TIMEOUT
     out_code[resolved_tp] = OUT_TP
     out_code[resolved_sl] = OUT_SL
     k_exit = np.where(resolved_tp, tp_k, np.where(resolved_sl, sl_k, H)).astype("int32")
 
     # exit price (before exit slippage)
-    to_close = cl[np.arange(m) + H]
-    sl_open = o[np.arange(m) + np.maximum(sl_k, 1)]          # bar open of the stop bar (gap-through)
+    to_close = cl[sig + H]
+    sl_open = o[sig + np.maximum(sl_k, 1)]                   # bar open of the stop bar (gap-through)
     sl_base = np.minimum(sl, sl_open) if sgn > 0 else np.maximum(sl, sl_open)
     exit_px = np.where(resolved_tp, tp,
                        np.where(resolved_sl, sl_base * (1.0 - sgn * (slip + sslip)),
@@ -158,18 +186,40 @@ def simulate_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: 
     net = gross - fees
 
     lab = np.where(resolved_tp, 1.0, 0.0)
-    label[:m] = np.where(ok, lab, np.nan)
-    outcome[:m] = out_code
-    exit_off[:m] = np.where(ok, k_exit, 0)
-    pnl[:m] = np.where(ok, net, np.nan)
-    notional[:m] = np.where(ok, notl, np.nan)
+    label[sig] = np.where(ok, lab, np.nan)
+    outcome[sig] = out_code
+    exit_off[sig] = np.where(ok, k_exit, 0)
+    pnl[sig] = np.where(ok, net, np.nan)
+    notional[sig] = np.where(ok, notl, np.nan)
     return dict(label=label, outcome=outcome, exit_off=exit_off, pnl_usd=pnl, notional=notional)
 
 
 def label_trades(kl: pd.DataFrame, side: Literal["long", "short"], exit_cfg: dict | None = None,
-                 horizon_bars: int = 288) -> np.ndarray:
+                 horizon_bars: int = 288, rows: np.ndarray | None = None) -> np.ndarray:
     """[N] float32: 1 TP first, 0 SL first / timeout, NaN if not enough future (see module doc)."""
-    return simulate_trades(kl, side, exit_cfg, horizon_bars)["label"]
+    return simulate_trades(kl, side, exit_cfg, horizon_bars, rows)["label"]
+
+
+# --------------------------------------------------------------------------------------------
+# decision cadence / cooldown (multi-timeframe "user style" trading)
+# --------------------------------------------------------------------------------------------
+def cooldown_select(signal_idx: np.ndarray, exit_off: np.ndarray, cooldown_bars: int = 0) -> np.ndarray:
+    """Greedy per-coin cooldown on ONE coin's time-ordered signals.
+
+    ``signal_idx`` are bar indices (ascending) of candidate entries, ``exit_off[k]`` the bars the k-th trade stays
+    open (``simulate_trades(...)["exit_off"][signal_idx]``, >= 1).  A candidate is taken if no earlier TAKEN trade is
+    still open at its bar or within ``cooldown_bars`` bars after that trade's exit (trade k occupies the entry bar
+    ``i`` up to bar ``i + exit_off`` and the cooldown extends the block to ``i + exit_off + cooldown_bars``).
+    Returns a boolean mask over ``signal_idx``."""
+    idx = np.asarray(signal_idx, dtype="int64")
+    off = np.maximum(np.asarray(exit_off, dtype="int64"), 1)
+    take = np.zeros(len(idx), dtype=bool)
+    blocked_until = -1
+    for k in range(len(idx)):
+        if idx[k] >= blocked_until:
+            take[k] = True
+            blocked_until = int(idx[k] + off[k] + cooldown_bars)
+    return take
 
 
 def breakeven_win_rate(sim: dict[str, np.ndarray]) -> float:

@@ -8,3 +8,4 @@ websocket-client
 python-dotenv
 httpx
 pytest
+scikit-learn==1.7.2

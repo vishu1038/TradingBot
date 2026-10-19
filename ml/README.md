@@ -80,3 +80,37 @@ arch_cfg, feature_names, window, norm {mean, std, clip}, **calibration** {long, 
 state_dict as float32. `tb.model_np.load(path)` returns the scorer; `predict_windows` gives calibrated
 probabilities for batches, `score(symbol, feats)` gives `Score` with the top-5 occlusion reasons.
 numpy vs torch(mps) parity: max abs logit diff ~1e-6 for all archs (`test_ml_parity.py`, limit 1e-4).
+
+## V3: multi-timeframe nets / gradient-boosted trees / Kalman features (experiments B, C, E)
+
+Question changed from "which 5m bar" to "which coin is set up" (docs/V3_EXPERIMENTS.md): features are built by
+RESAMPLING the 5m archive to 1h / 4h / 1d (closed bars only, `backend/tb/features_mtf.py`), plus 5m entry-timing
+features, BTC context per timeframe, OI / funding over hours and the optional `kalman` group
+(`backend/tb/features_kalman.py`, local-linear-trend filter per timeframe, fixed window, scale-free). One decision per
+coin per closed 1h bar; exits `pct` 3/6 or `atr` 3/2 on the **1h** ATR (`tb.labels`: `exit_mode: "pct"`, `atr_tf`),
+horizon 4 days, per-coin cooldown, <= 5 open, <= 8 entries/day. `tb.features_mtf.build_for_model(meta, bundle)` is the
+ONE feature builder for training and the live engine (all higher-timeframe features have finite memory, so a live
+engine fetching `history_bars_5m` bars reproduces the training row; tested).
+
+```bash
+export PYTHONPATH=backend
+nohup sh ml/run_v3_mtf.sh > /dev/null 2>&1 &            # everything, detached, posts to Google Chat when done
+# or by hand
+.venv-ml/bin/python ml/mtf_walkforward.py build         # dataset (var/ml_cache/mtf-*), CPU, ~10 min
+OMP_NUM_THREADS=3 nice -n 10 .venv-ml/bin/python ml/mtf_walkforward.py wf --models gbm          # CPU
+nice -n 10 .venv-ml/bin/python ml/mtf_walkforward.py wf --models mlp                            # GPU (mps)
+nice -n 10 .venv-ml/bin/python ml/mtf_walkforward.py finish                                     # ONE holdout eval each + export
+.venv-ml/bin/python ml/mtf_walkforward.py smoke         # synthetic end-to-end check
+```
+
+Variants (8): {mlp, gbm} x {pct36, atr1h32} x {kalman off/on}; the count (and a Bonferroni z over variants x sides) is
+printed in every report. Files: `mtf_dataset.py` (decision-row dataset), `mtf_eval.py` (selection with cooldown / daily
+cap, top-fraction thresholds chosen on validation, pooled + day-clustered z), `mtf_trainer.py` (MLP on mps),
+`mtf_walkforward.py` (driver, qualification, holdout, export), `run_v3_mtf.sh` (detached pipeline). Baselines per fold
+under identical exits / rules: random entries (same candidate count) and the ATR%-regime rule (1h-ATR% and 5m-ATR%,
+threshold chosen on validation the same way). A side **qualifies** only if pooled OOS z vs random >= 2, expectancy > 0,
+better than both ATR rules and >= 100 trades; qualifying variants get one holdout evaluation and are exported as
+`kind: "mtf"` (numpy MLP, `.npz`) / `"gbm"` (sklearn pickle, `.pkl`, pinned `scikit-learn==1.7.2` in both venvs),
+`status: "challenger"`. If none qualifies the single best is exported with `note` containing
+"PAPER TEST ONLY - no edge". Outputs: `var/ml/v3_mtf_wf_<variant>.json/.npz`, `var/ml/v3_mtf_report_latest.txt`,
+`var/ml/v3_mtf_summary.json`, `var/lab/train-v3_*.json`, `models/v3_*`.

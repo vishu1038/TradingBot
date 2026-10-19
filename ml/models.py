@@ -19,6 +19,7 @@ DEFAULT_CFG = {
     "cnn": {"channels": 24, "dilations": [1, 2, 4, 8], "kernel": 3, "hidden": 32, "dropout": 0.4},
     "gru": {"hidden": 32, "layers": 1, "dropout": 0.3, "head_hidden": 32},
     "transformer": {"d_model": 48, "heads": 4, "layers": 2, "ff": 96, "dropout": 0.1, "head_hidden": 64},
+    "mlp": {"hidden": 128, "hidden2": 64, "dropout": 0.3},
 }
 
 
@@ -106,6 +107,25 @@ class Transformer(nn.Module):
         return self.head2(self.drop(Fn.silu(self.head1(feat))))
 
 
+class MLP(nn.Module):
+    """Multi-timeframe net: flat feature vector [B, F] -> [B, n_out] (long, short logits [+ aux]).
+    Parameter names (fc1/fc2/head) are the export contract with ``tb.model_np.forward_mlp``."""
+
+    def __init__(self, n_feat: int, hidden=128, hidden2=64, dropout=0.3, n_out=2):
+        super().__init__()
+        self.fc1 = nn.Linear(n_feat, hidden)
+        self.fc2 = nn.Linear(hidden, hidden2)
+        self.head = nn.Linear(hidden2, n_out)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        if x.dim() == 3:
+            x = x[:, -1]
+        h = self.drop(Fn.silu(self.fc1(x)))
+        h = self.drop(Fn.silu(self.fc2(h)))
+        return self.head(h)
+
+
 def build(arch: str, n_feat: int, window: int = 64, cfg: dict | None = None) -> tuple[nn.Module, dict]:
     """Construct on CPU (no math is run), return (module, full arch_cfg).  Caller does `.to("mps")`."""
     c = dict(DEFAULT_CFG[arch])
@@ -114,6 +134,8 @@ def build(arch: str, n_feat: int, window: int = 64, cfg: dict | None = None) -> 
         return CNN(n_feat, **c), c
     if arch == "gru":
         return GRU(n_feat, **c), c
+    if arch == "mlp":
+        return MLP(n_feat, **c), c
     if arch == "transformer":
         m = Transformer(n_feat, window=window, **c)
         c["window"] = window

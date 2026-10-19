@@ -265,7 +265,17 @@ def forward_transformer(W: dict, cfg: dict, x: np.ndarray) -> np.ndarray:
     return _head(feat, W)
 
 
-FORWARD = {"cnn": forward_cnn, "gru": forward_gru, "transformer": forward_transformer}
+def forward_mlp(W: dict, cfg: dict, x: np.ndarray) -> np.ndarray:
+    """Multi-timeframe MLP on a flat feature vector: x [B, F] (a [B, T, F] input uses its last row)."""
+    h = np.asarray(x, "float32")
+    if h.ndim == 3:
+        h = h[:, -1]
+    h = silu(h @ W["fc1.weight"].T + W["fc1.bias"])
+    h = silu(h @ W["fc2.weight"].T + W["fc2.bias"])
+    return h @ W["head.weight"].T + W["head.bias"]
+
+
+FORWARD = {"cnn": forward_cnn, "gru": forward_gru, "transformer": forward_transformer, "mlp": forward_mlp}
 
 
 def forward(arch: str, W: dict, cfg: dict, x: np.ndarray, batch: int = 512) -> np.ndarray:
@@ -279,6 +289,8 @@ def forward(arch: str, W: dict, cfg: dict, x: np.ndarray, batch: int = 512) -> n
 # Scorer
 # --------------------------------------------------------------------------------------------
 class NpScorer:
+    kind = "per_symbol_5m"
+
     def __init__(self, meta: dict, weights: dict[str, np.ndarray]):
         self.meta = meta
         self.name = str(meta.get("name", "model"))
@@ -302,6 +314,8 @@ class NpScorer:
         self.feature_groups = list(meta.get("feature_groups", []))
         if "depth" in self.feature_groups:
             from . import features_depth  # noqa: F401  (registers the group)
+        if "kalman" in self.feature_groups:
+            from . import features_kalman  # noqa: F401  (registers the group)
         self.feature_names = list(meta.get("feature_names", feature_names(self.feature_groups)))
         if self.feature_names != feature_names(self.feature_groups):
             raise ValueError("model feature_names differ from tb.features (retrain, or register the model's "
@@ -374,12 +388,154 @@ class NpScorer:
         return Score(p_long, p_short, reasons)
 
 
-def load(path) -> NpScorer:
-    """``path`` may be the ``.json``, the ``.npz`` or the bare model path (no suffix)."""
+# --------------------------------------------------------------------------------------------
+# multi-timeframe scorers (kind "mtf" = numpy MLP here, kind "gbm" = tb.model_gbm): flat feature vector per decision
+# --------------------------------------------------------------------------------------------
+class MtfBase:
+    """Common part of the ``kind: "mtf"|"gbm"`` scorers (Scorer interface v2).
+
+    Features come from ``tb.features_mtf.build_for_model(meta, bundle)`` - the SAME function training uses.
+    Subclasses implement ``_raw_logits(X_raw [B, F]) -> [B, 2]`` (uncalibrated long / short logits)."""
+    kind = "mtf"
+
+    def __init__(self, meta: dict):
+        from . import features_mtf as fm
+        self.meta = meta
+        self.name = str(meta.get("name", "model"))
+        self.version = str(meta.get("version", ""))
+        self.status = meta.get("status", "challenger")
+        self.parent = meta.get("parent")
+        self.timeframes = list(meta.get("timeframes") or ["5m", *fm.DEFAULT_TFS])
+        self.feature_groups = list(meta.get("feature_groups", []))
+        if "kalman" in self.feature_groups:
+            from . import features_kalman  # noqa: F401  (registers the group)
+        tfs = fm.htf_timeframes(self.timeframes)
+        self.feature_names = list(meta.get("feature_names") or fm.feature_names(tfs, self.feature_groups))
+        if self.feature_names != fm.feature_names(tfs, self.feature_groups):
+            raise ValueError("model feature_names differ from tb.features_mtf (retrain the model)")
+        self.history_bars_5m = int(meta.get("history_bars_5m") or fm.history_bars_5m(tfs, self.feature_groups))
+        self.window = 1
+        norm = meta.get("norm") or {}
+        self.median = np.asarray(norm.get("mean", np.zeros(len(self.feature_names))), dtype="float32")
+        self.calibration = meta.get("calibration") or {}
+        self.thresholds = meta.get("thresholds", {})
+        self.exit_cfg = meta.get("exit_cfg", {})
+        self.entry_cfg = meta.get("entry_cfg", {})
+        self.metrics = meta.get("metrics", {})
+        self.n_reasons = 5
+        self._F = len(self.feature_names)
+
+    # -- subclass hook ---------------------------------------------------------------------------
+    def _raw_logits(self, X_raw: np.ndarray) -> np.ndarray:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    # -- batch API (training / evaluation) ---------------------------------------------------------
+    def predict(self, X_raw: np.ndarray) -> np.ndarray:
+        """Raw feature rows [B, F] -> calibrated probabilities [B, 2] (long, short)."""
+        lg = self._raw_logits(np.asarray(X_raw, "float32").reshape(-1, self._F))
+        return np.stack([self._cal("long", lg[:, 0]), self._cal("short", lg[:, 1])], axis=1)
+
+    predict_windows = predict            # same name as NpScorer (rows instead of windows)
+
+    def _cal(self, side: str, lg):
+        return apply_calibration(self.calibration.get(side), lg)
+
+    def _cal_slope(self, side: str) -> float:
+        c = self.calibration.get(side) or {}
+        return float(c.get("a", 1.0)) if c.get("method") == "platt" else 1.0
+
+    # -- live API ------------------------------------------------------------------------------------
+    def score(self, symbol: str, feats: np.ndarray, with_reasons: bool = True) -> Score:
+        """``feats``: the feature vector [F] (or [T, F], last row used) from ``build_for_model``."""
+        f = np.asarray(feats, dtype="float32")
+        if f.ndim == 2:
+            f = f[-1]
+        if f.shape != (self._F,):
+            raise ValueError(f"feats must be [{self._F}] (or [T, {self._F}]), got {tuple(np.shape(feats))}")
+        if not with_reasons:
+            lg = self._raw_logits(f[None])[0]
+            return Score(float(self._cal("long", lg[0])), float(self._cal("short", lg[1])), [])
+        batch = np.repeat(f[None], self._F + 1, axis=0)
+        for j in range(self._F):
+            batch[j + 1, j] = self.median[j]
+        lg = self._raw_logits(batch)
+        p_long = float(self._cal("long", lg[0, 0]))
+        p_short = float(self._cal("short", lg[0, 1]))
+        side = 0 if p_long >= p_short else 1
+        a = self._cal_slope("long" if side == 0 else "short")
+        contrib = a * (lg[0, side] - lg[1:, side])
+        order = np.argsort(-np.abs(contrib))[: self.n_reasons]
+        reasons = [Reason(self.feature_names[j], feature_label(self.feature_names[j], float(f[j])),
+                          float(f[j]), float(contrib[j])) for j in order]
+        return Score(p_long, p_short, reasons)
+
+    def score_universe(self, frames: dict) -> dict:
+        """``{symbol: FrameBundle}`` -> ``{symbol: Score}`` for the latest closed 5m bar of each symbol.  BTCUSDT's
+        frame (if present) is the market context of every other symbol.  Symbols with too little history or a
+        feature error score 0 / 0 (never trade)."""
+        from . import features_mtf as fm
+        btc = None
+        for k in ("BTCUSDT", "BTC"):
+            if k in frames:
+                btc = fm._get(frames[k], "kl", "klines")
+                break
+        out = {}
+        for sym, b in frames.items():
+            try:
+                kl = fm._get(b, "kl", "klines")
+                if kl is None or len(kl) < 0.9 * self.history_bars_5m:
+                    out[sym] = Score(0.0, 0.0, [])
+                    continue
+                bb = fm.FrameBundle(sym, kl, fm._get(b, "metrics"), fm._get(b, "funding"), None,
+                                    fm._get(b, "btc_kl", "btc") if fm._get(b, "btc_kl", "btc") is not None else btc)
+                X = fm.build_for_model(self.meta, bb, rows=np.array([len(fm.ft.regularize(kl)) - 1]))
+                out[sym] = self.score(sym, X[-1])
+            except Exception:                            # a bad frame must never take down the others
+                out[sym] = Score(0.0, 0.0, [])
+        return out
+
+
+class MtfScorer(MtfBase):
+    """``kind: "mtf"`` - the multi-timeframe MLP (numpy forward, normalisation + clipping from the artifact)."""
+    kind = "mtf"
+
+    def __init__(self, meta: dict, weights: dict[str, np.ndarray]):
+        super().__init__(meta)
+        self.arch = meta.get("arch", "mlp")
+        if self.arch not in FORWARD:
+            raise ValueError(f"unknown arch {self.arch!r}")
+        self.arch_cfg = meta.get("arch_cfg", {})
+        self.n_members = int(meta.get("ensemble", 1) or 1)
+        W32 = {k: np.asarray(v, dtype="float32") for k, v in weights.items()}
+        if self.n_members > 1:
+            self.members = [{k.split("/", 1)[1]: v for k, v in W32.items() if k.startswith(f"e{m}/")}
+                            for m in range(self.n_members)]
+        else:
+            self.members = [W32]
+        self.W = self.members[0]
+        norm = meta["norm"]
+        self.mean = np.asarray(norm["mean"], dtype="float32")
+        self.std = np.asarray(norm["std"], dtype="float32")
+        self.clip = float(norm.get("clip", 5.0))
+
+    def _raw_logits(self, X_raw: np.ndarray) -> np.ndarray:
+        z = normalize(X_raw, self.mean, self.std, self.clip)
+        return sum(forward(self.arch, W, self.arch_cfg, z)[:, :2] for W in self.members) / len(self.members)
+
+
+def load(path):
+    """``path`` may be the ``.json``, the ``.npz`` / ``.pkl`` or the bare model path (no suffix).  Dispatches on the
+    artifact's ``kind``: ``per_symbol_5m`` (default) -> NpScorer, ``mtf`` -> MtfScorer, ``gbm`` -> tb.model_gbm."""
     p = Path(path)
-    if p.suffix in (".json", ".npz"):
+    if p.suffix in (".json", ".npz", ".pkl"):
         p = p.with_suffix("")
     meta = json.loads(Path(str(p) + ".json").read_text())
+    kind = meta.get("kind", "per_symbol_5m")
+    if kind == "gbm":
+        from . import model_gbm
+        return model_gbm.load(p)
     with np.load(str(p) + ".npz") as z:
         weights = {k: z[k] for k in z.files}
+    if kind == "mtf":
+        return MtfScorer(meta, weights)
     return NpScorer(meta, weights)
