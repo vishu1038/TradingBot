@@ -131,8 +131,11 @@ def main() -> int:
     promos = [] if a.no_promote else try_promotions(a.api, s)
     s["promotions"] = promos
     out = json.dumps(s, indent=2, default=str)
-    (reports / f"check-{s['t']}.json").write_text(out)
-    (reports / "latest.json").write_text(out)
+    # One latest-file per bot: latest.json for the default (testnet, :8787), latest_<port>.json otherwise.
+    port = a.api.rstrip("/").rsplit(":", 1)[-1]
+    suffix = "" if port == "8787" else f"_{port}"
+    (reports / f"check{suffix}-{s['t']}.json").write_text(out)
+    (reports / f"latest{suffix}.json").write_text(out)
     print(out)
     if not a.no_chat:
         head, card = card_for(s, promos)
