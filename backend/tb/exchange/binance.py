@@ -462,8 +462,13 @@ class BinanceExchange(Exchange):
             return False
 
     def last_close(self, symbol: str, side: str, since_ms: int, sl_order_id: str | None = None,
-                   tp_order_id: str | None = None, entry_price: float = 0.0) -> CloseInfo | None:
+                   tp_order_id: str | None = None, entry_price: float = 0.0,
+                   booked: dict | None = None) -> CloseInfo | None:
         fills = self.user_trades(symbol, since_ms)
+        booked = booked or {}
+        skip = {str(o).partition(":")[2] or str(o) for o in booked.get("order_ids", ())}
+        if skip:                       # a partial take-profit already booked as its own trade must not be counted twice
+            fills = [f for f in fills if str(f.get("orderId")) not in skip]
         close_side = "SELL" if side == "long" else "BUY"
         closing = [f for f in fills if f["side"] == close_side and int(f["time"]) >= since_ms]
         if not closing:
@@ -473,8 +478,9 @@ class BinanceExchange(Exchange):
         pnl = sum(float(f["realizedPnl"]) for f in fills if int(f["time"]) >= since_ms)
         fees = sum(float(f["commission"]) for f in fills if int(f["time"]) >= since_ms
                    and f.get("commissionAsset", "USDT") in ("USDT", "USDC", "BUSD"))
+        fees = max(0.0, fees - float(booked.get("entry_fee", 0.0)))      # (the partial trade took its share of the entry fee)
         try:
-            funding = self.funding_income(symbol, since_ms)
+            funding = self.funding_income(symbol, since_ms) - float(booked.get("funding", 0.0))
         except ExchangeError:
             funding = 0.0
         if self._order_triggered(symbol, sl_order_id):

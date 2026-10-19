@@ -30,9 +30,15 @@ class SimConfig:
     sl_usd: float = 10.0
     tp_atr: float = 1.5
     sl_atr: float = 1.0
-    trail_enabled: bool = False
-    trail_activate_r: float = 1.0          # activate once price moved this many initial risks in favour
+    trail_enabled: bool = True             # profit protection (2026-10-19): same defaults as tb.config.Settings
+    trail_activate_r: float = 1.5          # activate once price moved this many initial risks in favour
     trail_distance_atr: float = 1.0        # stop trails this many ATRs behind the best price
+    breakeven_r: float = 1.0               # stop -> entry +- round-trip fees after this many initial risks in favour (0 = off)
+    sl_cooldown_bars: int = 24             # no new entry on a coin for N bars after a LOSING sl / trail / kill / liquidation exit
+    max_open_risk_pct: float = 20.0        # open-risk budget (% of equity) the side cap below is a share of
+    max_side_risk_pct: float = 60.0        # open stop-out risk of ONE side (incl. the new entry) <= this % of that budget; >= 100 = off
+    partial_tp_r: float = 1.5              # close partial_tp_frac of the position at this many initial risks in favour (0 = off)
+    partial_tp_frac: float = 0.5
     short_enabled: bool = False
     thr_long: float = 0.70
     thr_short: float = 0.80

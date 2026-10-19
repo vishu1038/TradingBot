@@ -96,3 +96,12 @@ def cfg() -> Settings:
 @pytest.fixture
 def fake_data() -> FakeData:
     return FakeData()
+
+
+def pytest_collection_finish(session):
+    """Move everything imported during collection (pandas, numpy, the whole tb package ...) out of the GC's reach: a full
+    collection over that heap takes ~50 ms and landed inside timing-sensitive tests (test_alerts non-blocking dispatch)."""
+    import gc
+
+    gc.collect()
+    gc.freeze()

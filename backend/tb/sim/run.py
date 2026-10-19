@@ -67,6 +67,8 @@ def build_cfg(a) -> SimConfig:
     return SimConfig(
         start_equity=a.start_equity, exit_mode=a.exit, tp_usd=a.tp_usd, sl_usd=a.sl_usd,
         tp_atr=a.tp_atr, sl_atr=a.sl_atr, trail_enabled=a.trail, trail_activate_r=a.activate_r,
+        breakeven_r=a.breakeven_r, sl_cooldown_bars=a.sl_cooldown_bars, max_side_risk_pct=a.max_side_risk,
+        max_open_risk_pct=a.max_open_risk, partial_tp_r=a.partial_r, partial_tp_frac=a.partial_frac,
         trail_distance_atr=a.trail_atr, short_enabled=a.shorts or a.side in ("short", "both"),
         thr_long=a.thr_long, thr_short=a.thr_short, max_positions=a.max_positions,
         kill_dd_pct=a.kill_dd, fee_taker=a.fee, slippage=a.slippage,
@@ -87,8 +89,15 @@ def main(argv=None) -> int:
     ap.add_argument("--sl-usd", type=float, default=10.0)
     ap.add_argument("--tp-atr", type=float, default=1.5)
     ap.add_argument("--sl-atr", type=float, default=1.0)
-    ap.add_argument("--trail", action="store_true")
-    ap.add_argument("--activate-r", type=float, default=1.0)
+    d = SimConfig()                      # profit protection defaults = the live Settings defaults (0 / --no-trail turn them off)
+    ap.add_argument("--trail", action=argparse.BooleanOptionalAction, default=d.trail_enabled)
+    ap.add_argument("--activate-r", type=float, default=d.trail_activate_r)
+    ap.add_argument("--breakeven-r", type=float, default=d.breakeven_r, help="0 = off")
+    ap.add_argument("--sl-cooldown-bars", type=int, default=d.sl_cooldown_bars)
+    ap.add_argument("--max-side-risk", type=float, default=d.max_side_risk_pct, help="%% of the open-risk budget; 100 = off")
+    ap.add_argument("--max-open-risk", type=float, default=d.max_open_risk_pct)
+    ap.add_argument("--partial-r", type=float, default=d.partial_tp_r, help="0 = off")
+    ap.add_argument("--partial-frac", type=float, default=d.partial_tp_frac)
     ap.add_argument("--trail-atr", type=float, default=1.0)
     ap.add_argument("--shorts", action="store_true")
     ap.add_argument("--thr-long", type=float, default=0.70)

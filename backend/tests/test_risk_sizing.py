@@ -184,7 +184,7 @@ def test_sl_loss_includes_fees_and_stop_slippage():
 
 
 def test_slots_fit_capacity_on_stakes():
-    cfg = Settings()
+    cfg = Settings().merge({"max_side_risk_pct": 100})                                  # (side cap: test_profit_protection.py)
     # 200 USDT stake: margin 17.8+0.08 per slice -> 11 by margin, 25 by 20x, but open risk 20% = 40 / 10.3 -> 3
     assert slots_fit(cfg, _book(200, 200), 0) == 3
     loose = cfg.merge({"max_open_risk_pct": 100})

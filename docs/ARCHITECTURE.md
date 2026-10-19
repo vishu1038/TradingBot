@@ -104,12 +104,48 @@ Shared runtime dirs (gitignored): `var/` (DB, logs), `data/archive/` (parquet), 
   - `fixed`: TP at +`tp_usd` (5) PnL, SL at −`sl_usd` (10) PnL on the position's notional.
   - `atr`: TP = entry ± `tp_atr`·ATR14(5m) (1.5), SL = entry ∓ `sl_atr`·ATR14 (1.0); qty sized so
     the SL loss ≈ `sl_usd`, capped by slice notional.
-  - optional trailing stop: once price has moved `trail.activate_r` × (initial risk) in favour,
-    the stop trails at `trail.distance_atr` × ATR behind the best price; never loosens.
+  - trailing stop (default ON since 2026-10-19: `activate_r` 1.5, `distance_atr` 1.0): once price has moved
+    `trail.activate_r` × (initial risk) in favour, the stop trails at `trail.distance_atr` × ATR behind the best price;
+    never loosens. See "Profit protection" below.
 - Fees: taker 0.05% per side (config). Slippage model: 0.02% + extra on stop fills (config).
   Funding applied at 00/08/16 UTC from the funding series.
 - Same-bar ambiguity (TP and SL both inside one 5m candle): assume **SL first** (pessimistic).
 - Entry happens at the **open of the bar after** the signal bar (no look-ahead).
+
+## Profit protection (user-approved 2026-10-19; `tb/protect.py`, shared by engine, shadow and `tb.sim`)
+Incident: +32 % equity that was mostly OPEN profit on ~12 positions (10 correlated alt longs) was erased in 8 minutes, and one
+coin was stopped out twice within 3 minutes. Five settings (in `/api/settings`, validated), plus the trailing stop above:
+- **Break-even** (`breakeven_r`, 1.0; 0 = off). Once the favourable move >= `breakeven_r` × initial risk (|entry − initial SL|)
+  the stop moves to entry ± round-trip fees (`entry × (1 ± 2·fee_taker)`). The stop only ever tightens; break-even and trailing
+  are combined by `protect.next_stop` (the tighter wins).
+- **Moving the exchange stop** (engine, every mode): the NEW reduce-only stop is placed first, the old one is cancelled afterwards
+  (`Exchange.replace_conditional`; algo orders are cancelled through the algo endpoint). If placing the new stop fails (3 tries, never
+  retried on -2021) the old stop stays live (the position is never without one) and the move is retried after 30 s; a stop that
+  could not be cancelled is remembered and cancelled later. Throttle: a move needs an improvement >= 0.1 % of the entry price and
+  happens at most once per 5m bar per position. Price already through the new level → market exit (`sl` / `trail`). Applies to the
+  Settings exits and to model exits (`pct`, `atr:<tf>`; the trail of an `atr:<tf>` position uses that timeframe's ATR; `pct` exits and
+  cross-sectional legs are not trailed, legs still get break-even).
+- **Cooldown after a losing exit** (`sl_cooldown_bars`, 24 = 2 h of 5m bars). No new entry on the same coin after an exit with reason
+  `sl` / `trail` / `kill` / `timeout` / `liquidation` AND net pnl <= 0 (a stop that locked in profit does not count); in addition to
+  `cooldown_bars`. Rebuilt from the `trades` table at start (survives restarts); shadow books and `tb.sim` use the same rule.
+- **One-direction cap** (`max_side_risk_pct`, 60). `risk.check_entry(..., side)` rule `side_risk`: the open stop-out risk of ONE side
+  (longs or shorts, incl. the new entry) may not exceed `max_side_risk_pct` % of the open-risk BUDGET (`max_open_risk_pct` % × bot
+  equity); e.g. 35 % of $200 = $70 budget → at most $42 of long risk. Log: `blocked by rule side_risk (...)`. Cross-sectional legs
+  are checked per leg. A stop moved to break-even stops counting as risk, which frees capacity. Shadow books apply it per model against a
+  static equity proxy (`capital_usd` or `paper_start_equity`); `tb.sim` against `SimConfig.max_open_risk_pct` × equity (100 = off in both).
+- **Partial take-profit** (`partial_tp_r` 1.5, `partial_tp_frac` 0.5; `partial_tp_r` 0 = off). Once per position, when price reaches
+  entry ± `partial_tp_r` × initial risk (and a TP, if any, is further than 0.1 % beyond that level): a reduce-only MARKET order closes
+  `frac` of the quantity (lot step respected; skipped for good when either part would be below min qty / min notional). It is a trade
+  row with `exit_reason: "partial"` (NET pnl, fees = entry-fee share + exit fee, funding share as a cost; the remainder's row carries the
+  rest, so the two rows sum to the position's net). Then stop and TP are re-placed for the remaining quantity (stop at least at
+  break-even; if the new stop cannot be placed the old, larger one stays and the resize is retried). Win rate / trade counts
+  (`trade_stats`, drift) count a scaled-out position once. Not used for cross-sectional legs. Exchange close-outs rebuilt from fills
+  (`last_close(..., booked=)`) exclude the booked partial. State per position lives in kv `protect`.
+- **Simulators.** `SimConfig` has the same five flags with the same defaults (and `trail_enabled` True / `trail_activate_r` 1.5);
+  `tb.sim.run` exposes them (`--no-trail`, `--breakeven-r`, `--sl-cooldown-bars`, `--max-side-risk`, `--partial-r`, ...). Break-even /
+  trail moves take effect from the NEXT bar; the partial fires after the stop check (SL first) and before the TP, at its level (gap: the
+  open) with slippage + taker fee. Sim and shadow fold a partial into the position's single trade row. Labels (`tb.labels`) and
+  `tb.sim.xsec` do not model any of this: the label-parity tests run with the protection off.
 
 ## Hard safety invariants (engine)
 1. The SL is placed **on the exchange** (reduce-only STOP_MARKET, workingType MARK_PRICE) right
@@ -208,10 +244,10 @@ reports which value is break-even after fees for the chosen exit mode.
 - **Time stop / max_open.** `exit_cfg.horizon_bars` (any exit mode): the position is closed at market that many 5m bars after the
   entry (exit reason `timeout`; shadow: at that bar's close, adverse slippage, taker fee), persisted in kv `time_stops`.
   `entry_cfg.max_open`: concurrent positions allowed (live: all open positions + in-flight entries; shadow: that model's own).
-- **Exits.** Only `exit_cfg.exit_mode = "pct"` (`tp_pct`/`sl_pct` in PERCENT, like `tb.labels`) or a non-5m `atr_tf` (`1h|4h|1d`; the SMA-ATR14
+- **Exits.** (profit protection: see above.) Only `exit_cfg.exit_mode = "pct"` (`tp_pct`/`sl_pct` in PERCENT, like `tb.labels`) or a non-5m `atr_tf` (`1h|4h|1d`; the SMA-ATR14
   of the last CLOSED bar of that timeframe, computed by `tb.labels.exit_atr` = exactly the labels' ATR) make the artifact drive the exits (`tb.exits`); classic `fixed`/`atr` on 5m stay the Settings
   template. Sizing is still risk-capped (`sl_usd`) and every cap applies. xsec artifacts use `stop_vol_mult` x trailing-7d daily
-  vol (clipped `stop_min..stop_max`), stop only (legs close on the rebalance). Model-driven positions are not trailed.
+  vol (clipped `stop_min..stop_max`), stop only (legs close on the rebalance). `pct` positions and xsec legs are not trailed.
 - **Maker entries** (`entry_mode: maker`). Post-only GTX LIMIT at the venue's best bid (long) / ask (short) (`/fapi/v1/ticker/bookTicker`);
   -5022 (would take) re-prices; every `maker_timeout_s` the order is cancelled and re-posted, at most `maker_reprices` times; the
   FIRST fill (partial or full) ends the attempt, the remainder is cancelled and the stop/TP are placed for exactly the filled
@@ -301,7 +337,7 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/positions` → `[{id, symbol, side, entry_price, qty, notional, leverage, margin,
   sl_price, tp_price, trail_active, trail_price, mark_price, upnl, opened_at, prob, reasons}]`
 - `GET /api/trades?limit=200` → `[{id, symbol, side, entry_price, exit_price, qty, opened_at,
-  closed_at, pnl, fees, funding, exit_reason:"tp"|"sl"|"trail"|"kill"|"manual"|"liquidation",
+  closed_at, pnl, fees, funding, exit_reason:"tp"|"sl"|"trail"|"kill"|"manual"|"liquidation"|"partial"|"timeout"|"rebalance",
   prob}]`
   **PnL convention (everywhere: sim, engine, API, UI):** `pnl` = NET realised PnL
   (gross − fees − funding). `fees` ≥ 0 is a cost. `funding` is a cost: positive = paid,
@@ -310,7 +346,7 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/logs?limit=200` → `[{t, level, msg}]`
 - `GET /api/settings` / `PUT /api/settings` (partial merge) → `{slice_margin_usd, leverage,
   max_positions, exit_mode, tp_usd, sl_usd, tp_atr, sl_atr, trail:{enabled, activate_r,
-  distance_atr}, short_enabled, prob_threshold_long, prob_threshold_short,
+  distance_atr}, breakeven_r, sl_cooldown_bars, max_side_risk_pct, partial_tp_r, partial_tp_frac, short_enabled, prob_threshold_long, prob_threshold_short,
   corr_cap:{max_corr, max_correlated}, universe_size, universe_refresh_s, kill_dd_pct, fee_taker,
   sound}`
 - `POST /api/control` `{action:"start"|"stop"|"kill"|"reset_kill"|"close_position"|"close_all"|

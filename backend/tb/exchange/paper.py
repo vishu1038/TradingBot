@@ -423,7 +423,7 @@ class PaperExchange(Exchange):
                 paid[s] = cash
         return paid
 
-    def last_close(self, symbol, side, since_ms, sl_order_id=None, tp_order_id=None, entry_price=0.0):
+    def last_close(self, symbol, side, since_ms, sl_order_id=None, tp_order_id=None, entry_price=0.0, booked=None):
         with self._lock:
             return self.closes.pop(symbol, None)
 

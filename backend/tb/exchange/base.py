@@ -251,8 +251,11 @@ class Exchange(ABC):
 
     @abstractmethod
     def last_close(self, symbol: str, side: str, since_ms: int, sl_order_id: str | None = None,
-                   tp_order_id: str | None = None, entry_price: float = 0.0) -> CloseInfo | None:
-        """Describe how a position that vanished from the exchange was closed."""
+                   tp_order_id: str | None = None, entry_price: float = 0.0,
+                   booked: dict | None = None) -> CloseInfo | None:
+        """Describe how a position that vanished from the exchange was closed. ``booked`` (venues that rebuild the
+        close from the fill history): a partial take-profit already booked as its own trade -
+        ``{"order_ids": [...], "entry_fee": usd, "funding": signed usd}`` - which must not be counted twice."""
 
     def leverage_brackets(self, symbol: str):
         """Maintenance-margin tiers (``tb.risk.Bracket`` list) for ``symbol``, or None when unavailable."""
@@ -276,6 +279,45 @@ class Exchange(ABC):
     def open_entry_orders(self, symbol: str | None = None) -> list[tuple[str, str]]:
         """[(symbol, order_id)] of resting NON-conditional maker entries (stale ones left by a crashed engine)."""
         return []
+
+    def replace_conditional(self, symbol: str, kind: str, side: str, price: float, qty: float,
+                            old_id: str | None = None, retries: int = 3,
+                            pause_s: float = 0.4) -> tuple[str, str | None]:
+        """Move a protective order: place the NEW reduce-only stop (``kind`` "SL") / take-profit ("TP") first and cancel the
+        old one only afterwards, so the position is never without protection. Returns ``(new_id, stale_id)``;
+        ``stale_id`` is the old order when it could not be cancelled (harmless: reduce-only; the caller retries the
+        cancel). If every attempt to place the new order fails the exception propagates and the OLD order is untouched.
+        -2021 ("would immediately trigger": the price is already through the level) is never retried."""
+        import logging
+        import time
+
+        log = logging.getLogger("tb.exchange")
+        place = self.place_stop if kind == "SL" else self.place_take_profit
+        last: ExchangeError | None = None
+        new_id = None
+        for i in range(max(1, retries)):
+            try:
+                new_id = place(symbol, side, price, qty)
+                break
+            except ExchangeError as e:
+                last = e
+                log.warning("replace %s %s: placing the new order @ %s failed (%s) [attempt %d/%d]", kind, symbol, price,
+                            e, i + 1, retries)
+                if e.code == -2021:
+                    break
+                if i + 1 < retries:
+                    time.sleep(pause_s * (i + 1))
+        if new_id is None:
+            assert last is not None
+            raise last
+        if old_id:
+            try:
+                self.cancel_order(symbol, old_id)
+            except ExchangeError as e:
+                log.warning("replace %s %s: new order %s is live but cancelling the old %s failed: %s", kind, symbol,
+                            new_id, old_id, e)
+                return new_id, old_id
+        return new_id, None
 
     # ---- helpers
     def filters(self, symbol: str) -> SymbolFilters:

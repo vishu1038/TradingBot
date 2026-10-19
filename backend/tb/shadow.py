@@ -22,6 +22,7 @@ from .config import Settings
 from .entry import EntryCfg
 from .exchange.base import SymbolFilters
 from .exits import ExitSpec
+from .protect import Protect, breakeven_price, next_stop, partial_level, partial_split, stop_loss_usd, tighter
 from .risk import levels, size_trade
 
 log = logging.getLogger("tb.shadow")
@@ -42,6 +43,19 @@ class ShadowPos:
     prob: float
     entry_fee: float
     deadline: int | None = None   # time stop (seconds): closed at the first bar close / tick at or after it
+    # ---- profit protection (same maths as the live engine / tb.sim): break-even, trailing stop, partial take-profit.
+    # The partial's economics are FOLDED into the position's single trade row (one row per position, win = net of both parts).
+    sl0: float = 0.0              # initial stop (initial risk = |entry - sl0|)
+    best: float = 0.0             # best price seen
+    atr: float | None = None      # ATR the trailing stop uses (None = no trailing: pct exits)
+    trail_active: bool = False
+    partial_done: bool = False
+    init_qty: float = 0.0
+    part_gross: float = 0.0
+    part_fees: float = 0.0
+    step_size: float = 1e-9       # lot filters, for the partial take-profit split
+    min_qty: float = 0.0
+    min_notional: float = 0.0
 
 
 @dataclass
@@ -126,7 +140,28 @@ class ShadowBook:
                 return None
             qty, sl, tp = sz.qty, sz.sl_price, (sz.tp_price if spec.tp_enabled else None)
         dl = int(t) + int(spec.horizon_bars) * 300 if spec is not None and spec.horizon_bars else None
-        return ShadowPos(model, symbol, side, fill, qty, sl, tp, int(t), float(prob), qty * fill * fee_rate, dl)
+        if not self._side_ok(model, side, qty, fill, sl):
+            return None
+        trail_atr = None if (spec is not None and spec.mode == "pct") else atr
+        return ShadowPos(model, symbol, side, fill, qty, sl, tp, int(t), float(prob), qty * fill * fee_rate, dl,
+                         sl0=sl, best=fill, atr=trail_atr, init_qty=qty, step_size=f.step_size, min_qty=f.min_qty,
+                         min_notional=f.min_notional)
+
+    def _pc(self) -> Protect:
+        return Protect.from_settings(self.cfg)
+
+    def _side_ok(self, model: str, side: str, qty: float, entry: float, sl: float) -> bool:
+        """max_side_risk_pct against the open-risk budget (max_open_risk_pct x a static equity proxy: ``capital_usd`` or
+        ``paper_start_equity``): a model's open stop-out risk on ONE side, incl. the new entry, stays under the cap.
+        100 % = off (the shadow book has no total open-risk cap that would bound a single side)."""
+        cfg = self.cfg
+        if cfg.max_side_risk_pct >= 100:
+            return True
+        c = (cfg.fee_taker, cfg.slippage_pct, cfg.stop_slippage_pct)
+        cap = cfg.max_side_risk_pct / 100.0 * cfg.max_open_risk_pct / 100.0 * float(cfg.capital_usd or cfg.paper_start_equity)
+        used = sum(stop_loss_usd(q.side, q.qty, q.entry, q.sl, *c) for q in self.pos.values()
+                   if q.model == model and q.side == side)
+        return used + stop_loss_usd(side, qty, entry, sl, *c, entry_fee=True) <= cap + 1e-9
 
     def open(self, model: str, symbol: str, side: str, prob: float, price: float, t: float,
              atr: float | None, f: SymbolFilters, spec: ExitSpec | None = None, entry: EntryCfg | None = None,
@@ -159,11 +194,13 @@ class ShadowBook:
 
     def _close(self, p: ShadowPos, px: float, reason: str, t: float) -> dict:
         d = 1.0 if p.side == "long" else -1.0
-        gross = (px - p.entry) * p.qty * d
-        fees = p.entry_fee + p.qty * px * self.cfg.fee_taker
+        gross = (px - p.entry) * p.qty * d + p.part_gross
+        fees = p.entry_fee + p.qty * px * self.cfg.fee_taker + p.part_fees
         del self.pos[self._key(p.model, p.symbol)]
+        if reason == "sl" and p.trail_active and (p.sl - (p.sl0 or p.sl)) * d > 0:
+            reason = "trail"                                      # a stop that was ratcheted (trail) is reported as such
         return {"model": p.model, "symbol": p.symbol, "side": p.side, "entry_time": p.opened_at, "exit_time": int(t),
-                "entry_price": p.entry, "exit_price": px, "qty": p.qty, "pnl": gross - fees, "fees": fees,
+                "entry_price": p.entry, "exit_price": px, "qty": p.init_qty or p.qty, "pnl": gross - fees, "fees": fees,
                 "exit_reason": reason, "prob": p.prob}
 
     def _eval(self, p: ShadowPos, m: float, t: float) -> dict | None:
@@ -185,16 +222,54 @@ class ShadowBook:
             r = self._eval(p, price, t)
             if r is None and p.deadline and t >= p.deadline:      # time stop (labels: a timeout is closed at market)
                 r = self.close_leg(p.model, p.symbol, price, t, "timeout")
+            if r is None:
+                self._partial(p, price)
+                self._ratchet(p, price)
             if r:
                 out.append(r)
         return out
+
+    def _partial(self, p: ShadowPos, ref: float) -> None:
+        """Partial take-profit when ``ref`` reached its level: ``partial_tp_frac`` is closed at the level (taker fee,
+        adverse slippage), the remainder's stop moves to at least break-even. Booked into the position (folded row)."""
+        if p.partial_done:
+            return
+        pc = self._pc()
+        lvl = partial_level(p.side, p.entry, p.sl0 or p.sl, p.tp, pc)
+        d = 1.0 if p.side == "long" else -1.0
+        if lvl is None or (ref - lvl) * d < 0:
+            return
+        from .exchange.base import SymbolFilters
+
+        split = partial_split(p.qty, lvl, pc.partial_tp_frac, SymbolFilters(0.0, p.step_size, p.min_qty, p.min_notional))
+        p.partial_done = True
+        if split is None:
+            return
+        q, rem = split
+        px = lvl * (1.0 - d * self.cfg.slippage_pct)
+        frac = q / p.qty
+        p.part_gross += (px - p.entry) * q * d
+        p.part_fees += p.entry_fee * frac + q * px * self.cfg.fee_taker
+        p.entry_fee *= (1.0 - frac)
+        p.qty = rem
+        p.sl = tighter(p.side, p.sl, breakeven_price(p.side, p.entry, self.cfg.fee_taker))
+
+    def _ratchet(self, p: ShadowPos, fav: float) -> None:
+        """Break-even / trailing stop update from the favourable extreme just seen (effective from the next evaluation)."""
+        p.best = max(p.best or fav, fav) if p.side == "long" else min(p.best or fav, fav)
+        p.trail_active, p.sl, _ = next_stop(p.side, p.entry, p.sl0 or p.sl, p.sl, p.best, p.atr, p.trail_active, self._pc())
 
     def _bar_eval(self, p: ShadowPos, bar_open_ms: int, low: float, high: float, t: float,
                   close: float | None = None) -> dict | None:
         if bar_open_ms <= p.opened_at * 1000:
             return None
         adverse, fav = (low, high) if p.side == "long" else (high, low)
-        r = self._eval(p, adverse, t) or self._eval(p, fav, t)
+        r = self._eval(p, adverse, t)                             # stop first (pessimistic) ...
+        if r is None:
+            self._partial(p, fav)                                 # ... then the partial take-profit ...
+            r = self._eval(p, fav, t)                             # ... then the TP for what is left
+        if r is None:
+            self._ratchet(p, fav)
         if r is None and p.deadline and close is not None and (bar_open_ms + BAR_MS) / 1000.0 >= p.deadline:
             r = self.close_leg(p.model, p.symbol, close, (bar_open_ms + BAR_MS) / 1000.0, "timeout")   # at that bar's close
         return r
@@ -257,6 +332,11 @@ class ShadowBook:
     def import_state(self, st: Mapping[str, Any]) -> None:
         names = {f.name for f in fields(ShadowPos)}
         self.pos = {k: ShadowPos(**{a: b for a, b in v.items() if a in names}) for k, v in st.items()}
+        for p in self.pos.values():                               # positions saved before profit protection existed
+            if not p.sl0:
+                p.sl0, p.best = p.sl, p.entry
+            if not p.init_qty:
+                p.init_qty = p.qty
 
 
 # ----------------------------------------------------------------------------- statistics / promotion

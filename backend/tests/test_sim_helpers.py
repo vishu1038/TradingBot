@@ -47,6 +47,8 @@ def sig_at(n: int, rows, side: str = "long", prob: float = 1.0) -> np.ndarray:
 def plain_cfg(**kw) -> SimConfig:
     """No slippage, no safety layer, kill off: isolates the template arithmetic."""
     base = dict(start_equity=1000.0, slippage=0.0, stop_slippage_extra=0.0, kill_dd_pct=100.0,
-                derate_enabled=False, plausibility_enabled=False, drift_enabled=False)
+                derate_enabled=False, plausibility_enabled=False, drift_enabled=False,
+                # profit protection OFF: these tests hand-compute the bare template (see test_profit_protection.py)
+                trail_enabled=False, breakeven_r=0.0, partial_tp_r=0.0, sl_cooldown_bars=0, max_side_risk_pct=100.0)
     base.update(kw)
     return SimConfig(**base)

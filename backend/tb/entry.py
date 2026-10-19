@@ -35,6 +35,7 @@ class EntryCfg:
     maker_timeout_s: int = 60
     maker_reprices: int = 2
     maker_on_timeout: str = "skip"
+    sl_cooldown_bars: int = 0           # per coin: no new entry for N bars after a LOSING sl/trail/kill/timeout/liquidation exit
     max_open: int | None = None         # entry_cfg only: concurrent positions this model may hold (null = unlimited)
 
     @classmethod
@@ -56,6 +57,7 @@ class EntryCfg:
             maker_timeout_s=_int(e.get("maker_timeout_s"), cfg.maker_timeout_s, 5, 900),
             maker_reprices=_int(e.get("maker_reprices"), cfg.maker_reprices, 0, 10),
             maker_on_timeout=on_to if on_to in ("skip", "taker") else cfg.maker_on_timeout,
+            sl_cooldown_bars=_int(e.get("sl_cooldown_bars"), cfg.sl_cooldown_bars, 0, 100_000),
             max_open=_int(e.get("max_open"), 0, 1, 1000) or None)
 
 
@@ -109,20 +111,24 @@ class EntryGate:
 
     def __init__(self) -> None:
         self.last: dict[str, float] = {}      # symbol -> last entry / exit time (s)
+        self.last_loss: dict[str, float] = {}  # symbol -> last LOSING stop-type exit time (s): sl_cooldown_bars
         self.entries: list[float] = []        # entry times (s), pruned to the current UTC day
 
-    def seed(self, entries: Iterable[tuple[str, float]] = (), exits: Iterable[tuple[str, float]] = ()) -> None:
+    def seed(self, entries: Iterable[tuple[str, float]] = (), exits: Iterable[tuple] = ()) -> None:
+        """``exits``: (symbol, time) or (symbol, time, was_a_losing_exit)."""
         for sym, t in entries:
             self.record_entry(sym, t)
-        for sym, t in exits:
-            self.record_exit(sym, t)
+        for ex in exits:
+            self.record_exit(ex[0], ex[1], loss=bool(ex[2]) if len(ex) > 2 else False)
 
     def record_entry(self, sym: str, t: float) -> None:
         self.last[sym] = max(self.last.get(sym, 0.0), float(t))
         self.entries.append(float(t))
 
-    def record_exit(self, sym: str, t: float) -> None:
+    def record_exit(self, sym: str, t: float, loss: bool = False) -> None:
         self.last[sym] = max(self.last.get(sym, 0.0), float(t))
+        if loss:
+            self.last_loss[sym] = max(self.last_loss.get(sym, 0.0), float(t))
 
     def trades_today(self, now: float) -> int:
         d0 = day_start(now)
@@ -139,4 +145,9 @@ class EntryGate:
             left = self.last.get(sym, 0.0) + cfg.cooldown_bars * BAR_MS / 1000.0 - now
             if left > 0:
                 return False, f"{sym} cooling down ({left / 60:.0f} min left of {cfg.cooldown_bars} bars)"
+        if cfg.sl_cooldown_bars > 0 and sym in self.last_loss:
+            left = self.last_loss[sym] + cfg.sl_cooldown_bars * BAR_MS / 1000.0 - now
+            if left > 0:
+                return False, (f"{sym} cooling down after a losing exit ({left / 60:.0f} min left of "
+                               f"{cfg.sl_cooldown_bars} bars)")
         return True, ""

@@ -321,9 +321,14 @@ class Store:
         w = "WHERE closed_at>=?" if since is not None else ""
         a = (since,) if since is not None else ()
         # trades.pnl is NET of fees and funding (fees/funding are COSTS, > 0 = paid); win = net pnl > 0
-        r = self.one(f"SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees, "
-                     f"COALESCE(SUM(funding),0) funding, "
-                     f"COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) wins FROM trades {w}", a)
+        r = self.one(f"SELECT COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(fees),0) fees, "
+                     f"COALESCE(SUM(funding),0) funding FROM trades {w}", a)
+        # a position scaled out by a partial take-profit has several rows (exit_reason 'partial' + the final one):
+        # trade COUNT and wins are per position (summed net pnl), money sums are per row
+        g = self.one(f"SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN p>0 THEN 1 ELSE 0 END),0) wins FROM "
+                     f"(SELECT SUM(pnl) p FROM trades {w} GROUP BY CASE WHEN position_id IN "
+                     f"(SELECT position_id FROM trades WHERE exit_reason='partial') THEN position_id ELSE -id END)", a)
+        r = {"n": g["n"], "wins": g["wins"], "pnl": r["pnl"], "fees": r["fees"], "funding": r["funding"]}
         return {"n": r["n"], "net": r["pnl"], "fees": r["fees"], "funding": r["funding"],
                 "gross": r["pnl"] + r["fees"] + r["funding"], "wins": r["wins"]}
 

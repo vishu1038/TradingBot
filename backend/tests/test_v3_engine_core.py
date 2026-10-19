@@ -519,7 +519,7 @@ def test_xsec_rebalance_closes_dropped_legs_keeps_unchanged_and_opens_new(store,
 def test_xsec_legs_obey_the_open_risk_cap(store, tmp_path, doubles):
     eng, data, slot = xsec_engine(store, tmp_path, doubles, {"AAAUSDT": 0.9, "BBBUSDT": 0.6, "CCCUSDT": 0.4, "DDDUSDT": 0.1},
                                   )
-    store.patch_settings({"max_open_risk_pct": 12.0}, allow_internal=True)       # one leg risks ~10 % of equity
+    store.patch_settings({"max_open_risk_pct": 12.0, "max_side_risk_pct": 100.0}, allow_internal=True)       # one leg risks ~10 % of equity
     eng.cfg = store.get_settings()
     run(eng.bars_cycle())
     assert len(store.get_positions()) == 1 and len(eng.xsec_book) == 1               # the cap binds: no overshoot

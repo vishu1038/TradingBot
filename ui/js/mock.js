@@ -64,7 +64,12 @@ export const DEFAULT_SETTINGS = () => ({
   sl_usd: 10,
   tp_atr: 1.5,
   sl_atr: 1.0,
-  trail: { enabled: true, activate_r: 1.0, distance_atr: 0.8 },
+  breakeven_r: 1.0, // stop -> entry +- fees after this many R in profit (0 = off)
+  sl_cooldown_bars: 24, // no re-entry on a coin for this many 5m bars after a losing exit
+  max_side_risk_pct: 60, // one side's open stop-out risk as % of the open-risk budget
+  partial_tp_r: 1.5, // partial take-profit level in R (0 = off)
+  partial_tp_frac: 0.5, // share of the quantity closed there
+  trail: { enabled: true, activate_r: 1.5, distance_atr: 1.0 },
   short_enabled: false,
   prob_threshold_long: 0.7,
   prob_threshold_short: 0.8,
@@ -88,6 +93,11 @@ const SETTINGS_RULES = [
   ['sl_usd', 0.01, 10000],
   ['tp_atr', 0.1, 20],
   ['sl_atr', 0.1, 20],
+  ['breakeven_r', 0, 20],
+  ['sl_cooldown_bars', 0, 100000, true],
+  ['max_side_risk_pct', 1, 100],
+  ['partial_tp_r', 0, 20],
+  ['partial_tp_frac', 0.05, 0.95],
   ['trail.activate_r', 0.1, 10],
   ['trail.distance_atr', 0.1, 10],
   ['prob_threshold_long', 0.5, 0.99],

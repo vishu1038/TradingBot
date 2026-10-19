@@ -156,8 +156,8 @@ def trading_base_url(mode: str, env: Mapping[str, str] | None = None) -> str:
 # ----------------------------------------------------------------------------- settings
 @dataclass(frozen=True)
 class TrailCfg:
-    enabled: bool = False
-    activate_r: float = 1.0
+    enabled: bool = True                # profit protection (2026-10-19): trail on by default, after break-even
+    activate_r: float = 1.5
     distance_atr: float = 1.0
 
 
@@ -175,6 +175,7 @@ CONTRACT_KEYS = (
     "universe_size", "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
     "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
     "maker_reprices", "maker_on_timeout",
+    "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
 )
 
 
@@ -212,6 +213,12 @@ class Settings:
     maker_timeout_s: int = 60           # how long one resting post-only order may wait before it is re-priced
     maker_reprices: int = 2             # re-price (cancel + repost at the new best bid/ask) at most this many times
     maker_on_timeout: str = "skip"      # skip | taker: what to do when no maker order filled at all
+    # ---- profit protection (docs/ARCHITECTURE.md "Profit protection"; same maths in engine, shadow and tb.sim)
+    breakeven_r: float = 1.0            # favourable move (x initial risk) after which the stop moves to entry +- round-trip fees; 0 = off
+    sl_cooldown_bars: int = 24          # per coin: no new entry for N 5m bars after a LOSING sl / trail / kill / timeout / liquidation exit
+    max_side_risk_pct: float = 60.0     # open stop-out risk of ONE side (longs or shorts), incl. a new entry, <= this % of the open-risk budget
+    partial_tp_r: float = 1.5           # at this favourable move (x initial risk) close partial_tp_frac of the position; 0 = off
+    partial_tp_frac: float = 0.5        # share of the quantity closed by the partial take-profit (once per position)
     # ---- engine-internal (not part of the API contract; stored but not exposed)
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
@@ -301,6 +308,11 @@ class Settings:
         chk(0 <= self.fee_maker < 0.01, "fee_maker must be a fraction in [0, 0.01)")
         chk(self.tp_usd > 0 and self.sl_usd > 0, "tp_usd/sl_usd must be > 0")
         chk(self.tp_atr > 0 and self.sl_atr > 0, "tp_atr/sl_atr must be > 0")
+        chk(0 <= self.breakeven_r <= 20, "breakeven_r must be 0..20 (0 = off)")
+        chk(0 <= self.sl_cooldown_bars <= 100_000, "sl_cooldown_bars must be >= 0")
+        chk(1 <= self.max_side_risk_pct <= 100, "max_side_risk_pct must be 1..100")
+        chk(0 <= self.partial_tp_r <= 20, "partial_tp_r must be 0..20 (0 = off)")
+        chk(0.05 <= self.partial_tp_frac <= 0.95, "partial_tp_frac must be 0.05..0.95")
         chk(self.trail.activate_r > 0 and self.trail.distance_atr > 0, "trail values must be > 0")
         chk(0 <= self.prob_threshold_long <= 1, "prob_threshold_long must be 0..1")
         chk(0 <= self.prob_threshold_short <= 1, "prob_threshold_short must be 0..1")

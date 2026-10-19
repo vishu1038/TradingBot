@@ -214,7 +214,7 @@ def test_open_risk_cap_blocks_the_nth_correlated_trade(store, tmp_path, caplog):
     import logging
     syms = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "BTCUSDT")
     eng, data, venue = mk_demo(store, tmp_path, prod_marks={s: 100.0 for s in syms}, venue_marks={s: 100.0 for s in syms},
-                               settings={"max_open_risk_pct": 25.0, "corr_cap": {"max_corr": 0.99, "max_correlated": 9}},
+                               settings={"max_open_risk_pct": 25.0, "max_side_risk_pct": 100.0, "corr_cap": {"max_corr": 0.99, "max_correlated": 9}},
                                wallet=100.0)
     eng.cfg = store.get_settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)
     eng.universe = list(syms[:4])
@@ -288,7 +288,7 @@ def test_leverage_falls_back_when_the_exchange_rejects_it(store, tmp_path):
 
 def test_capacity_on_a_200_usdt_stake(store, tmp_path):
     eng, data, venue = mk_demo(store, tmp_path, prod_marks=PROD, venue_marks=dict(PROD), wallet=5000.0,
-                               settings={"capital_usd": 200.0, "max_open_risk_pct": 20.0})
+                               settings={"capital_usd": 200.0, "max_open_risk_pct": 20.0, "max_side_risk_pct": 100.0})
     run(eng.heartbeat_cycle())
     st = store.kv_get("status")
     assert st["equity"] == pytest.approx(200.0)

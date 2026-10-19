@@ -254,20 +254,24 @@ class Book:
     open_notional: float = 0.0
     open_mm: float = 0.0
     open_risk: float = 0.0
+    open_risk_long: float = 0.0        # share of ``open_risk`` held by long positions
+    open_risk_short: float = 0.0       # ... and by shorts (side_risk rule)
 
 
 @dataclass
 class EntryCheck:
     ok: bool
-    rule: str = ""          # total_leverage | margin_ratio | open_risk | free_margin | "" (ok)
+    rule: str = ""          # total_leverage | margin_ratio | open_risk | side_risk | free_margin | "" (ok)
     detail: str = ""
 
 
 def check_entry(cfg: Settings, book: Book, new_notional: float, new_mm: float, new_risk: float, margin: float,
-                fee: float) -> EntryCheck:
+                fee: float, side: str | None = None) -> EntryCheck:
     """A new position is allowed only if, INCLUDING it:
     (1) sum(notional)/equity <= max_total_leverage, (2) sum(maintenance margin)/equity <= max_margin_ratio,
-    (3) sum(loss if every SL fills)/equity <= max_open_risk_pct %, (4) free margin >= its margin + entry fee."""
+    (3) sum(loss if every SL fills)/equity <= max_open_risk_pct %, (4) free margin >= its margin + entry fee,
+    (5) with ``side``: the stop-out risk of ONE side (longs or shorts) <= max_side_risk_pct % of the open-risk BUDGET
+    (max_open_risk_pct % x equity), so one correlated direction cannot use the whole budget."""
     eq = book.equity
     if eq <= 0:
         return EntryCheck(False, "total_leverage", "no equity")
@@ -280,6 +284,14 @@ def check_entry(cfg: Settings, book: Book, new_notional: float, new_mm: float, n
     risk = (book.open_risk + new_risk) / eq * 100.0
     if risk > cfg.max_open_risk_pct + 1e-9:
         return EntryCheck(False, "open_risk", f"open stop-out risk {risk:.1f}% > max {cfg.max_open_risk_pct:g}%")
+    if side in ("long", "short"):
+        budget = cfg.max_open_risk_pct / 100.0 * eq
+        cap = cfg.max_side_risk_pct / 100.0 * budget
+        side_risk = (book.open_risk_long if side == "long" else book.open_risk_short) + new_risk
+        if side_risk > cap + 1e-9:
+            return EntryCheck(False, "side_risk",
+                              f"{side} stop-out risk ${side_risk:.2f} > {cfg.max_side_risk_pct:g}% of the open-risk budget "
+                              f"${budget:.2f} (max ${cap:.2f})")
     if book.available + 1e-9 < margin + fee:
         return EntryCheck(False, "free_margin", f"free margin {book.available:.2f} < slice margin + fee {margin + fee:.2f}")
     return EntryCheck(True)
@@ -296,19 +308,27 @@ def slots_fit(cfg: Settings, book: Book, n_open: int, brackets=None) -> int:
     fee = notional * cfg.fee_taker
     mm = maintenance_margin(notional, brackets, cfg.maint_margin_rate)
     risk = sl_loss(cfg, notional / entry, entry, sl, "long", entry_fee=True)
-    n = 0
-    b = Book(book.equity, book.available, book.open_notional, book.open_mm, book.open_risk)
-    while n < 100:
-        if cfg.max_positions is not None and n_open + n >= cfg.max_positions:
-            break
-        if not check_entry(cfg, b, notional, mm, risk, margin, fee).ok:
-            break
-        n += 1
-        b.open_notional += notional
-        b.open_mm += mm
-        b.open_risk += risk
-        b.available -= margin + fee
-    return n
+    best = 0
+    for side in ("long", "short"):          # a slice fits on whichever side still has room
+        n = 0
+        b = Book(book.equity, book.available, book.open_notional, book.open_mm, book.open_risk,
+                 book.open_risk_long, book.open_risk_short)
+        while n < 100:
+            if cfg.max_positions is not None and n_open + n >= cfg.max_positions:
+                break
+            if not check_entry(cfg, b, notional, mm, risk, margin, fee, side).ok:
+                break
+            n += 1
+            b.open_notional += notional
+            b.open_mm += mm
+            b.open_risk += risk
+            if side == "long":
+                b.open_risk_long += risk
+            else:
+                b.open_risk_short += risk
+            b.available -= margin + fee
+        best = max(best, n)
+    return best
 
 
 def effective_slots(cfg: Settings, n_open: int, available: float) -> int:

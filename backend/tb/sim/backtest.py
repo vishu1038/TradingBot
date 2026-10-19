@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 
 from . import safety, signals as sig
+from ..protect import Protect, breakeven_price, is_loss_exit, next_stop, partial_level, partial_split, stop_loss_usd, tighter
+from ..exchange.base import SymbolFilters
 from .template import SimConfig, atr_wilder, liq_price, size_and_levels
 
 BAR_MS = 300_000
@@ -50,6 +52,11 @@ class Position:
     funding: float = 0.0     # positive = paid
     last: float = 0.0
     bars: int = 0
+    init_qty: float = 0.0
+    part_done: bool = False
+    part_gross: float = 0.0   # partial take-profit economics, folded into the position's single trade row
+    part_fees: float = 0.0
+    part_qty: float = 0.0
 
 
 @dataclass
@@ -87,6 +94,7 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
     stats = {k: 0 for k in (
         "signals", "entries", "skip_kill", "skip_has_position", "skip_fault", "skip_no_slot",
         "skip_no_margin", "skip_corr", "skip_no_atr", "skip_min_notional", "skip_drift_block",
+        "skip_sl_cooldown", "skip_side_risk", "partials", "breakeven_moves",
         "derated_trades", "drift_half_trades", "shadow_trades", "shadow_wins", "kill_closes",
         "faults_bars", "fault_episodes", "fault_excluded_bars", "drift_fired_half",
         "drift_fired_block")}
@@ -186,6 +194,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
     fee = cfg.fee_taker
     slip = cfg.slippage
     sslip = cfg.slippage + cfg.stop_slippage_extra
+    prot = Protect.from_sim(cfg)
+    cooldown_until: dict[int, int] = {}      # symbol index -> first step at which a new entry is allowed again (sl_cooldown_bars)
+    lot = SymbolFilters(0.0, 1e-9, 0.0, cfg.min_notional_usd)
 
     def unreal(p: Position) -> float:
         return p.side * p.qty * (p.last - p.entry_price)
@@ -193,13 +204,15 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
     def close(p: Position, price: float, reason: str, t_exit: int, liq: bool = False):
         nonlocal wallet, next_id
         gross = p.side * p.qty * (price - p.entry_price)
+        part_gross, part_fees = p.part_gross, p.part_fees
         exit_fee = fee * p.qty * price
         liq_fee = 0.0
         if liq:   # isolated: the loss is capped at the margin and the whole margin is lost
             gross = max(gross, -p.margin)
             exit_fee = min(exit_fee, max(0.0, p.margin + gross))
             liq_fee = p.margin + gross - exit_fee
-        fees = p.entry_fee + exit_fee + liq_fee
+        gross += part_gross
+        fees = p.entry_fee + exit_fee + liq_fee + part_fees
         net = gross - fees - p.funding
         win = net > 0
         if p.shadow:
@@ -208,13 +221,16 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
             if drift is not None:
                 drift.add(p.prob, win)
             return
-        wallet += gross - exit_fee - liq_fee
+        wallet += gross - part_gross - exit_fee - liq_fee      # (the partial's cash was booked when it happened)
+        if cfg.sl_cooldown_bars > 0 and is_loss_exit(reason, net):
+            cooldown_until[p.sidx] = ti + cfg.sl_cooldown_bars
         trades.append({
             "id": len(trades) + 1, "symbol": p.sym, "side": "long" if p.side > 0 else "short",
-            "entry_price": p.entry_price, "exit_price": price, "qty": p.qty,
+            "entry_price": p.entry_price, "exit_price": price, "qty": p.init_qty or p.qty,
             "opened_at": p.entry_time // 1000, "closed_at": t_exit // 1000,
             "pnl": net, "fees": fees, "funding": p.funding, "exit_reason": reason, "prob": p.prob,
             "gross_pnl": gross, "notional": p.notional, "bars_held": p.bars, "scale": p.scale,
+            "partial_qty": p.part_qty,
         })
         if drift is not None:
             drift.add(p.prob, win)
@@ -257,6 +273,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 continue
             if EXC[k][r - 1]:
                 stats["skip_fault"] += 1
+                continue
+            if ti < cooldown_until.get(k, 0):
+                stats["skip_sl_cooldown"] += 1
                 continue
             o = O[k][r]
             real = [p for p in open_pos if not p.shadow]
@@ -313,6 +332,14 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 if nc >= cfg.corr_max_correlated:
                     stats["skip_corr"] += 1
                     continue
+            if cfg.max_side_risk_pct < 100:
+                c = (fee, slip, cfg.stop_slippage_extra)
+                cap = cfg.max_side_risk_pct / 100.0 * cfg.max_open_risk_pct / 100.0 * equity_now
+                used = sum(stop_loss_usd("long" if q.side > 0 else "short", q.qty, q.entry_price, q.sl, *c)
+                           for q in same)
+                if used + stop_loss_usd("long" if side > 0 else "short", qty, fill, sl, *c, entry_fee=True) > cap + 1e-9:
+                    stats["skip_side_risk"] += 1
+                    continue
             wallet -= efee
             if scale_eff < 1.0:
                 stats["derated_trades"] += int(scale < 1.0)
@@ -320,7 +347,7 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 stats["min_derate_mult"] = min(stats["min_derate_mult"], scale_eff)
             p = Position(next_id, syms[k], k, side, ti, T0, fill, qty, notional, margin, tp, sl, sl,
                          liq_price(fill, side, cfg.leverage, cfg.mmr), float(atr_sig), prob, scale_eff,
-                         efee, best=fill, last=fill)
+                         efee, best=fill, last=fill, init_qty=qty)
             next_id += 1
             stats["entries"] += 1
             open_pos.append(p)
@@ -350,23 +377,42 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 px = base * (1.0 - d * sslip)
                 trailed = p.trail_active and ((stop > p.sl0) if d > 0 else (stop < p.sl0))
                 res = ("trail" if trailed else "sl", px, False)
-            elif tp_hit:
-                res = ("tp", p.tp, False)
+            else:
+                # partial take-profit: after the (pessimistic) stop check, before the TP, at its level (gap: the open)
+                if not p.part_done and not p.shadow:
+                    lvl = partial_level("long" if d > 0 else "short", p.entry_price, p.sl0, p.tp, prot)
+                    if lvl is not None and ((h >= lvl) if d > 0 else (l <= lvl)):
+                        p.part_done = True
+                        fillp = (max(lvl, o) if d > 0 else min(lvl, o)) * (1.0 - d * slip)
+                        split = partial_split(p.qty, fillp, prot.partial_tp_frac, lot)
+                        if split is not None:
+                            q, rem_q = split
+                            frac = q / p.qty
+                            g = d * q * (fillp - p.entry_price)
+                            xf = fee * q * fillp
+                            ef = p.entry_fee * frac
+                            wallet += g - xf
+                            p.part_gross += g
+                            p.part_fees += xf + ef
+                            p.part_qty += q
+                            p.entry_fee -= ef
+                            p.margin *= (1.0 - frac)
+                            p.qty = rem_q
+                            p.sl = tighter("long" if d > 0 else "short", p.sl,
+                                           breakeven_price("long" if d > 0 else "short", p.entry_price, fee))
+                            stats["partials"] += 1
+                if tp_hit:
+                    res = ("tp", p.tp, False)
             if res is not None:
                 close(p, res[1], res[0], T0 + BAR_MS - 1, res[2])
                 continue
-            # trailing update (effective from the next bar)
-            if cfg.trail_enabled and p.atr > 0:
-                risk = abs(p.entry_price - p.sl0)
-                if d > 0:
-                    p.best = max(p.best, h)
-                else:
-                    p.best = min(p.best, l)
-                fav = (p.best - p.entry_price) * d
-                if p.trail_active or fav >= cfg.trail_activate_r * risk:
-                    p.trail_active = True
-                    cand = p.best - d * cfg.trail_distance_atr * p.atr
-                    p.sl = max(p.sl, cand) if d > 0 else min(p.sl, cand)
+            # break-even / trailing update (effective from the next bar)
+            p.best = max(p.best, h) if d > 0 else min(p.best, l)
+            act, new_sl, why = next_stop("long" if d > 0 else "short", p.entry_price, p.sl0, p.sl, p.best,
+                                         p.atr if p.atr > 0 else None, p.trail_active, prot)
+            if why == "breakeven" and p.sl != new_sl:
+                stats["breakeven_moves"] += 1
+            p.trail_active, p.sl = act, new_sl
             p.last = c
             still.append(p)
         open_pos = still

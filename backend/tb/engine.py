@@ -21,6 +21,7 @@ import signal
 import sys
 import time
 from collections import deque
+from decimal import Decimal
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -36,8 +37,10 @@ from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, nex
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
 from .exits import SETTINGS_SPEC, ExitSpec, exit_atr, resolve_exit
 from .exits import bind as bind_exit
+from .protect import (MIN_STEP as PROTECT_MIN_STEP, Protect, breakeven_price, is_loss_exit, next_stop, partial_level,
+                      partial_split, tighter)
 from .risk import (Book, atr14, check_entry, correlation_gate, dd_reference, derate_multiplier, drawdown_pct, kill_tripped, levels,
-                   maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit, trail_update)
+                   maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
                      slippage_drift)
 from .scorer import (KIND_PER_SYMBOL, FrameBundle, ModelInfo, NullScorer, Score, Scorer, is_paper_only, load_model,
@@ -63,7 +66,7 @@ SYNC_LIVE_S = 5.0
 DEPTH_MIN_AGE_S = 10.0            # per-symbol order-book refresh period (8 symbols -> <= 0.8 weight-20 calls/s = ~960/min)
 DEPTH_WEIGHT_CEILING = 1500       # skip depth fetches while the minute's used weight is above this (limit 2400)
 BRACKET_TTL_S = 3600.0
-TRAIL_MIN_STEP = 0.0005           # fraction of price a trailing stop must improve by before it is moved
+PROTECT_RETRY_S = 30.0            # after a failed stop move / partial take-profit / resize: wait this long before retrying
 
 
 @dataclass
@@ -226,6 +229,9 @@ class Engine:
         self.model_gaps: dict[str, float] = {}
         self._spec_cache: dict[tuple, ExitSpec] = {}
         self._backfill_budget = HISTORY_PAGES_PER_CYCLE
+        # profit protection, per position id: last stop-move bar, partial take-profit state, booked partial (for the
+        # exchange close-out), stale stops still to cancel, failure timestamps. Persisted in kv "protect".
+        self.prot: dict[str, dict] = {}
 
     # ================================================================== helpers
     async def io(self, fn: Callable, *a: Any, **kw: Any) -> Any:
@@ -268,7 +274,7 @@ class Engine:
         # restore persisted state
         st = self.store.kv_get_many(["start_equity", "peak_equity", "kill", "running", "paper_state",
                                      "shadow_open", "universe_at", "live_trades_opened", "xsec_book", "xsec_slots",
-                                     "maker_stats", "time_stops"])
+                                     "maker_stats", "time_stops", "protect"])
         if self.paper:
             if st.get("paper_state"):
                 self.ex.import_state(st["paper_state"])
@@ -292,6 +298,7 @@ class Engine:
         self.xsec_book = {str(k): str(v) for k, v in (st.get("xsec_book") or {}).items()}
         self.xsec_slots = {str(k): int(v) for k, v in (st.get("xsec_slots") or {}).items()}
         self.time_stops = {str(k): float(v) for k, v in (st.get("time_stops") or {}).items()}
+        self.prot = {str(k): dict(v) for k, v in (st.get("protect") or {}).items() if isinstance(v, dict)}
         for k, v in (st.get("maker_stats") or {}).items():
             if k in self.maker_stats:
                 self.maker_stats[k] = int(v)
@@ -397,9 +404,10 @@ class Engine:
         """Cooldown / trades-per-day bookkeeping of the real account from the DB (restart-safe)."""
         g = EntryGate()
         d0 = day_start(self.clock()) - 2 * 86400
-        for r in self.store.query("SELECT symbol, opened_at, closed_at FROM trades WHERE closed_at>=?", (d0,)):
+        for r in self.store.query("SELECT symbol, opened_at, closed_at, exit_reason, pnl FROM trades "
+                                  "WHERE closed_at>=? AND exit_reason!='partial'", (d0,)):
             g.record_entry(r["symbol"], r["opened_at"])
-            g.record_exit(r["symbol"], r["closed_at"])
+            g.record_exit(r["symbol"], r["closed_at"], loss=is_loss_exit(r["exit_reason"], r["pnl"]))
         for p in self._db_positions():
             g.record_entry(p["symbol"], p["opened_at"])
         self.live_gate = g
@@ -411,7 +419,7 @@ class Engine:
             d0 = day_start(self.clock()) - 2 * 86400
             for t in self.store.get_shadow_trades(name, int(d0)):
                 g.record_entry(t["symbol"], t["entry_time"])
-                g.record_exit(t["symbol"], t["exit_time"])
+                g.record_exit(t["symbol"], t["exit_time"], loss=is_loss_exit(t["exit_reason"], t["pnl"]))
             for p in self.shadow.pos.values():
                 if p.model == name:
                     g.record_entry(p.symbol, p.opened_at)
@@ -519,6 +527,9 @@ class Engine:
             self.store.kv_set("xsec_book", self.xsec_book)
             self.store.kv_set("xsec_slots", self.xsec_slots)
             self.store.kv_set("time_stops", self.time_stops)
+            live_ids = {str(p["id"]) for p in self._db_positions()}
+            self.prot = {k: v for k, v in self.prot.items() if k in live_ids}
+            self.store.kv_set("protect", self.prot)
             self.store.kv_set("maker_stats", self.maker_stats)
         except Exception:
             log.exception("persist failed")
@@ -569,8 +580,7 @@ class Engine:
         xpos = {p.symbol: p for p in self.ex.positions()}
         for pos in self._db_positions():
             if pos["symbol"] not in xpos:
-                info = self.ex.last_close(pos["symbol"], pos["side"], int(pos["opened_at"] * 1000),
-                                          pos.get("sl_order_id"), pos.get("tp_order_id"), pos["entry_price"])
+                info = self._last_close(pos)
                 if info is None:
                     px = self.marks.get(pos["symbol"]) or pos["entry_price"]
                     d = 1 if pos["side"] == "long" else -1
@@ -601,6 +611,14 @@ class Engine:
                 "mark_price": xp.mark_price, "upnl": xp.upnl, "opened_at": int(self.clock()), "prob": None, "reasons": [],
                 "sl_order_id": sl.order_id, "tp_order_id": tp.order_id if tp else None, "exit_mode": self.cfg.exit_mode})
 
+    def _last_close(self, pos: dict) -> CloseInfo | None:
+        """How the position closed on the exchange; a partial take-profit already booked as its own trade is passed on
+        so venues that rebuild the close from fills do not count it twice."""
+        booked = self.prot.get(str(pos["id"]), {}).get("booked")
+        kw = {"booked": booked} if booked else {}
+        return self.ex.last_close(pos["symbol"], pos["side"], int(pos["opened_at"] * 1000), pos.get("sl_order_id"),
+                                  pos.get("tp_order_id"), pos["entry_price"], **kw)
+
     def _finalize(self, pos: dict, info: CloseInfo, reason: str) -> None:
         """Persist a closed position as a trade (sync; no exchange calls)."""
         if reason == "sl" and pos.get("trail_active"):
@@ -613,7 +631,8 @@ class Engine:
                  "funding": info.funding_cost, "exit_reason": reason, "prob": pos.get("prob")}
         tid = self.store.insert_trade(trade)
         self.store.delete_position(pos["id"])
-        self.live_gate.record_exit(pos["symbol"], t)
+        self.live_gate.record_exit(pos["symbol"], t, loss=is_loss_exit(reason, net))
+        self.prot.pop(str(pos["id"]), None)
         self.xsec_book.pop(pos["symbol"], None)
         self.time_stops.pop(str(pos["id"]), None)
         self.event("position_closed", {**trade, "id": tid})
@@ -625,7 +644,7 @@ class Engine:
         self.persist_state(force=True)
 
     def _update_drift(self) -> None:
-        rows = self.store.query("SELECT prob, pnl FROM trades WHERE prob IS NOT NULL "
+        rows = self.store.query("SELECT prob, pnl FROM trades WHERE prob IS NOT NULL AND exit_reason!='partial' "
                                 "ORDER BY id DESC LIMIT ?", (self.cfg.drift_n,))
         rows = list(reversed(rows))
         probs = [r["prob"] for r in rows]
@@ -652,8 +671,7 @@ class Engine:
         info = None
         for _ in range(4):
             try:
-                info = await self.io(self.ex.last_close, sym, pos["side"], int(pos["opened_at"] * 1000),
-                                     pos.get("sl_order_id"), pos.get("tp_order_id"), pos["entry_price"])
+                info = await self.io(self._last_close, pos)
             except ExchangeError as e:
                 log.warning("last_close lookup failed for %s: %s", sym, e)
             if info is not None:
@@ -979,18 +997,22 @@ class Engine:
     def book(self) -> Book:
         """Account aggregates over the open positions AND the in-flight maker entries (cached brackets; no I/O)."""
         n = mm = risk = 0.0
+        by_side = {"long": 0.0, "short": 0.0}
         for p in self._db_positions():
             ent = self.brackets.get(p["symbol"])
             n += p["notional"]
             mm += maintenance_margin(p["notional"], ent[1] if ent else None, self.cfg.maint_margin_rate)
-            risk += sl_loss(self.cfg, p["qty"], p["entry_price"], p["sl_price"], p["side"])
+            r = sl_loss(self.cfg, p["qty"], p["entry_price"], p["sl_price"], p["side"])
+            risk += r
+            by_side[p["side"]] = by_side.get(p["side"], 0.0) + r
         reserved = 0.0
         for r in self.pending.values():          # a resting post-only entry already counts against every cap
             n += r["notional"]
             mm += r["mm"]
             risk += r["risk"]
+            by_side[r.get("side", "long")] = by_side.get(r.get("side", "long"), 0.0) + r["risk"]
             reserved += r["margin"]
-        return Book(self.equity, self.available - reserved, n, mm, risk)
+        return Book(self.equity, self.available - reserved, n, mm, risk, by_side["long"], by_side["short"])
 
     async def try_open(self, sym: str, side: str, prob: float, reasons: list, closed: pd.DataFrame, *,
                        neutral: bool = False, spec: ExitSpec | None = None, entry: EntryCfg | None = None) -> bool:
@@ -1049,7 +1071,7 @@ class Engine:
                 return False
             fee = sz.notional * cfg.fee_taker
             new_risk = sl_loss(cfg, sz.qty, sz.entry, sz.sl_price, side, entry_fee=True)
-            chk = check_entry(cfg, bk, sz.notional, sz.mm, new_risk, sz.margin, fee)
+            chk = check_entry(cfg, bk, sz.notional, sz.mm, new_risk, sz.margin, fee, side)
             if not chk.ok:
                 log.info("skip %s %s: blocked by rule %s (%s)", side, sym, chk.rule, chk.detail)
                 return False
@@ -1255,8 +1277,7 @@ class Engine:
                 if pos["symbol"] not in xpos:
                     info = None
                     try:
-                        info = await self.io(self.ex.last_close, pos["symbol"], pos["side"], int(pos["opened_at"] * 1000),
-                                             pos.get("sl_order_id"), pos.get("tp_order_id"), pos["entry_price"])
+                        info = await self.io(self._last_close, pos)
                     except ExchangeError as e:
                         log.warning("last_close failed for %s: %s", pos["symbol"], e)
                     if info is None:
@@ -1304,30 +1325,9 @@ class Engine:
                 log.error("%s is beyond its stop by >0.3%% and still open; closing at market", sym)
                 await self.close_position({**pos, **upd}, "sl")
                 continue
-            # trailing stop
-            if cfg.trail.enabled and str(pos.get("exit_mode") or "") in ("fixed", "atr", ""):   # (model-driven exits: no trail)
-                a_prod = atr14(*self._hlc(sym))
-                atr = a_prod * self.venue_scale(sym) if a_prod else pos.get("atr")
-                active, new_sl = trail_update(pos["side"], pos["entry_price"], pos["init_sl_price"], pos["sl_price"], best,
-                                              atr, bool(pos["trail_active"]), cfg.trail.activate_r, cfg.trail.distance_atr)
-                f = await self.io(self.ex.filters, sym)
-                new_sl = f.round_price(new_sl)
-                if active and (new_sl - pos["sl_price"]) * d > max(f.tick_size, TRAIL_MIN_STEP * pos["entry_price"]):
-                    if (new_sl - m) * d >= 0:           # price already through the new stop: exit now
-                        await self.close_position({**pos, **upd, "trail_active": True}, "trail")
-                        continue
-                    try:
-                        new_id = await self.io(self.ex.place_stop, sym, opposite(order_side(pos["side"])), new_sl, pos["qty"])
-                        old = pos.get("sl_order_id")
-                        if old:
-                            await self.io(self.ex.cancel_order, sym, old)
-                        upd.update(sl_price=new_sl, sl_order_id=new_id, trail_active=True, trail_price=new_sl)
-                        self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": new_sl, "trail_active": True,
-                                                        "trail_price": new_sl})
-                    except ExchangeError as e:
-                        log.warning("trail move failed for %s: %s (old stop kept)", sym, e)
-                elif active and not pos["trail_active"]:
-                    upd.update(trail_active=True)
+            # profit protection: break-even / trailing stop, partial take-profit (exchange orders are moved, never dropped)
+            if await self._protect(pos, m, best, d, upd, now):
+                continue
             self.store.update_position(pos["id"], **upd)
         # 3) invariant: no open position without a live stop
         if self.paper or now - self._last_stop_check >= STOP_CHECK_LIVE_S:
@@ -1345,6 +1345,182 @@ class Engine:
                     log.error("INVARIANT: %s has no live stop; closing it", sym)
                     self.alerts.engine_error("stop_invariant", f"{sym} had no live stop; closed")
                     await self.close_position(pos, "manual")
+
+    # ================================================================== profit protection
+    def _pos_atr(self, pos: dict, sym: str) -> float | None:
+        """ATR the trailing stop of this position uses: the 5m ATR for the Settings exits, the exit timeframe's ATR for
+        ``atr:<tf>`` model exits (venue-scaled). None = no trailing (pct exits, cross-sectional legs)."""
+        mode = str(pos.get("exit_mode") or "")
+        if sym in self.xsec_book:
+            return None
+        if mode in ("fixed", "atr", ""):
+            a_prod = atr14(*self._hlc(sym))
+            return a_prod * self.venue_scale(sym) if a_prod else pos.get("atr")
+        if mode.startswith("atr:"):
+            k = self.kl.get(sym)
+            if k is None:
+                return None
+            now_ms = self.now_ms()
+            a = exit_atr(ExitSpec("atr", mode[4:]), k[k["open_time"] + BAR_MS <= now_ms], now_ms)
+            return a * self.venue_scale(sym) if a else None
+        return None
+
+    async def _protect(self, pos: dict, m: float, best: float, d: int, upd: dict, now: float) -> bool:
+        """Break-even + trailing stop and the partial take-profit of one position (caller holds tlock). Mutates ``upd``
+        (the DB fields to write). True = the position was closed here. A stop is only moved when it improves by >= 0.1 %
+        of the entry price and at most once per 5m bar; the NEW exchange stop is placed before the old one is cancelled
+        (``Exchange.replace_conditional``), so a failure keeps the old stop live."""
+        sym, side = pos["symbol"], pos["side"]
+        pc = Protect.from_settings(self.cfg)
+        st = self.prot.setdefault(str(pos["id"]), {})
+        entry = pos["entry_price"]
+        close_side = opposite(order_side(side))
+        bar = self.now_ms() // BAR_MS
+        await self._protect_retry(pos, st, upd, now)
+        f = await self.io(self.ex.filters, sym)
+        sl_cur = float(upd.get("sl_price", pos["sl_price"]))
+        # ---- stop: break-even, then trail
+        atr = self._pos_atr(pos, sym) if pc.trail_enabled else None
+        active, new_sl, why = next_stop(side, entry, pos["init_sl_price"], sl_cur, best, atr, bool(pos["trail_active"]), pc)
+        new_sl = f.round_price(new_sl)
+        if active and not pos["trail_active"]:
+            upd["trail_active"] = True
+        if why and (new_sl - sl_cur) * d > max(f.tick_size, PROTECT_MIN_STEP * entry) and st.get("bar") != bar \
+                and now - st.get("fail_t", -1e9) >= PROTECT_RETRY_S:
+            if (new_sl - m) * d >= 0:               # price already through the new stop: exit now
+                await self.close_position({**pos, **upd, "trail_active": active}, "trail" if active else "sl")
+                return True
+            try:
+                new_id, stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, new_sl, pos["qty"],
+                                              pos.get("sl_order_id"))
+            except ExchangeError as e:
+                st["fail_t"] = now
+                log.error("%s stop move %s -> %s FAILED (%s); the old stop stays live, retry in %.0fs", sym, sl_cur, new_sl, e,
+                          PROTECT_RETRY_S)
+            else:
+                st["bar"] = bar
+                st.pop("fail_t", None)
+                if stale:
+                    st.setdefault("orphans", []).append(stale)
+                upd.update(sl_price=new_sl, sl_order_id=new_id, trail_active=active)
+                if why == "trail":
+                    upd["trail_price"] = new_sl
+                self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": new_sl, "trail_active": active,
+                                                "trail_price": upd.get("trail_price", pos.get("trail_price"))})
+                log.info("%s stop -> %s (%s; was %s, price %s)", sym, new_sl, why, sl_cur, m)
+        # ---- partial take-profit (once per position; not for cross-sectional legs, which close on the rebalance)
+        if not st.get("partial") and sym not in self.xsec_book:
+            lvl = partial_level(side, entry, pos["init_sl_price"], pos.get("tp_price"), pc)
+            if lvl is not None and (m - lvl) * d >= 0 and now - st.get("pfail_t", -1e9) >= PROTECT_RETRY_S:
+                await self._partial_tp(pos, m, d, upd, st, f, pc, now)
+        return False
+
+    async def _partial_tp(self, pos: dict, m: float, d: int, upd: dict, st: dict, f, pc: Protect, now: float) -> None:
+        """Close ``partial_tp_frac`` of the position with a reduce-only market order, book it as its own trade (exit reason
+        "partial", NET pnl: fees and funding are costs), then resize the exchange stop / TP to the remainder."""
+        sym, side, entry = pos["symbol"], pos["side"], pos["entry_price"]
+        split = partial_split(pos["qty"], m, pc.partial_tp_frac, f)
+        if split is None:
+            st["partial"] = "skipped"
+            log.info("partial take-profit skipped for %s: %s x %s would leave a part below min qty / min notional",
+                     sym, pos["qty"], pc.partial_tp_frac)
+            return
+        q, _ = split
+        try:
+            res = await self.io(self.ex.market_order, sym, opposite(order_side(side)), q, True)
+        except ExchangeError as e:
+            st["pfail_t"] = now
+            log.error("partial take-profit order for %s failed: %s; retry in %.0fs", sym, e, PROTECT_RETRY_S)
+            return
+        filled = min(float(res.qty or q), pos["qty"])
+        px = float(res.avg_price or m)
+        frac = filled / pos["qty"]
+        entry_fee = float(pos.get("entry_fee") or pos["qty"] * entry * self.cfg.fee_taker)
+        funding = float(pos.get("funding") or 0.0)                    # signed cash flow (+ received)
+        gross = (px - entry) * filled * d
+        fees = entry_fee * frac + filled * px * self.cfg.fee_taker
+        info = CloseInfo(px, gross, fees, funding * frac, "partial", int(now))
+        net = info.net_pnl                                            # same convention as every trade row
+        t = int(now)
+        trade = {"position_id": pos["id"], "symbol": sym, "side": side, "entry_price": entry, "exit_price": px,
+                 "qty": filled, "opened_at": pos["opened_at"], "closed_at": t, "pnl": net, "fees": fees,
+                 "funding": info.funding_cost, "exit_reason": "partial", "prob": pos.get("prob")}
+        tid = self.store.insert_trade(trade)
+        rem = float(Decimal(repr(float(pos["qty"]))) - Decimal(repr(float(filled))))
+        fields = {"qty": rem, "notional": rem * entry, "margin": float(pos["margin"]) * (1 - frac),
+                  "entry_fee": entry_fee * (1 - frac), "funding": funding * (1 - frac)}
+        self.store.update_position(pos["id"], **fields)
+        pos.update(fields)
+        upd.update(fields)
+        upd["upnl"] = (m - entry) * rem * d
+        st["partial"] = True
+        st["booked"] = {"order_ids": [res.order_id], "entry_fee": entry_fee * frac, "funding": funding * frac}
+        st["resize"] = True
+        self.event("trade_partial", {**trade, "id": tid})
+        log.info("PARTIAL take-profit %s %s: closed %s of %s @ %s (%.2fR): net pnl %+.3f (gross %+.3f, fees %.3f, funding cost %+.3f)",
+                 side, sym, filled, filled + rem, px, pc.partial_tp_r, net, gross, fees, info.funding_cost)
+        self.alerts.trade_closed(sym, side, entry, px, net, fees, "partial", self.mode)
+        await self._resize_orders(pos, st, upd, now)
+        self.persist_state(force=True)
+
+    async def _resize_orders(self, pos: dict, st: dict, upd: dict, now: float) -> None:
+        """After a partial close: stop and TP for exactly the remaining quantity, the stop at least at break-even.
+        The new orders are placed first; if the new stop cannot be placed the old (larger) one stays live and the
+        resize is retried every ``PROTECT_RETRY_S``."""
+        sym, side = pos["symbol"], pos["side"]
+        close_side = opposite(order_side(side))
+        f = await self.io(self.ex.filters, sym)
+        qty = float(pos["qty"])
+        be = f.round_price(breakeven_price(side, pos["entry_price"], self.cfg.fee_taker))
+        sl = tighter(side, float(upd.get("sl_price", pos["sl_price"])), be)
+        try:
+            new_id, stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, sl, qty,
+                                          upd.get("sl_order_id", pos.get("sl_order_id")))
+        except ExchangeError as e:
+            st["resize"] = True
+            st["retry_t"] = now
+            log.error("%s: resizing the stop to the remaining %s FAILED (%s); the old stop stays live, retrying", sym, qty, e)
+            return
+        if stale:
+            st.setdefault("orphans", []).append(stale)
+        upd.update(sl_price=sl, sl_order_id=new_id)
+        pos.update(sl_price=sl, sl_order_id=new_id)
+        tp_id = upd.get("tp_order_id", pos.get("tp_order_id"))
+        if tp_id and pos.get("tp_price"):
+            try:
+                tp_new, tp_stale = await self.io(self.ex.replace_conditional, sym, "TP", close_side, pos["tp_price"], qty, tp_id)
+                upd["tp_order_id"] = pos["tp_order_id"] = tp_new
+                if tp_stale:
+                    st.setdefault("orphans", []).append(tp_stale)
+            except ExchangeError as e:
+                log.warning("%s: resizing the take-profit failed (%s); dropping it - the engine closes at TP itself", sym, e)
+                try:
+                    await self.io(self.ex.cancel_order, sym, tp_id)
+                except ExchangeError:
+                    st.setdefault("orphans", []).append(tp_id)
+                upd["tp_order_id"] = pos["tp_order_id"] = None
+        st.pop("resize", None)
+        self.store.update_position(pos["id"], **{k: upd[k] for k in ("sl_price", "sl_order_id", "tp_order_id") if k in upd})
+        self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": sl, "qty": qty})
+
+    async def _protect_retry(self, pos: dict, st: dict, upd: dict, now: float) -> None:
+        """Housekeeping of one position: cancel stops left over by a move, retry an unfinished resize."""
+        if not (st.get("orphans") or st.get("resize")) or now - st.get("retry_t", -1e9) < PROTECT_RETRY_S:
+            return
+        st["retry_t"] = now
+        left = []
+        for oid in st.get("orphans", []):
+            try:
+                await self.io(self.ex.cancel_order, pos["symbol"], oid)
+            except ExchangeError as e:
+                log.warning("could not cancel the stale order %s on %s yet: %s", oid, pos["symbol"], e)
+                left.append(oid)
+        if left:
+            st["orphans"] = left
+        else:
+            st.pop("orphans", None)
+        if st.get("resize"):
+            await self._resize_orders(pos, st, upd, now)
 
     def _hlc(self, sym: str):
         k = self.kl.get(sym)
@@ -1621,7 +1797,7 @@ class Engine:
 
     def _record_shadow(self, tr: dict) -> None:
         self.store.add_shadow_trade(tr)
-        self.shadow_gate(tr["model"]).record_exit(tr["symbol"], tr["exit_time"])
+        self.shadow_gate(tr["model"]).record_exit(tr["symbol"], tr["exit_time"], loss=is_loss_exit(tr["exit_reason"], tr["pnl"]))
         self.event("shadow_trade", tr)
         log.info("shadow %s %s %s pnl %+.3f (%s)", tr["model"], tr["side"], tr["symbol"], tr["pnl"], tr["exit_reason"])
 
@@ -2014,8 +2190,8 @@ class Engine:
         if today != self._last_day:
             day0 = int(datetime.fromisoformat(self._last_day).replace(tzinfo=timezone.utc).timestamp())
             s = self.store.trade_stats(day0)
-            s_day = self.store.one("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) net, "
-                                   "COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) w FROM trades "
+            s_day = self.store.one("SELECT COUNT(CASE WHEN exit_reason!='partial' THEN 1 END) n, COALESCE(SUM(pnl),0) net, "
+                                   "COALESCE(SUM(CASE WHEN pnl>0 AND exit_reason!='partial' THEN 1 ELSE 0 END),0) w FROM trades "
                                    "WHERE closed_at>=? AND closed_at<?", (day0, day0 + 86400))
             self.alerts.daily_summary(date=self._last_day, trades=s_day["n"], wins=s_day["w"], pnl=s_day["net"],
                                       equity=self.equity, mode=self.mode)

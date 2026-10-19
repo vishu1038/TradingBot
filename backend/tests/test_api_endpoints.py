@@ -155,11 +155,12 @@ def test_settings_get_put_merge(env):
                       "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
                       "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
-                          "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout"}
-    assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": False, "activate_r": 1.0, "distance_atr": 1.0}
-    r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": True}, "short_enabled": True})
-    assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is True
-    assert r.json()["trail"]["activate_r"] == 1.0 and r.json()["tp_usd"] == 5          # partial merge
+                          "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
+                          "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac"}
+    assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": True, "activate_r": 1.5, "distance_atr": 1.0}
+    r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": False}, "short_enabled": True})
+    assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is False
+    assert r.json()["trail"]["activate_r"] == 1.5 and r.json()["tp_usd"] == 5          # partial merge
     assert c.get("/api/settings").json() == r.json()
     assert s.get_settings().leverage == 5                                              # engine sees it through the store
     for bad in ({"leverage": 0}, {"exit_mode": "wat"}, {"nonsense": 1}, {"paper_start_equity": 1}, {"prob_threshold_long": 2}):
