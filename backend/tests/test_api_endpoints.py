@@ -312,3 +312,29 @@ def test_capacity_settings_defaults_and_validation(env):
     for bad in ({"max_leverage": 0}, {"max_leverage": 126}, {"max_margin_ratio": 0.04}, {"max_margin_ratio": 0.95},
                 {"max_total_leverage": 0}, {"max_open_risk_pct": 0}, {"max_positions": 0}):
         assert c.put("/api/settings", json=bad).status_code == 422, bad
+
+
+def test_access_decision_loopback_tailnet_token_and_lan():
+    from tb.api import access_decision
+    tok = "x" * 32
+    assert access_decision("127.0.0.1", None, tok) == "allow" and access_decision("::1", None, "") == "allow"
+    assert access_decision("100.64.159.91", tok, tok) == "allow"              # tailnet + token
+    assert access_decision("100.64.159.91", None, tok) == "token"             # tailnet, no token
+    assert access_decision("100.64.159.91", "wrong", tok) == "token"
+    assert access_decision("100.64.159.91", tok, "") == "deny"                # remote access disabled
+    assert access_decision("192.168.1.20", tok, tok) == "deny"                # LAN: never
+    assert access_decision("8.8.8.8", tok, tok) == "deny" and access_decision("bogus", tok, tok) == "deny"
+
+
+def test_tailnet_client_sets_cookie_and_lan_client_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("TB_API_TOKEN", "t" * 32)
+    db = tmp_path / "tb.sqlite"
+    Store(db)
+    app = create_app(db, control_wait_s=0.0, ui=tmp_path)
+    tail = TestClient(app, client=("100.80.1.2", 5000))
+    assert tail.get("/api/health").status_code == 401
+    r = tail.get("/api/health?token=" + "t" * 32, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/api/health" and "tb_token" in r.headers["set-cookie"]
+    assert tail.get("/api/health", cookies={"tb_token": "t" * 32}).status_code == 200
+    lan = TestClient(app, client=("192.168.1.9", 5000))
+    assert lan.get("/api/health?token=" + "t" * 32).status_code == 403

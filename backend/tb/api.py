@@ -7,6 +7,8 @@ open trades. Timestamps are unix seconds.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -15,13 +17,15 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, capital
-from .config import Settings, db_path, models_dir, resolve_mode, ui_dir
+from .config import Settings, db_path, load_env, models_dir, resolve_mode, ui_dir
 from .risk import dd_reference, drawdown_pct
 from .safety import merged_safety
 from .scorer import scan_models
@@ -42,7 +46,30 @@ def _num(x: Any, nd: int | None = None) -> Any:
     return round(x, nd) if nd is not None and isinstance(x, float) else x
 
 
+TAILNET_NETS = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+TOKEN_COOKIE = "tb_token"
+
+
+def access_decision(client_host: str | None, presented: str | None, token: str) -> str:
+    """'allow' for this Mac; for Tailscale peers 'allow' only with the token; 'deny' otherwise.
+
+    The dashboard can place real (testnet) orders and has no user accounts, so anything that isn't
+    loopback or the user's tailnet is refused outright, and tailnet devices must present the token."""
+    if client_host == "testclient":       # Starlette's in-process TestClient; real servers always report an IP
+        return "allow"
+    try:
+        ip = ipaddress.ip_address((client_host or "").split("%")[0])
+    except ValueError:
+        return "deny"
+    if ip.is_loopback:
+        return "allow"
+    if token and any(ip in n for n in TAILNET_NETS):
+        return "allow" if presented and hmac.compare_digest(presented, token) else "token"
+    return "deny"
+
+
 def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui: Path | None = None) -> FastAPI:
+    load_env()
     store = Store(db or db_path())
     app = FastAPI(title="TradingBot API", version=__version__)
     app.add_middleware(CORSMiddleware, allow_origin_regex=LOCAL_ORIGIN, allow_methods=["*"], allow_headers=["*"])
@@ -56,6 +83,24 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
         if not request.url.path.startswith("/api"):
             resp.headers["Cache-Control"] = "no-cache"
         return resp
+
+    @app.middleware("http")
+    async def access_guard(request, call_next):
+        # Remote use over Tailscale: open http://mac-pro:<port>/?token=… once; the token moves into an
+        # HttpOnly cookie and the URL is cleaned. LAN / internet clients are always refused.
+        token = os.environ.get("TB_API_TOKEN", "")
+        q = request.query_params.get("token")
+        presented = q or request.cookies.get(TOKEN_COOKIE) or request.headers.get("x-tb-token")
+        verdict = access_decision(request.client.host if request.client else None, presented, token)
+        if verdict != "allow":
+            return JSONResponse({"error": "forbidden"}, status_code=403 if verdict == "deny" else 401)
+        if q:
+            params = [(k, v) for k, v in request.query_params.multi_items() if k != "token"]
+            dest = request.url.path + (("?" + urlencode(params)) if params else "")
+            resp = RedirectResponse(dest, status_code=303)
+            resp.set_cookie(TOKEN_COOKIE, q, max_age=30 * 86400, httponly=True, samesite="strict")
+            return resp
+        return await call_next(request)
 
     # ------------------------------------------------------------------ builders
     def heartbeat_age() -> tuple[float | None, dict | None]:
@@ -269,6 +314,11 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
     # ------------------------------------------------------------------ websocket
     @app.websocket("/ws")
     async def ws(sock: WebSocket) -> None:
+        # HTTP middleware doesn't see WebSockets: same access rule here (cookie set by the page load).
+        if access_decision(sock.client.host if sock.client else None, sock.cookies.get(TOKEN_COOKIE),
+                           os.environ.get("TB_API_TOKEN", "")) != "allow":
+            await sock.close(code=4403)
+            return
         await sock.accept()
         closed = asyncio.Event()
 
@@ -312,10 +362,11 @@ def main(argv: list[str] | None = None) -> int:
 
     ap = argparse.ArgumentParser(prog="tb.api")
     ap.add_argument("--port", type=int, default=int(os.environ.get("TB_API_PORT", "8787")))
-    ap.add_argument("--host", default="127.0.0.1")
+    load_env()
+    ap.add_argument("--host", default=os.environ.get("TB_API_HOST", "127.0.0.1"))
     args = ap.parse_args(argv)
-    if args.host not in ("127.0.0.1", "localhost", "::1"):
-        print("refusing to bind a non-loopback host (the API has no authentication)", file=sys.stderr)
+    if args.host not in ("127.0.0.1", "localhost", "::1") and len(os.environ.get("TB_API_TOKEN", "")) < 24:
+        print("refusing to bind a non-loopback host without TB_API_TOKEN (>= 24 chars) in .env", file=sys.stderr)
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
