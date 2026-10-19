@@ -205,8 +205,11 @@ reports which value is break-even after fees for the chosen exit mode.
   closes on a multiple of `decision_every_bars` on the UTC grid (12 = every full hour); cooldown counts from the coin's last entry
   or exit, max trades per UTC day counts entries (all coins). Restart-safe (seeded from the DB). Thresholds: classic models use the
   Settings, V3 kinds use the artifact's `thresholds` (Settings if absent).
-- **Exits.** Only `exit_cfg.exit_mode = "pct"` (`tp_pct`/`sl_pct` in PERCENT, like `tb.labels`) or a non-5m `atr_tf` (Wilder ATR14
-  of UTC-aligned resampled bars) make the artifact drive the exits (`tb.exits`); classic `fixed`/`atr` on 5m stay the Settings
+- **Time stop / max_open.** `exit_cfg.horizon_bars` (any exit mode): the position is closed at market that many 5m bars after the
+  entry (exit reason `timeout`; shadow: at that bar's close, adverse slippage, taker fee), persisted in kv `time_stops`.
+  `entry_cfg.max_open`: concurrent positions allowed (live: all open positions + in-flight entries; shadow: that model's own).
+- **Exits.** Only `exit_cfg.exit_mode = "pct"` (`tp_pct`/`sl_pct` in PERCENT, like `tb.labels`) or a non-5m `atr_tf` (`1h|4h|1d`; the SMA-ATR14
+  of the last CLOSED bar of that timeframe, computed by `tb.labels.exit_atr` = exactly the labels' ATR) make the artifact drive the exits (`tb.exits`); classic `fixed`/`atr` on 5m stay the Settings
   template. Sizing is still risk-capped (`sl_usd`) and every cap applies. xsec artifacts use `stop_vol_mult` x trailing-7d daily
   vol (clipped `stop_min..stop_max`), stop only (legs close on the rebalance). Model-driven positions are not trailed.
 - **Maker entries** (`entry_mode: maker`). Post-only GTX LIMIT at the venue's best bid (long) / ask (short) (`/fapi/v1/ticker/bookTicker`);
@@ -228,7 +231,7 @@ reports which value is break-even after fees for the chosen exit mode.
 - **Status.** `/api/status` adds `models[]` (name, kind, role, history, cadence, entry/exit mode, next_decision_t), `decisions`
   (next decision time, trades today vs max, cadence, history ready), `maker` (entries, filled, partial, timeouts, gtx_rejects,
   reprices, taker_fallback, skipped, aborted, fill_rate, in_flight), `xsec_legs`; `/api/shadow` rows add `kind`, `entry_mode`,
-  `loaded`. `/api/settings` adds the seven entry-control keys above. `exit_reason` may also be `rebalance`.
+  `loaded`. `/api/settings` adds the seven entry-control keys above. `exit_reason` may also be `rebalance` or `timeout`.
 
 ## Features contract (`backend/tb/features.py`, numpy/pandas only)
 ```python

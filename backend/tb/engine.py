@@ -222,6 +222,7 @@ class Engine:
                             "taker_fallback": 0, "skipped": 0, "aborted": 0}
         self.xsec_slots: dict[str, int] = {}                   # model -> last executed rebalance slot
         self.xsec_book: dict[str, str] = {}                    # symbol -> side of the live cross-sectional legs
+        self.time_stops: dict[str, float] = {}                 # position id -> unix time at which it is closed (horizon_bars)
         self.model_gaps: dict[str, float] = {}
         self._spec_cache: dict[tuple, ExitSpec] = {}
         self._backfill_budget = HISTORY_PAGES_PER_CYCLE
@@ -267,7 +268,7 @@ class Engine:
         # restore persisted state
         st = self.store.kv_get_many(["start_equity", "peak_equity", "kill", "running", "paper_state",
                                      "shadow_open", "universe_at", "live_trades_opened", "xsec_book", "xsec_slots",
-                                     "maker_stats"])
+                                     "maker_stats", "time_stops"])
         if self.paper:
             if st.get("paper_state"):
                 self.ex.import_state(st["paper_state"])
@@ -290,6 +291,7 @@ class Engine:
         self.store.kv_set("start_equity", self.start_equity)
         self.xsec_book = {str(k): str(v) for k, v in (st.get("xsec_book") or {}).items()}
         self.xsec_slots = {str(k): int(v) for k, v in (st.get("xsec_slots") or {}).items()}
+        self.time_stops = {str(k): float(v) for k, v in (st.get("time_stops") or {}).items()}
         for k, v in (st.get("maker_stats") or {}).items():
             if k in self.maker_stats:
                 self.maker_stats[k] = int(v)
@@ -516,6 +518,7 @@ class Engine:
             self.store.kv_set("shadow_open", self.shadow.export_state())
             self.store.kv_set("xsec_book", self.xsec_book)
             self.store.kv_set("xsec_slots", self.xsec_slots)
+            self.store.kv_set("time_stops", self.time_stops)
             self.store.kv_set("maker_stats", self.maker_stats)
         except Exception:
             log.exception("persist failed")
@@ -608,6 +611,7 @@ class Engine:
         self.store.delete_position(pos["id"])
         self.live_gate.record_exit(pos["symbol"], t)
         self.xsec_book.pop(pos["symbol"], None)
+        self.time_stops.pop(str(pos["id"]), None)
         self.event("position_closed", {**trade, "id": tid})
         log.info("closed %s %s %s: net pnl %+.3f (gross %+.3f, fees %.3f, funding cost %+.3f) %s", pos["symbol"], pos["side"],
                  pos["qty"], net, info.pnl, info.fees, info.funding_cost, reason)
@@ -796,6 +800,8 @@ class Engine:
                "liq_price": next((p.liq_price for p in await self.io(ex.positions) if p.symbol == sym), None)}
         pid = self.store.insert_position(pos)
         self.live_gate.record_entry(sym, opened_ts)
+        if spec.horizon_bars:                         # labels count a timeout as a loss closed at market: enforce the same
+            self.time_stops[str(pid)] = opened_ts + spec.horizon_bars * 300.0
         if not via_maker:        # (a maker fill is a price improvement, not a slippage sample)
             slip_pct = (fill_px - ref_price) / ref_price * 100.0 * (1 if side == "long" else -1)
             self.slips.append(slip_pct)
@@ -1278,6 +1284,13 @@ class Engine:
             best = max(pos.get("best_price") or m, m) if d == 1 else min(pos.get("best_price") or m, m)
             upnl = (m - pos["entry_price"]) * pos["qty"] * d
             upd: dict[str, Any] = {"mark_price": m, "upnl": upnl, "best_price": best}
+            # time stop (exit_cfg.horizon_bars): close at market once the horizon has passed
+            dl = self.time_stops.get(str(pos["id"]))
+            if dl is not None and now >= dl:
+                log.info("time stop: %s %s open since %s, horizon reached; closing at market", pos["side"], sym,
+                         int(pos["opened_at"]))
+                await self.close_position({**pos, **upd}, "timeout")
+                continue
             # fallback exits when the exchange-side order is missing / slow
             if pos.get("tp_price") and not pos.get("tp_order_id") and (m - pos["tp_price"]) * d >= 0:
                 await self.close_position({**pos, **upd}, "tp")
@@ -1530,7 +1543,8 @@ class Engine:
         if self.paper and (sym in self.pending or any(p["symbol"] == sym for p in self._db_positions())):
             self.ex.check_range(sym, float(bar.low), float(bar.high), int(bar.open_time))
         if self.shadow.pos or self.shadow.pending:
-            for tr in self.shadow.on_bar(sym, int(bar.open_time), float(bar.low), float(bar.high), self.clock(), frame=closed):
+            for tr in self.shadow.on_bar(sym, int(bar.open_time), float(bar.low), float(bar.high), self.clock(), frame=closed,
+                                  close=float(bar.close)):
                 self._record_shadow(tr)
         if sym not in self.trade_symbols():
             return
@@ -1559,7 +1573,7 @@ class Engine:
             await self.shadow_signals(sym, closed, bar, cache, sc if (active and decision and not xsec_champ) else None)
         if action != "none":
             if fresh:
-                ok, why = self.live_gate.check(sym, self.clock(), ent)
+                ok, why = self.live_gate.check(sym, self.clock(), ent, len(self._db_positions()) + len(self.pending))
                 if ok:
                     await self.try_open(sym, action, prob, reasons, closed)
                 else:
@@ -1587,7 +1601,8 @@ class Engine:
             if not side:
                 continue
             gate = self.shadow_gate(name)
-            ok, _ = gate.check(sym, now, ent)
+            n_open = sum(1 for k in (*self.shadow.pos, *self.shadow.pending) if k.startswith(f"{name}|"))
+            ok, _ = gate.check(sym, now, ent, n_open)
             if not ok or self.shadow.has(name, sym):
                 continue
             spec = bind_exit(self.model_spec(info), closed, self.now_ms())
