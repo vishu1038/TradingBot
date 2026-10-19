@@ -119,9 +119,10 @@ coin was stopped out twice within 3 minutes. Five settings (in `/api/settings`, 
 - **Break-even** (`breakeven_r`, 1.0; 0 = off). Once the favourable move >= `breakeven_r` × initial risk (|entry − initial SL|)
   the stop moves to entry ± round-trip fees (`entry × (1 ± 2·fee_taker)`). The stop only ever tightens; break-even and trailing
   are combined by `protect.next_stop` (the tighter wins).
-- **Moving the exchange stop** (engine, every mode): the NEW reduce-only stop is placed first, the old one is cancelled afterwards
-  (`Exchange.replace_conditional`; algo orders are cancelled through the algo endpoint). If placing the new stop fails (3 tries, never
-  retried on -2021) the old stop stays live (the position is never without one) and the move is retried after 30 s; a stop that
+- **Moving the exchange stop** (engine, every mode): the old closePosition stop is cancelled, then the new one is placed (Binance keeps
+  one closePosition stop per direction, -4130; `Exchange.replace_conditional`; algo orders are cancelled through the algo endpoint).
+  If placing the new stop fails (3 tries, never retried on -2021) the OLD level is placed back (the position is never left without
+  one) and the move is retried after 30 s; a stop that
   could not be cancelled is remembered and cancelled later. Throttle: a move needs an improvement >= 0.1 % of the entry price and
   happens at most once per 5m bar per position. Price already through the new level → market exit (`sl` / `trail`). Applies to the
   Settings exits and to model exits (`pct`, `atr:<tf>`; the trail of an `atr:<tf>` position uses that timeframe's ATR; `pct` exits and
@@ -135,11 +136,12 @@ coin was stopped out twice within 3 minutes. Five settings (in `/api/settings`, 
   are checked per leg. A stop moved to break-even stops counting as risk, which frees capacity. Shadow books apply it per model against a
   static equity proxy (`capital_usd` or `paper_start_equity`); `tb.sim` against `SimConfig.max_open_risk_pct` × equity (100 = off in both).
 - **Partial take-profit** (`partial_tp_r` 1.5, `partial_tp_frac` 0.5; `partial_tp_r` 0 = off). Once per position, when price reaches
-  entry ± `partial_tp_r` × initial risk (and a TP, if any, is further than 0.1 % beyond that level): a reduce-only MARKET order closes
+  entry ± `partial_tp_r` × initial risk (and a TP, if any, is further than 0.1 % beyond that level) and the piece gains >= `min_tp_usd`
+  (else no partial: the position runs to its full TP): a normal MARKET order closes
   `frac` of the quantity (lot step respected; skipped for good when either part would be below min qty / min notional). It is a trade
   row with `exit_reason: "partial"` (NET pnl, fees = entry-fee share + exit fee, funding share as a cost; the remainder's row carries the
-  rest, so the two rows sum to the position's net). Then stop and TP are re-placed for the remaining quantity (stop at least at
-  break-even; if the new stop cannot be placed the old, larger one stays and the resize is retried). Win rate / trade counts
+  rest, so the two rows sum to the position's net). The closePosition TP / SL cover the remainder unchanged (no qty to resize); the
+  stop is only moved to at least break-even (if that fails the old level stays and the move is retried). Win rate / trade counts
   (`trade_stats`, drift) count a scaled-out position once. Not used for cross-sectional legs. Exchange close-outs rebuilt from fills
   (`last_close(..., booked=)`) exclude the booked partial. State per position lives in kv `protect`.
 - **Simulators.** `SimConfig` has the same five flags with the same defaults (and `trail_enabled` True / `trail_activate_r` 1.5);
@@ -185,7 +187,7 @@ Symmetric trading "in such a way that if the market reverses, the bots don't los
    `skip_reversal_block`, `reversal_triggers`, `reversal_locks`; the lock applies from the next bar. `tb.sim.model_backtest` and the labels do not model it.
 
 ## Hard safety invariants (engine)
-1. The SL is placed **on the exchange** (reduce-only STOP_MARKET, workingType MARK_PRICE) right
+1. The SL is placed **on the exchange** (STOP_MARKET closePosition=true, workingType MARK_PRICE, no qty, never reduce-only) right
    after the entry fills. If placing it fails, close the position at market immediately.
    (Binance has been migrating conditional orders to an Algo Order endpoint — if `/fapi/v1/order`
    rejects STOP_MARKET with an algo-switch error, use the algo order endpoint. Verify against
@@ -219,9 +221,9 @@ channel: the native Android app (push + widget for live trades).
    (drawdown / kill, positions or orders unreadable, repeated network errors with unconfirmable stops). A position whose mark is
    through its `liquidationPrice` (long mark ≤ liq, short mark ≥ liq) or whose isolated margin is ≤ 0 is *in liquidation*: no
    orders are sent for it, one Google Chat alert, re-checked every cycle (kv `liquidating`); once it vanishes the engine records
-   the trade with `exit_reason: liquidation`. Emergency close order: cancel the symbol's reduce-only conditional orders (legacy
-   and algo ids), reduce-only market close; on -2022 with the position still shown and not liquidating, ONE plain MARKET of exactly
-   the freshly re-read quantity (one-way mode), else give up for that symbol. Every such action (guard flatten / no-stop close,
+   the trade with `exit_reason: liquidation`. Emergency close (`emergency.close_flat`, per-symbol lock): re-read the position,
+   cancel the symbol's TP/SL (legacy and algo ids), ONE normal MARKET order of exactly the re-read quantity (one-way mode), verify
+   flat; a reverse position left by a racing stop is flattened the same way and alerted. Every such action (guard flatten / no-stop close,
    engine invariant close, "beyond its stop" close, stop re-place, untracked-position close) backs off per symbol 5 s → 10 s → …
    5 min (reset on success), logs once per step and alerts once per symbol per incident. `BinanceExchange.market_order` raises
    `OrderNotFilled` (and cancels the order) when the venue acks a market order that never fills, instead of reporting the
@@ -430,3 +432,28 @@ All timestamps unix **seconds** in the API. JSON.
 - `WS /ws` → messages `{type, data}`; types: `status`, `tick` `{symbol,t,price}`, `candle`
   `{symbol,tf,candle}`, `signal`, `position_opened`, `position_updated`, `position_closed`,
   `universe`, `equity` `{t,equity}`, `log`, `kill`, `orderbook`.
+
+## Order rules (user 2026-10-19)
+- The bot never SENDS a reduce-only order (`tests/test_no_reduce_only.py`). Entries are normal orders; TP / SL are STOP_MARKET /
+  TAKE_PROFIT_MARKET `closePosition=true` on MARK_PRICE with no quantity, placed right after the fill (like the Binance UI's TP/SL);
+  partial take-profits and every close (manual, time stop, model exit, emergency, orphan) are normal MARKET orders for the
+  freshly re-read quantity, verified flat afterwards; leftover TP/SL are cancelled after every close. (Binance echoes
+  `reduceOnly=true` on closePosition orders; that is its internal flag, not ours.)
+- Reversal: an opposite-side signal on a held coin (`reverse_enabled`, prob >= that side's threshold + `reverse_min_prob_margin`)
+  closes the position (`exit_reason: "reverse"`) and opens the other side through every entry check; a blocked new side stays flat.
+  Live-verified on the testnet 2026-10-19: one normal 2x order also flips one-way positions cleanly.
+
+## Testnet mirror (`tb/mirror.py`; `mirror_enabled`, `mirror_venue` "binance_demo" only, `mirror_size` "min")
+The paper bot (real prices, simulated fills) is the master and the only scoreboard. Every paper order action (entry, TP/SL,
+stop move, partial, close, emergency close) is mirrored ONE-WAY to the Binance futures testnet at the venue's minimum size, to
+exercise the real order path. The mirror never blocks, delays or alters the paper book (own queue / thread pool / timeouts /
+per-symbol backoff; its errors never touch kill, safety, guard or drawdown — tested byte-identical on/off).
+- `mirror_events` records every venue call with `cls`: ok / our_bug (request problems on our side) / venue_fault (5xx, timeouts,
+  not filled) / account_unusable / skipped. our_bug alerts at once (1 per code+symbol per hour); the rest goes to the digest.
+- Reconciler every 60 s: venue position without a paper twin -> closed; failed mirror entry -> divergence, never entered late;
+  missing stop -> re-placed. Positions the mirror does not own (e.g. ghosts) are never touched.
+- Account health: `/fapi/v2/account` plus "rejects everything" detection (3 account-class rejects over >= 2 symbols) -> quiet
+  `account_unusable` until the account changes or `POST /api/mirror/retry`.
+- `GET /api/mirror`: account state, success rate 1h/24h, latency p50/p95, counts by class and error code, divergences, open mirror
+  positions, last 50 events. The old separate testnet stack (`scripts/dev.sh`) is retired.
+- `TB_CHAT_PAUSED=1` (env / .env) mutes every Google Chat message; the dashboard over the tailnet is the live view.
