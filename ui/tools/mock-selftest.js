@@ -42,12 +42,18 @@ check('seeded trades', tr.length > 30, String(tr.length));
 need(tr[0], ['id', 'symbol', 'side', 'entry_price', 'exit_price', 'qty', 'opened_at', 'closed_at', 'pnl', 'fees', 'funding', 'exit_reason', 'prob'], 'trade');
 const eq = get('/api/equity', { limit: '2000' });
 check('equity history', eq.length > 100, String(eq.length));
-need(get('/api/settings'), ['slice_margin_usd', 'max_leverage', 'max_total_leverage', 'max_margin_ratio', 'max_open_risk_pct', 'max_positions', 'exit_mode', 'tp_usd', 'sl_usd', 'tp_atr', 'sl_atr', 'trail', 'short_enabled', 'prob_threshold_long', 'prob_threshold_short', 'corr_cap', 'universe_size', 'universe_refresh_s', 'kill_dd_pct', 'fee_taker', 'sound', 'breakeven_r', 'sl_cooldown_bars', 'max_side_risk_pct', 'partial_tp_r', 'partial_tp_frac'], 'settings');
+need(get('/api/settings'), ['slice_margin_usd', 'max_leverage', 'max_total_leverage', 'max_margin_ratio', 'max_open_risk_pct', 'max_positions', 'exit_mode', 'tp_usd', 'sl_usd', 'tp_atr', 'sl_atr', 'trail', 'short_enabled', 'prob_threshold_long', 'prob_threshold_short', 'corr_cap', 'universe_size', 'universe_refresh_s', 'universe_whitelist', 'kill_dd_pct', 'fee_taker', 'sound', 'breakeven_r', 'sl_cooldown_bars', 'max_side_risk_pct', 'partial_tp_r', 'partial_tp_frac'], 'settings');
 const labs = get('/api/lab/reports');
 need(labs[0], ['id', 'created_at', 'kind', 'title', 'summary', 'equity'], 'lab report');
-check('settings PUT merges', m.request('PUT', '/api/settings', {}, { trail: { enabled: false } }).body.trail.distance_atr === 0.8);
+check('settings PUT merges', m.request('PUT', '/api/settings', {}, { trail: { enabled: false } }).body.trail.distance_atr === 1.0);
 check('settings PUT validates', m.request('PUT', '/api/settings', {}, { max_leverage: 999 }).status === 422);
 m.request('PUT', '/api/settings', {}, { trail: { enabled: true } });
+check('whitelist defaults to null', get('/api/settings').universe_whitelist === null);
+check('whitelist PUT validates', m.request('PUT', '/api/settings', {}, { universe_whitelist: ['not a symbol'] }).status === 422);
+check('whitelist PUT rejects empty list', m.request('PUT', '/api/settings', {}, { universe_whitelist: [] }).status === 422);
+const wlSym = get('/api/universe')[0].symbol;
+check('whitelist PUT accepts', m.request('PUT', '/api/settings', {}, { universe_whitelist: [wlSym] }).body.universe_whitelist[0] === wlSym);
+m.request('PUT', '/api/settings', {}, { universe_whitelist: null });
 
 // ---- simulate 1800 ticks (1 virtual hour at 10x) and gather stats
 const types = {};

@@ -8,7 +8,7 @@ import { derateAt } from '../components.js';
 import { ctl } from '../actions.js';
 import { confirmDialog } from '../dialog.js';
 
-// type: num | int | bool | select. `when` marks which exit_mode a field applies to (dimmed otherwise).
+// type: num | int | bool | select | symbols (comma-separated list, empty = null). `when` marks which exit_mode a field applies to (dimmed otherwise).
 const SECTIONS = [
   {
     title: 'POSITION SIZING',
@@ -56,6 +56,7 @@ const SECTIONS = [
     fields: [
       { k: 'universe_size', label: 'universe size', type: 'int', min: 1, max: 30, step: 1 },
       { k: 'universe_refresh_s', label: 'refresh interval (s)', type: 'int', min: 60, max: 86400, step: 60 },
+      { k: 'universe_whitelist', label: 'whitelist (optional)', type: 'symbols', optional: true, ifPresent: true, placeholder: 'empty = hot-list ranking', hint: 'comma-separated, e.g. BTCUSDT, ETHUSDT. When set, ONLY these coins that trade on the order venue are the universe (size and ranking ignored). Open trades in other coins keep running to their exits' },
     ],
   },
   {
@@ -66,6 +67,17 @@ const SECTIONS = [
     ],
   },
 ];
+
+const SYMBOL_RE = /^[A-Z0-9]{2,20}(USDT|USDC|BUSD)$/;
+/** "btcusdt, ETHUSDT ,btcusdt" -> ['BTCUSDT','ETHUSDT'] (upper-cased, de-duplicated); empty -> null. */
+export function parseSymbols(text) {
+  const out = [];
+  for (const t of String(text ?? '').split(/[\s,;]+/)) {
+    const x = t.trim().toUpperCase();
+    if (x && !out.includes(x)) out.push(x);
+  }
+  return out.length ? out : null;
+}
 
 const getPath = (o, path) => path.split('.').reduce((a, k) => (a == null ? a : a[k]), o);
 function setPath(o, path, v) {
@@ -79,6 +91,11 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 export function validateField(f, v) {
   if (v === undefined && f.ifPresent) return null; // older backend does not have this setting
   if (v === null && f.optional) return null;
+  if (f.type === 'symbols') {
+    if (!Array.isArray(v) || !v.length || v.length > 50) return 'enter 1 to 50 symbols like BTCUSDT, or leave empty';
+    const bad = v.find((x) => typeof x !== 'string' || !SYMBOL_RE.test(x));
+    return bad === undefined ? null : `"${bad}" is not a symbol like BTCUSDT`;
+  }
   if (f.type === 'bool') return typeof v === 'boolean' ? null : 'must be on/off';
   if (f.type === 'select') return f.options.includes(v) ? null : `must be one of ${f.options.join(', ')}`;
   if (!isNum(v)) return 'must be a number';
@@ -112,6 +129,7 @@ export function mount(root) {
     const id = `f-${f.k.replace(/\./g, '-')}`;
     if (f.type === 'info') return `<span class="auto-pill">${esc(f.text)}</span>`;
     if (f.type === 'bool') return `<label class="switch"><input type="checkbox" id="${id}" data-k="${f.k}" ${v ? 'checked' : ''}><span class="slider"></span><span class="sw-t">${v ? 'ON' : 'OFF'}</span></label>`;
+    if (f.type === 'symbols') return `<input type="text" id="${id}" data-k="${f.k}" value="${esc(Array.isArray(v) ? v.join(', ') : '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="off" spellcheck="false">`;
     if (f.type === 'select') return `<select id="${id}" data-k="${f.k}">${f.options.map((o) => `<option value="${esc(o)}" ${o === v ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`;
     return `<input type="number" id="${id}" data-k="${f.k}" value="${esc(v ?? '')}" ${f.optional ? 'placeholder="no cap"' : ''} min="${f.min}" max="${f.max}" step="${f.step}" inputmode="decimal">`;
   }
@@ -157,6 +175,7 @@ export function mount(root) {
     let v;
     if (f.type === 'bool') v = e.target.checked;
     else if (f.type === 'select') v = e.target.value;
+    else if (f.type === 'symbols') v = parseSymbols(e.target.value);
     else v = e.target.value === '' ? (f.optional ? null : NaN) : Number(e.target.value);
     setPath(draft, k, v);
     errors[k] = validateField(f, v);

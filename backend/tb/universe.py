@@ -70,6 +70,57 @@ def venue_filter(ranked: Sequence[str], venue_info: Mapping[str, SymbolInfo]) ->
     return [s for s in ranked if s in venue_info and venue_info[s].status == "TRADING"]
 
 
+def whitelist_symbols(whitelist: Sequence[str], prod_info: Mapping[str, SymbolInfo],
+                      venue_info: Mapping[str, SymbolInfo] | None = None, dropped: list[str] | None = None) -> list[str]:
+    """The fixed universe: the whitelist (its order) restricted to symbols TRADING on prod (the signal data) and, when
+    given, on the order venue. No volume / funding / listing-age / ranking filters and no ``universe_size`` cap: the
+    operator named these coins. Coins the venue lacks are appended to ``dropped``."""
+    out = []
+    for s in dict.fromkeys(whitelist):
+        i = prod_info.get(s)
+        if i is None or i.status != "TRADING" or i.contract_type != "PERPETUAL":
+            log.warning("universe whitelist: %s is not a TRADING perpetual on prod; skipped", s)
+            continue
+        if venue_info is not None and not (s in venue_info and venue_info[s].status == "TRADING"):
+            if dropped is not None:
+                dropped.append(s)
+            continue
+        out.append(s)
+    return out
+
+
+def _whitelist_rows(ex: Exchange, cfg: Settings, info: Mapping[str, SymbolInfo], tickers: Mapping[str, Ticker24h],
+                    prem: Mapping[str, Premium], current: Mapping[str, int], now: float,
+                    venue_info: Mapping[str, SymbolInfo] | None, dropped: list[str] | None) -> list[dict]:
+    chosen = whitelist_symbols(cfg.universe_whitelist or [], info, venue_info, dropped)
+    rows = []
+    for rank, s in enumerate(chosen, 1):
+        t = tickers.get(s)
+        atr = None
+        try:
+            kl = ex.klines(s, "5m", ATR_FETCH)
+            atr = atr_pct(kl["high"].to_numpy(), kl["low"].to_numpy(), kl["close"].to_numpy(), ATR_BARS)
+        except NetworkError as e:
+            log.warning("universe: klines failed for %s: %s", s, e)
+        vol = t.quote_volume if t else 0.0
+        last = (t.last_price if t else 0.0) or (prem[s].mark_price if s in prem else 0.0)
+        oi_usd = oi_chg = None
+        try:
+            oi = ex.open_interest(s)
+            oi_usd = oi * (prem[s].mark_price if s in prem else last)
+            hist = ex.open_interest_hist(s, "5m", 13)
+            if len(hist) >= 2 and hist[0][1] > 0:
+                oi_chg = (hist[-1][1] / hist[0][1] - 1) * 100
+        except Exception as e:  # OI is decoration; never let it break the refresh
+            log.warning("universe: OI failed for %s: %s", s, e)
+        rows.append({"symbol": s, "rank": rank, "score": score(atr, vol) if atr is not None else 0.0, "atr_pct": atr,
+                     "quote_volume_24h": vol, "change_24h_pct": t.price_change_pct if t else 0.0,
+                     "funding_rate": prem[s].funding_rate if s in prem else 0.0, "open_interest_usd": oi_usd,
+                     "oi_change_1h_pct": oi_chg, "last_price": last, "in_universe_since": current.get(s, int(now)),
+                     "updated_at": int(now)})
+    return rows
+
+
 def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float | None = None,
             venue_info: Mapping[str, SymbolInfo] | None = None, dropped: list[str] | None = None) -> list[dict]:
     """Build the new universe rows. ``current`` = {symbol: in_universe_since}.
@@ -81,6 +132,8 @@ def refresh(ex: Exchange, cfg: Settings, current: Mapping[str, int], now: float 
     info = ex.exchange_info()
     tickers = {t.symbol: t for t in ex.tickers_24h()}
     prem = {p.symbol: p for p in ex.premium()}
+    if cfg.universe_whitelist:
+        return _whitelist_rows(ex, cfg, info, tickers, prem, current, now, venue_info, dropped)
     pre = []
     for s, t in tickers.items():
         i = info.get(s)

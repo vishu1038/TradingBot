@@ -65,7 +65,7 @@ def test_settings_merge_validation_and_api_shape():
     api = s.to_api()
     assert list(api) == ["slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio", "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
                          "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-                         "universe_size", "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars",
+                         "universe_size", "universe_refresh_s", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars",
                              "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
                              "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac"]
     assert s.merge({"trail": {"enabled": False}}).trail.activate_r == 1.5

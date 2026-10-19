@@ -25,7 +25,7 @@ from urllib.parse import urlencode
 import pandas as pd
 
 from .base import (KLINE_COLUMNS, Balance, CloseInfo, ConditionalOrder, Exchange, ExchangeError,
-                   NetworkError, OrderResult, Premium, PositionInfo, RateLimitError, SymbolFilters,
+                   NetworkError, OrderNotFilled, OrderResult, Premium, PositionInfo, RateLimitError, SymbolFilters,
                    SymbolInfo, Ticker24h, opposite)
 
 log = logging.getLogger("tb.binance")
@@ -263,8 +263,19 @@ class BinanceExchange(Exchange):
         if r.get("status") not in ("FILLED", "PARTIALLY_FILLED"):
             time.sleep(0.3)
             r = self._request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": r["orderId"]}, signed=True)
-        return OrderResult(f"o:{r['orderId']}", symbol, side.upper(), float(r.get("executedQty") or qty),
-                           float(r.get("avgPrice") or 0), r.get("status", ""))
+        status = str(r.get("status", ""))
+        executed = float(r.get("executedQty") or 0)
+        if executed <= 0 and status != "FILLED":
+            # accepted but never filled (testnet's thin books do this): cancel it so it cannot fill later, and fail loudly
+            # instead of reporting the REQUESTED quantity as executed
+            try:
+                self._request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": r["orderId"]}, signed=True)
+            except ExchangeError as e:
+                log.debug("cancel of the unfilled market order %s failed: %s", r.get("orderId"), e)
+            raise OrderNotFilled(f"market {side.upper()} {symbol} qty {params['quantity']} accepted but not filled "
+                                 f"(status {status or '?'})")
+        return OrderResult(f"o:{r['orderId']}", symbol, side.upper(), executed or qty,
+                           float(r.get("avgPrice") or 0), status)
 
     # ---- maker (post-only) entries
     def best_bid_ask(self, symbol: str) -> tuple[float, float]:

@@ -4,10 +4,15 @@ A separate OS process with its own exchange client; it never imports ``tb.engine
 ``guard_interval_s`` (5 s) it checks
 
 * engine heartbeat age (stale > ``heartbeat_stale_s`` with open positions -> make sure stops exist, DEGRADED)
-* every open position has a live exchange-side stop (demo/live: places a missing one itself; if that
-  fails it flattens the position; paper_local: acts through the commands table)
+* every open position has a live exchange-side stop (demo/live: places a missing one itself; if the price is already
+  through the level or the venue refuses it, it closes THAT coin only - the account state just stays DEGRADED while the
+  problem persists; paper_local: acts through the commands table)
+* positions in liquidation (mark through the liquidation price / isolated margin gone): no orders are sent for them, one
+  alert, re-checked every cycle (the engine records the trade once they vanish)
 * account drawdown vs the kill limit (FLATTEN, then HALTED)
 * exchange-wide faults (debounced): DEGRADED, FLATTEN only if the stops can not be confirmed
+
+Every per-symbol action backs off exponentially (5 s -> 5 min, ``tb.emergency.Backoff``) and logs / alerts once per step.
 
 and publishes ``safety_guard`` (+ ``guard_heartbeat``) in the store. The engine obeys it before
 every entry. NORMAL -> DEGRADED (no entries, keep stops) -> FLATTEN (close all) -> HALTED (sticky,
@@ -28,7 +33,8 @@ from . import __version__
 from . import capital as cap
 from .alerts import AlertDispatcher
 from .config import Settings, load_secrets, resolve_mode, trading_base_url, db_path, LiveNotAllowed
-from .exchange.base import Exchange, ExchangeError, order_side
+from .emergency import (Backoff, emergency_close, liq_clear, liq_map, liq_mark, liquidation_reason, transient)
+from .exchange.base import Exchange, ExchangeError, PositionInfo, order_side
 from .risk import dd_reference, derated_below_min_notional, drawdown_pct, positions_without_stop
 from .safety import DEGRADED, FLATTEN, HALTED, NORMAL, Debouncer
 
@@ -60,6 +66,9 @@ class Guard:
         self._exch_since: float | None = None
         self._cmd_sent: dict[Any, float] = {}
         self._last_published: tuple | None = None
+        self.backoff = Backoff()
+        self._alerted: set[str] = set()                 # symbols already alerted in their current incident
+        self._liq_syms: list[str] = []
 
     # ------------------------------------------------------------------ helpers
     def _say(self, level: int, msg: str) -> None:
@@ -88,44 +97,97 @@ class Guard:
         return (float(eq) if eq is not None else None), peak
 
     # ------------------------------------------------------------------ actions
-    def _flatten_exchange(self, why: str) -> bool:
-        """Close every exchange position (reduce-only market) and cancel stray orders. True if flat."""
-        assert self.ex is not None
-        ok = True
-        try:
-            for p in self.ex.positions():
-                try:
-                    self.ex.market_order(p.symbol, "SELL" if p.side == "long" else "BUY", p.qty, reduce_only=True)
-                    self.ex.cancel_all(p.symbol)
-                    self._say(logging.WARNING, f"flattened {p.symbol} ({why})")
-                except ExchangeError as e:
-                    ok = False
-                    self._say(logging.ERROR, f"flatten {p.symbol} failed: {e}")
-        except ExchangeError as e:
-            self._say(logging.ERROR, f"flatten: cannot list positions: {e}")
-            return False
-        return ok
-
-    def _place_missing_stop(self, sym: str, side: str, qty: float, entry: float, cfg: Settings) -> bool:
-        assert self.ex is not None
-        row = next((r for r in self.store.get_positions() if r["symbol"] == sym), None)
-        d = 1.0 if side == "long" else -1.0
-        px = float(row["sl_price"]) if row else entry - d * cfg.sl_usd / qty
-        f = self.ex.filters(sym)
-        try:
-            oid = self.ex.place_stop(sym, "SELL" if side == "long" else "BUY", px, qty)
-            self._say(logging.WARNING, f"placed missing stop for {sym} @ {px:g} ({oid})")
-            if row:
-                self.store.update_position(row["id"], sl_price=f.round_price(px), sl_order_id=oid)
-            return True
-        except ExchangeError as e:
-            self._say(logging.ERROR, f"cannot place stop for {sym}: {e}; closing the position")
+    def _fail(self, key: tuple, now: float, symbol: str, what: str, detail: Any) -> float:
+        """One failed attempt: back off, log ONCE per backoff step, alert once per symbol per incident."""
+        delay = self.backoff.fail(key, now)
+        self._say(logging.ERROR, f"{what} on {symbol} failed: {detail}; next try in {delay:.0f}s")
+        if self.alerts and symbol not in self._alerted:
+            self._alerted.add(symbol)
             try:
-                self.ex.market_order(sym, "SELL" if side == "long" else "BUY", qty, reduce_only=True)
-                self.ex.cancel_all(sym)
-            except ExchangeError as e2:
-                self._say(logging.ERROR, f"emergency close of {sym} failed: {e2}")
+                self.alerts.symbol_problem(symbol, what, str(detail), self.mode)
+            except Exception:
+                log.exception("alert failed")
+        return delay
+
+    def _ok(self, key: tuple, symbol: str) -> None:
+        if self.backoff.reset(key):
+            self._say(logging.WARNING, f"{symbol}: recovered ({key[0]})")
+        if not any(k[1] == symbol for k in self.backoff.keys()):
+            self._alerted.discard(symbol)
+
+    def _note_liquidation(self, p: PositionInfo, why: str, now: float) -> None:
+        if liq_mark(self.store, p, why, now, self.alerts, self.mode):
+            self._say(logging.ERROR, f"{p.symbol} is in liquidation ({why}); no orders will be sent for it")
+
+    def _flatten_exchange(self, why: str, now: float) -> bool:
+        """Close every exchange position, each on its own backoff; positions in liquidation are left to the venue.
+        True when nothing closable is left."""
+        assert self.ex is not None
+        try:
+            xpos = self.ex.positions()
+        except ExchangeError as e:
+            if self.backoff.ready(("flatten", "*"), now):
+                self._fail(("flatten", "*"), now, "*", "flatten (cannot list positions)", e)
             return False
+        left = False
+        for p in xpos:
+            lq = liquidation_reason(p)
+            if lq:
+                self._note_liquidation(p, lq, now)
+                continue
+            key = ("flatten", p.symbol)
+            if not self.backoff.ready(key, now):
+                left = True
+                continue
+            out = emergency_close(self.ex, p.symbol, say=lambda m: self._say(logging.WARNING, m))
+            if out.ok:
+                self._ok(key, p.symbol)
+                self._say(logging.WARNING, f"flattened {p.symbol} ({why}): {out.detail}")
+            elif out.liquidation:
+                continue
+            else:
+                left = True
+                self._fail(key, now, p.symbol, "flatten", out.detail)
+        return not left
+
+    def _fix_missing_stop(self, p: PositionInfo, cfg: Settings, now: float) -> str | None:
+        """One position has no live stop. Place it; if the price is already through the level (or the venue refuses it) close
+        THAT coin. Backed off per symbol. Returns the unresolved problem (None = fixed)."""
+        assert self.ex is not None
+        key = ("stop", p.symbol)
+        if not self.backoff.ready(key, now):
+            return f"{p.symbol} has no stop (retry in {self.backoff.wait_left(key, now):.0f}s)"
+        row = next((r for r in self.store.get_positions() if r["symbol"] == p.symbol), None)
+        d = 1.0 if p.side == "long" else -1.0
+        px = float(row["sl_price"]) if row else p.entry_price - d * cfg.sl_usd / p.qty
+        closing = "SELL" if p.side == "long" else "BUY"
+        why = ""
+        if p.mark_price > 0 and (p.mark_price - px) * d <= 0:
+            why = f"mark {p.mark_price:g} is already through the stop level {px:g}"
+        else:
+            try:
+                oid = self.ex.place_stop(p.symbol, closing, px, p.qty)
+            except ExchangeError as e:
+                if transient(e):
+                    self._fail(key, now, p.symbol, "placing the stop", e)
+                    return f"cannot place the stop on {p.symbol}: {e}"
+                why = f"the venue refuses the stop ({e})"
+            else:
+                self._say(logging.WARNING, f"placed missing stop for {p.symbol} @ {px:g} ({oid})")
+                if row:
+                    self.store.update_position(row["id"], sl_price=self.ex.filters(p.symbol).round_price(px), sl_order_id=oid)
+                self._ok(key, p.symbol)
+                return None
+        self._say(logging.WARNING, f"{p.symbol}: no stop and {why}; closing this coin")
+        out = emergency_close(self.ex, p.symbol, say=lambda m: self._say(logging.WARNING, m))
+        if out.ok:
+            self._ok(key, p.symbol)
+            self._say(logging.WARNING, f"closed {p.symbol} (no stop, {why}): {out.detail}")
+            return None
+        if out.liquidation:
+            return None
+        self._fail(key, now, p.symbol, "emergency close", out.detail)
+        return f"{p.symbol} has no stop and cannot be closed ({out.detail})"
 
     def _command_once(self, key: Any, action: str, payload: dict, every_s: float = 30.0) -> None:
         now = self.clock()
@@ -164,31 +226,49 @@ class Guard:
             reasons.append(f"engine heartbeat stale {age:.0f}s with {len(db_positions)} open position(s)"
                            if age is not None else "engine heartbeat missing with open positions")
 
-        # ---- exchange check: positions + stops
+        # ---- exchange check: positions + stops (per symbol: one misbehaving coin never escalates the whole account)
         exchange_error = False
         stops_confirmed = False
         eq: float | None = None
         peak = 0.0
+        liq_syms: list[str] = []
         if self.ex is not None and self.mode != "paper_local":
             try:
                 xpos = self.ex.positions()
                 orders = self.ex.open_conditional_orders()
                 stops_confirmed = True
                 self._last_stops_ok = now
+                self.backoff.reset(("exchange", "*"))
                 bad = positions_without_stop(
                     [{"symbol": p.symbol, "side": p.side, "qty": p.qty} for p in xpos], orders)
                 for p in xpos:
+                    lq = liquidation_reason(p)
+                    if lq:                                   # the venue is liquidating it: no orders, alert once, re-check
+                        liq_syms.append(p.symbol)
+                        self._note_liquidation(p, lq, now)
+                        continue
+                    if p.symbol in liq_map(self.store):
+                        liq_clear(self.store, p.symbol)      # mark / margin recovered: it was not liquidating after all
                     missing = self.nostop_deb.observe(("nostop", p.symbol), p.symbol in bad, now)
-                    if p.symbol in bad and (missing or engine_stale):
+                    if p.symbol not in bad:
+                        self._ok(("stop", p.symbol), p.symbol)
+                    elif missing or engine_stale:
                         desired = max(desired, DEGRADED, key=_rank)
                         reasons.append(f"stop missing on {p.symbol}")
-                        if not self._place_missing_stop(p.symbol, p.side, p.qty, p.entry_price, cfg):
-                            desired = FLATTEN
-                            self.flatten_reason = f"cannot place stop on {p.symbol}"
+                        problem = self._fix_missing_stop(p, cfg, now)
+                        if problem:
+                            reasons.append(problem)
+                held = {p.symbol for p in xpos}
+                recorded = {r["symbol"] for r in db_positions}
+                for sym in list(liq_map(self.store)):        # gone from the exchange and already booked by the engine
+                    if sym not in held and sym not in recorded:
+                        liq_clear(self.store, sym)
                 eq, peak = self._equity(cfg)
             except ExchangeError as e:
                 exchange_error = True
-                self._say(logging.WARNING, f"exchange check failed: {e}")
+                if self.backoff.ready(("exchange", "*"), now):       # one log line per backoff step, not per cycle
+                    delay = self.backoff.fail(("exchange", "*"), now)
+                    self._say(logging.WARNING, f"exchange check failed: {e} (next log in {delay:.0f}s)")
         else:
             # paper_local: the simulated stops live in the engine; verify through its persisted state
             ps = self.store.kv_get("paper_state") or {}
@@ -203,6 +283,7 @@ class Guard:
                 else:
                     self.nostop_deb.observe(("nostop", r["symbol"]), False, now)
             eq, peak = self._equity(cfg)
+        self._liq_syms = liq_syms
         exch_active = self.exch_deb.observe("exchange", exchange_error, now)
         if exch_active:
             self._exch_since = self._exch_since or now
@@ -240,9 +321,9 @@ class Guard:
         if desired == FLATTEN or self.state == FLATTEN:
             reasons.append(self.flatten_reason or "flatten")
             if self.ex is not None and self.mode != "paper_local":
-                flat = self._flatten_exchange(self.flatten_reason)
+                flat = self._flatten_exchange(self.flatten_reason, now)
                 try:
-                    flat = flat and not self.ex.positions()
+                    flat = flat and not [p for p in self.ex.positions() if not liquidation_reason(p)]
                 except ExchangeError:
                     flat = False
             else:
@@ -262,7 +343,8 @@ class Guard:
         changed = state != self.state
         prev = self.state
         self.state = state
-        self.store.kv_set(KEY_STATE, {"state": state, "reasons": reasons, "t": now, "since": self.halted_since})
+        self.store.kv_set(KEY_STATE, {"state": state, "reasons": reasons, "t": now, "since": self.halted_since,
+                                      "liquidating": list(self._liq_syms)})
         self.store.kv_set(KEY_BEAT, {"t": now, "pid": os.getpid(), "mode": self.mode, "version": __version__})
         sig = (state, tuple(reasons))
         if changed or sig != self._last_published:

@@ -345,6 +345,24 @@ class AlertDispatcher:
         self.send(f"[{mode}] SAFETY {state}: {'; '.join(reasons)}", dedupe_key=f"safety:{state}",
                   headline=f"🚦 Safety {state}", card=build_card(f"🚦 Safety → {state}", mode, rows, "safety"))
 
+    def liquidation(self, symbol: str, side: str, qty: float, entry: float, mark: float, liq: float, why: str,
+                    mode: str = "") -> None:
+        """A position is in the venue's liquidation engine (mark through the liquidation price / margin gone): the bot sends
+        no orders for it, re-checks it every cycle and records the trade (exit reason liquidation) once it disappears."""
+        rows = [("Side", f"{side.upper()} {qty:g}", None), ("Entry", f"{entry:g}", None), ("Mark", f"{mark:g}", RED),
+                ("Liquidation price", f"{liq:g}", RED), ("Why", why, None),
+                ("Next step", "no orders are sent; trade is recorded when the venue closes it", AMBER)]
+        self.send(f"[{mode}] LIQUIDATION {side.upper()} {symbol} qty {qty:g}: {why}",
+                  dedupe_key=f"liq:{symbol}", headline=f"💥 {symbol} is in liquidation",
+                  card=build_card(f"💥 In liquidation · {symbol}", mode, rows, "liquidation"))
+
+    def symbol_problem(self, symbol: str, what: str, detail: str, mode: str = "") -> None:
+        """One coin's protection / close is failing (the rest of the book is fine): sent once per symbol per incident."""
+        rows = [("Symbol", symbol, AMBER), ("Problem", what, None), ("Detail", detail[:300], None),
+                ("Next step", "retrying with exponential backoff (5 s .. 5 min)", GREY)]
+        self.send(f"[{mode}] {symbol}: {what}: {detail}"[:500], dedupe_key=f"sym:{symbol}:{what}",
+                  headline=f"⚠️ {symbol}: {what}", card=build_card(f"⚠️ {symbol}", mode, rows, "symbol"))
+
     def engine_error(self, where: str, err: str) -> None:
         self.send(f"ENGINE ERROR in {where}: {err}"[:500], dedupe_key=f"err:{where}",
                   headline=f"⚠️ Engine error in {where}",

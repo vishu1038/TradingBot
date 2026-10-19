@@ -34,6 +34,8 @@ from .alerts import AlertDispatcher
 from .config import (LiveNotAllowed, Settings, db_path, load_secrets, models_dir, resolve_mode, trading_base_url,
                      PROD_BASE)
 from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, next_decision_ms, next_rebalance_ms, rebalance_slot
+from .emergency import (Backoff, emergency_close, liq_clear, liq_map, liq_mark, liquidation_reason, reduce_rejected,
+                        transient)
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
 from .exits import SETTINGS_SPEC, ExitSpec, exit_atr, resolve_exit
 from .exits import bind as bind_exit
@@ -232,6 +234,12 @@ class Engine:
         # profit protection, per position id: last stop-move bar, partial take-profit state, booked partial (for the
         # exchange close-out), stale stops still to cancel, failure timestamps. Persisted in kv "protect".
         self.prot: dict[str, dict] = {}
+        # emergency paths (tb.emergency): per-symbol exponential backoff (5 s .. 5 min), positions the venue is liquidating
+        # (no orders are sent for them), symbols already alerted in their current incident
+        self.backoff = Backoff()
+        self.liquidating: set[str] = set()
+        self._alerted: set[str] = set()
+        self._uni_sig: tuple | None = None                     # whitelist the current universe was built from
 
     # ================================================================== helpers
     async def io(self, fn: Callable, *a: Any, **kw: Any) -> Any:
@@ -245,6 +253,26 @@ class Engine:
             self.store.add_event(type_, data)
         except Exception:
             log.exception("event write failed")
+
+    def _bo_fail(self, key: tuple, symbol: str, what: str, detail: Any) -> float:
+        """A failed emergency action: back off (5 s doubling to 5 min), log ONCE per step, alert once per incident."""
+        delay = self.backoff.fail(key, self.clock())
+        log.error("%s on %s failed: %s; next try in %.0fs", what, symbol, detail, delay)
+        if symbol not in self._alerted:
+            self._alerted.add(symbol)
+            self.alerts.symbol_problem(symbol, what, str(detail), self.mode)
+        return delay
+
+    def _bo_ok(self, key: tuple, symbol: str) -> None:
+        if self.backoff.reset(key):
+            log.warning("%s: %s recovered", symbol, key[0])
+        if not any(k[1] == symbol for k in self.backoff.keys()):
+            self._alerted.discard(symbol)
+
+    def _note_liquidation(self, xp: Any, why: str) -> None:
+        if liq_mark(self.store, xp, why, self.clock(), self.alerts, self.mode):
+            log.error("%s is in liquidation (%s); no orders will be sent for it, the trade is recorded when it vanishes",
+                      xp.symbol, why)
 
     def watchlist(self) -> list[str]:
         syms = list(self.universe)
@@ -310,6 +338,7 @@ class Engine:
         if rows:
             self.universe = [r["symbol"] for r in rows]
             self.universe_at = float(st.get("universe_at") or 0.0)
+        self._uni_sig = tuple(self.store.kv_get("universe_wl", []) or [])
         self.reconcile_sync(startup=True)
         self.persist_state(force=True)
         log.info("engine started mode=%s equity=%.2f running=%s model=%s", self.mode, self.equity, self.running,
@@ -591,18 +620,25 @@ class Engine:
         for sym, xp in xpos.items():
             if sym in known or sym in self.pending:          # (a pending maker entry's fill is protected by its own flow)
                 continue
+            why = liquidation_reason(xp, self.vmarks.get(sym))
+            if why:
+                self._note_liquidation(xp, why)             # the venue is liquidating it: nothing to adopt or close
+                continue
+            if not self.backoff.ready(("recon", sym), self.clock()):
+                continue
             log.error("reconcile: exchange position %s %s qty=%s has no record; adopting", sym, xp.side, xp.qty)
             orders = self.ex.open_conditional_orders(sym)
             sl = next((o for o in orders if o.kind == "SL"), None)
             tp = next((o for o in orders if o.kind == "TP"), None)
             if sl is None:
                 log.error("reconcile: %s has no stop; closing it", sym)
-                try:
-                    self.ex.market_order(sym, opposite(order_side(xp.side)), xp.qty, reduce_only=True)
-                    self.ex.cancel_all(sym)
-                except ExchangeError as e:
-                    log.error("reconcile close failed for %s: %s", sym, e)
+                out = emergency_close(self.ex, sym, say=log.warning)
+                if out.ok:
+                    self._bo_ok(("recon", sym), sym)
+                elif not out.liquidation:
+                    self._bo_fail(("recon", sym), sym, "closing an untracked position without a stop", out.detail)
                 continue
+            self._bo_ok(("recon", sym), sym)
             self.store.insert_position({
                 "symbol": sym, "side": xp.side, "entry_price": xp.entry_price, "qty": xp.qty,
                 "notional": xp.qty * xp.entry_price, "leverage": xp.leverage, "margin": xp.margin or xp.qty * xp.entry_price / xp.leverage,
@@ -657,17 +693,40 @@ class Engine:
             if self.drift.level > prev:
                 self.alerts.send(f"[{self.mode}] {msg}", dedupe_key=f"drift{self.drift.level}")
 
-    async def close_position(self, pos: dict, reason: str) -> bool:
-        """Close at market (reduce-only), then clear leftover orders. Caller holds tlock."""
+    async def close_position(self, pos: dict, reason: str, emergency: bool = False) -> bool:
+        """Close at market (reduce-only), then clear leftover orders. Caller holds tlock.
+
+        Per-symbol robust: a position the venue is liquidating gets no order; a failing close backs off (5 s .. 5 min,
+        reset on success) and is logged / alerted once per step; a reduce-only close the venue rejects with -2022 goes
+        through ``tb.emergency.emergency_close`` (cancel the symbol's reduce-only stops, retry, then one plain MARKET of
+        exactly the quantity the exchange reports). ``emergency=True`` (stop missing / beyond its stop) cancels the stops
+        first."""
         sym = pos["symbol"]
-        try:
-            res = await self.io(self.ex.market_order, sym, opposite(order_side(pos["side"])), pos["qty"], True)
-        except ExchangeError as e:
-            if e.code in (-2022, -4118) or "ReduceOnly" in str(e):     # already flat on the exchange
-                log.warning("close %s: nothing to reduce (%s); reconciling", sym, e)
-                return False
-            log.error("close %s failed: %s", sym, e)
+        key = ("close", sym)
+        if sym in self.liquidating:
             return False
+        if not self.backoff.ready(key, self.clock()):
+            return False
+        res = None
+        if not emergency:
+            try:
+                res = await self.io(self.ex.market_order, sym, opposite(order_side(pos["side"])), pos["qty"], True)
+            except ExchangeError as e:
+                if not reduce_rejected(e):
+                    self._bo_fail(key, sym, "close", e)
+                    return False
+                log.warning("close %s: reduce-only close rejected (%s); using the emergency close", sym, e)
+        if res is None:
+            out = await self.io(emergency_close, self.ex, sym, cancel_first=emergency, say=log.warning)
+            if out.liquidation:
+                self.liquidating.add(sym)
+                log.error("close %s skipped: %s", sym, out.detail)
+                return False
+            if not out.ok:
+                self._bo_fail(key, sym, "close", out.detail)
+                return False
+            res = out.result
+        self._bo_ok(key, sym)
         info = None
         for _ in range(4):
             try:
@@ -679,7 +738,7 @@ class Engine:
             await asyncio.sleep(0.5)
         if info is None:
             d = 1 if pos["side"] == "long" else -1
-            px = res.avg_price or self.marks.get(sym) or pos["entry_price"]
+            px = (res.avg_price if res is not None else 0.0) or self.marks.get(sym) or pos["entry_price"]
             info = CloseInfo(px, (px - pos["entry_price"]) * pos["qty"] * d,
                              (pos.get("entry_fee") or pos["qty"] * pos["entry_price"] * self.cfg.fee_taker)
                              + pos["qty"] * px * self.cfg.fee_taker, pos.get("funding") or 0.0, reason, int(self.clock()))
@@ -728,10 +787,14 @@ class Engine:
             await self.io(ex.market_order, sym, close_side, qty, True)
             await self.io(ex.cancel_all, sym)
         except ExchangeError as e:
-            log.error("EMERGENCY CLOSE of unprotected %s failed: %s", sym, e)
-            self.alerts.engine_error("emergency_close", f"{sym}: {e}")
-            self.kill = {"tripped": True, "reason": f"unprotected position {sym} could not be closed", "t": int(self.clock())}
-            return False
+            # one coin that cannot be closed must not take the account down (no kill switch): the emergency close
+            # (cancel reduce-only stops, retry, plain market of the reported quantity); if even that fails the untracked
+            # position is retried with backoff by the reconcile (and the guard) - alerted once.
+            out = await self.io(emergency_close, ex, sym, cancel_first=True, say=log.warning)
+            if not out.ok:
+                if not out.liquidation:
+                    self._bo_fail(("recon", sym), sym, "EMERGENCY CLOSE of an unprotected fill", f"{e}; {out.detail}")
+                return False
         info = None
         try:
             info = await self.io(ex.last_close, sym, side, int(self.clock() * 1000) - 60_000)
@@ -1280,9 +1343,14 @@ class Engine:
                         info = await self.io(self._last_close, pos)
                     except ExchangeError as e:
                         log.warning("last_close failed for %s: %s", pos["symbol"], e)
+                    liq = liq_map(self.store).get(pos["symbol"])
+                    d = 1 if pos["side"] == "long" else -1
+                    if info is None and liq:                       # liquidated by the venue: loss ~ the isolated margin
+                        lpx = float(liq.get("liq") or marks.get(pos["symbol"]) or pos["entry_price"])
+                        info = CloseInfo(lpx, (lpx - pos["entry_price"]) * pos["qty"] * d, pos["qty"] * lpx * cfg.fee_taker * 2,
+                                         0.0, "liquidation", int(now))
                     if info is None:
                         m = marks.get(pos["symbol"]) or pos["entry_price"]
-                        d = 1 if pos["side"] == "long" else -1
                         hit_sl = (m - pos["sl_price"]) * d <= 0
                         info = CloseInfo(pos["sl_price"] if hit_sl else (pos["tp_price"] or m),
                                          (((pos["sl_price"] if hit_sl else (pos["tp_price"] or m)) - pos["entry_price"]) * pos["qty"] * d),
@@ -1291,15 +1359,36 @@ class Engine:
                         await self.io(self.ex.cancel_all, pos["symbol"])
                     except ExchangeError:
                         pass
-                    self._finalize(pos, info, info.reason)
+                    self._finalize(pos, info, "liquidation" if liq else info.reason)
+                    if liq:
+                        liq_clear(self.store, pos["symbol"])
+                        self.liquidating.discard(pos["symbol"])
+                    self.backoff.reset(("close", pos["symbol"]))
+                    self.backoff.reset(("stop", pos["symbol"]))
+                    self._bo_ok(("recon", pos["symbol"]), pos["symbol"])
             db = self._db_positions()
             known = {p["symbol"] for p in db}
             for sym, xp in xpos.items():
                 if sym not in known and not self.paper and sym not in self.pending:
+                    if not self.backoff.ready(("recon", sym), now):
+                        continue
                     log.error("untracked exchange position %s; reconciling", sym)
                     await self.io(self.reconcile_sync)
                     db = self._db_positions()
                     break
+            # positions the venue is liquidating: no orders for them, one alert; re-checked on every sync
+            self.liquidating = set()
+            lmap = liq_map(self.store)
+            for pos in db:
+                xp = xpos.get(pos["symbol"])
+                if xp is None:
+                    continue
+                why = liquidation_reason(xp, marks.get(pos["symbol"]))
+                if why:
+                    self.liquidating.add(pos["symbol"])
+                    self._note_liquidation(xp, why)
+                elif pos["symbol"] in lmap:
+                    liq_clear(self.store, pos["symbol"])
         # 2) per-position management
         for pos in db:
             sym = pos["symbol"]
@@ -1310,6 +1399,9 @@ class Engine:
             best = max(pos.get("best_price") or m, m) if d == 1 else min(pos.get("best_price") or m, m)
             upnl = (m - pos["entry_price"]) * pos["qty"] * d
             upd: dict[str, Any] = {"mark_price": m, "upnl": upnl, "best_price": best}
+            if sym in self.liquidating:                      # the venue owns it now: no stop moves, no closes, no orders
+                self.store.update_position(pos["id"], mark_price=m, upnl=upnl)
+                continue
             # time stop (exit_cfg.horizon_bars): close at market once the horizon has passed
             dl = self.time_stops.get(str(pos["id"]))
             if dl is not None and now >= dl:
@@ -1322,8 +1414,9 @@ class Engine:
                 await self.close_position({**pos, **upd}, "tp")
                 continue
             if not self.paper and (m - pos["sl_price"]) * d < -0.003 * pos["entry_price"]:
-                log.error("%s is beyond its stop by >0.3%% and still open; closing at market", sym)
-                await self.close_position({**pos, **upd}, "sl")
+                if self.backoff.ready(("close", sym), now):          # (one log line per backoff step, not per loop)
+                    log.error("%s is beyond its stop by >0.3%% and still open; closing at market", sym)
+                    await self.close_position({**pos, **upd}, "sl", emergency=True)
                 continue
             # profit protection: break-even / trailing stop, partial take-profit (exchange orders are moved, never dropped)
             if await self._protect(pos, m, best, d, upd, now):
@@ -1340,11 +1433,45 @@ class Engine:
                 except ExchangeError as e:
                     log.warning("stop check skipped: %s", e)
                     return
-                for sym in positions_without_stop([p for p in db if p["symbol"] in xnow], orders):
+                for sym in positions_without_stop([p for p in db if p["symbol"] in xnow and p["symbol"] not in self.liquidating],
+                                                  orders):
                     pos = next(p for p in db if p["symbol"] == sym)
-                    log.error("INVARIANT: %s has no live stop; closing it", sym)
-                    self.alerts.engine_error("stop_invariant", f"{sym} had no live stop; closed")
-                    await self.close_position(pos, "manual")
+                    await self._restore_stop(pos, now)
+                for sym in [p["symbol"] for p in db]:
+                    if sym not in positions_without_stop([p for p in db if p["symbol"] == sym], orders):
+                        self._bo_ok(("stop", sym), sym)
+
+    async def _restore_stop(self, pos: dict, now: float) -> None:
+        """INVARIANT: an open position has no live stop. Per symbol and backed off: place the stop at its level; if the price is
+        already through that level (or the venue refuses the stop) close THAT coin; nothing else is touched."""
+        sym, d = pos["symbol"], (1 if pos["side"] == "long" else -1)
+        key = ("stop", sym)
+        if not self.backoff.ready(key, now):
+            return
+        m = self.vmarks.get(sym) or self.marks.get(sym) or pos.get("mark_price") or 0.0
+        px = float(pos["sl_price"])
+        why = ""
+        if m and (m - px) * d <= 0:
+            why = f"mark {m:g} is already through the stop level {px:g}"
+        else:
+            try:
+                oid = await self.io(self.ex.place_stop, sym, opposite(order_side(pos["side"])), px, pos["qty"])
+            except ExchangeError as e:
+                if transient(e):
+                    self._bo_fail(key, sym, "re-placing the stop", e)
+                    return
+                why = f"the venue refuses the stop ({e})"
+            else:
+                log.warning("INVARIANT: %s had no live stop; re-placed it @ %s (%s)", sym, px, oid)
+                self.store.update_position(pos["id"], sl_order_id=oid)
+                self._bo_ok(key, sym)
+                return
+        log.error("INVARIANT: %s has no live stop and %s; closing it", sym, why)
+        self.alerts.engine_error("stop_invariant", f"{sym} had no live stop ({why}); closing it")
+        if await self.close_position(pos, "manual", emergency=True):
+            self._bo_ok(key, sym)
+        elif sym not in self.liquidating:
+            self.backoff.fail(key, now)
 
     # ================================================================== profit protection
     def _pos_atr(self, pos: dict, sym: str) -> float | None:
@@ -1963,6 +2090,9 @@ class Engine:
 
         cfg = self.cfg
         forced, self.force_universe = self.force_universe, False
+        wl_sig = tuple(cfg.universe_whitelist or ())
+        if wl_sig != self._uni_sig:                    # the whitelist was set / changed / cleared: rebuild right away
+            forced = True
         if not forced and self.universe and self.clock() - self.universe_at < cfg.universe_refresh_s:
             return
         cur = {r["symbol"]: r["in_universe_since"] for r in self.store.get_universe()}
@@ -1974,6 +2104,7 @@ class Engine:
             except ExchangeError as e:
                 log.warning("order-venue exchangeInfo unavailable (%s); keeping the current universe", e)
                 self.universe_at = self.clock() - cfg.universe_refresh_s + 60
+                self._uni_sig = wl_sig
                 return
         rows = await self.io(uni.refresh, self.data, cfg, cur, self.clock(), venue_info, dropped)
         if dropped:
@@ -1982,11 +2113,14 @@ class Engine:
         if not rows:
             log.warning("universe refresh returned no symbols; keeping the old list")
             self.universe_at = self.clock() - cfg.universe_refresh_s + 120
+            self._uni_sig = wl_sig
             return
         self.store.replace_universe(rows)
         self.universe = [r["symbol"] for r in rows]
         self.universe_at = self.clock()
         self.store.kv_set("universe_at", self.universe_at)
+        self._uni_sig = wl_sig
+        self.store.kv_set("universe_wl", list(wl_sig))
         self.event("universe", {"symbols": self.universe, "updated_at": int(self.universe_at)})
         log.info("universe: %s", ", ".join(self.universe))
 

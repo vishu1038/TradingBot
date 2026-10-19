@@ -176,6 +176,19 @@ channel: the native Android app (push + widget for live trades).
    (manual `reset_kill` only). Engine heartbeat stale > 30 s with open positions → guard ensures
    stops exist (places them itself if missing, demo/live) and sets DEGRADED. In `paper_local`
    the guard acts through the commands table (paper fills live in the engine).
+   **Per-symbol emergency paths (`tb/emergency.py`, incident 2026-10-19 testnet).** One misbehaving coin never escalates the
+   account: a missing stop is re-placed; if the price is already through its level (or the venue refuses it) THAT coin is closed,
+   and the account only stays `DEGRADED` (no new entries) while the problem persists. `FLATTEN` is for account-wide causes only
+   (drawdown / kill, positions or orders unreadable, repeated network errors with unconfirmable stops). A position whose mark is
+   through its `liquidationPrice` (long mark ≤ liq, short mark ≥ liq) or whose isolated margin is ≤ 0 is *in liquidation*: no
+   orders are sent for it, one Google Chat alert, re-checked every cycle (kv `liquidating`); once it vanishes the engine records
+   the trade with `exit_reason: liquidation`. Emergency close order: cancel the symbol's reduce-only conditional orders (legacy
+   and algo ids), reduce-only market close; on -2022 with the position still shown and not liquidating, ONE plain MARKET of exactly
+   the freshly re-read quantity (one-way mode), else give up for that symbol. Every such action (guard flatten / no-stop close,
+   engine invariant close, "beyond its stop" close, stop re-place, untracked-position close) backs off per symbol 5 s → 10 s → …
+   5 min (reset on success), logs once per step and alerts once per symbol per incident. `BinanceExchange.market_order` raises
+   `OrderNotFilled` (and cancels the order) when the venue acks a market order that never fills, instead of reporting the
+   requested quantity as executed.
 2. **Data plausibility + fault debouncing.** Reject a bar/tick before use when: single-bar
    |return| > max(15%, 8×ATR14); high < low or non-positive prices; zero volume; bar timestamp
    stale > 2 bars; |mark − last| > 1%. A fault must occur `fault_mature_n` (3) consecutive
@@ -210,6 +223,10 @@ Refresh every `universe_refresh_s` (3600). Candidates: USDⓈ-M perpetuals quote
 TRADING. Exclude: 24h quote volume < 50M USD, listed < 7 days (`onboardDate`), |funding| > 0.1%.
 Score = ATR%(5m, last 6h) × sqrt(24h quote volume). Keep top `universe_size` (8), with a
 retention buffer: a current member stays while it ranks within top ceil(1.5·size).
+**Whitelist** (`universe_whitelist: list[str] | null`, default null = the ranking above): when set, the universe is exactly the
+whitelist ∩ symbols TRADING on prod (signal data) and on the order venue, in whitelist order; `universe_size`, the ranking and the
+volume / funding / listing filters are ignored. Changing it rebuilds the universe within ~5 s. Open positions in coins outside the
+universe are still watched, priced, protected (stops, trailing, partials) and closed normally.
 
 ## Scorer interface (engine ↔ model)
 `backend/tb/scorer.py`:
@@ -347,8 +364,8 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/settings` / `PUT /api/settings` (partial merge) → `{slice_margin_usd, leverage,
   max_positions, exit_mode, tp_usd, sl_usd, tp_atr, sl_atr, trail:{enabled, activate_r,
   distance_atr}, breakeven_r, sl_cooldown_bars, max_side_risk_pct, partial_tp_r, partial_tp_frac, short_enabled, prob_threshold_long, prob_threshold_short,
-  corr_cap:{max_corr, max_correlated}, universe_size, universe_refresh_s, kill_dd_pct, fee_taker,
-  sound}`
+  corr_cap:{max_corr, max_correlated}, universe_size, universe_refresh_s, universe_whitelist (null | [symbol]),
+  kill_dd_pct, fee_taker, sound}`
 - `POST /api/control` `{action:"start"|"stop"|"kill"|"reset_kill"|"close_position"|"close_all"|
   "pause_symbol"|"unpause_symbol"|"refresh_universe", position_id?, symbol?}` → `{ok, error?}`
 - `GET /api/lab/reports` → `[{id, created_at, kind:"backtest"|"train", title, summary:{...},

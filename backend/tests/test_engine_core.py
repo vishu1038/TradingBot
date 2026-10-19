@@ -127,15 +127,30 @@ def test_sl_placement_failure_closes_position_immediately(store, tmp_path):
     assert any("sl_placement" in m for m in eng.sink.msgs)
 
 
-def test_stop_invariant_closes_position_without_live_stop(store, tmp_path):
+def test_stop_invariant_replaces_a_lost_stop_for_that_coin(store, tmp_path):
     eng, data = mk_engine(store, tmp_path)
     open_long(eng)
+    sl = store.get_positions()[0]["sl_price"]
     eng.ex.conds.clear()                                 # simulate a lost stop (and TP)
+    run(eng.prices_cycle())
+    assert len(store.get_positions()) == 1               # still open: the stop was put back, nothing was closed
+    sls = [o for o in eng.ex.open_conditional_orders() if o.kind == "SL"]
+    assert len(sls) == 1 and sls[0].trigger_price == pytest.approx(sl)
+    assert store.get_positions()[0]["sl_order_id"] == sls[0].order_id
+
+
+def test_stop_invariant_closes_the_coin_when_price_is_already_through_the_stop(store, tmp_path):
+    eng, data = mk_engine(store, tmp_path)
+    open_long(eng)
+    p = store.get_positions()[0]
+    eng.ex.conds.clear()
+    data.marks["AAAUSDT"] = p["sl_price"] * 0.999        # through the level: a stop would trigger at once
+    eng.ex.marks["AAAUSDT"] = data.marks["AAAUSDT"]
     run(eng.prices_cycle())
     assert store.get_positions() == []
     assert eng.ex.positions() == []
     t = store.get_trades(1)[0]
-    assert t["exit_reason"] == "manual"
+    assert t["exit_reason"] in ("manual", "sl")
 
 
 def test_tp_hit_recorded_with_fees(store, tmp_path):

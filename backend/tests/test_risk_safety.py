@@ -208,6 +208,9 @@ class FakeTrade:
     def cancel_all(self, sym):
         self.orders = [o for o in self.orders if o.symbol != sym]
 
+    def cancel_order(self, sym, oid):
+        self.orders = [o for o in self.orders if o.order_id != oid]
+
 
 def pos_row(store, sym="AAAUSDT", sl=93.75):
     return store.insert_position({"symbol": sym, "side": "long", "entry_price": 100.0, "qty": 1.6, "notional": 160.0,
@@ -289,7 +292,8 @@ def test_guard_flattens_when_stop_cannot_be_placed(store):
     g = G.Guard(store, "binance_demo", ex, clock=clk)
     r = g.step()
     assert ex.closed == [("AAAUSDT", "SELL", 1.6)]
-    assert r["state"] == HALTED                              # flat afterwards -> HALTED until manual reset
+    # per-symbol: only THAT coin was closed; the account is NOT flattened/halted (no new entries while the issue shows)
+    assert r["state"] == DEGRADED and "stop missing on AAAUSDT" in r["reasons"]
 
 
 def test_guard_judges_the_bot_stake_not_the_wallet(store):

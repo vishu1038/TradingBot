@@ -76,6 +76,7 @@ export const DEFAULT_SETTINGS = () => ({
   corr_cap: { max_corr: 0.8, max_correlated: 2 },
   universe_size: 8,
   universe_refresh_s: 3600,
+  universe_whitelist: null, // null = hot-list ranking; else exactly these coins
   kill_dd_pct: 50,
   fee_taker: 0.0005,
   sound: false,
@@ -391,6 +392,9 @@ export class MockServer {
   }
 
   _rankUniverse(current) {
+    const wl = this.settings.universe_whitelist;
+    const wlIn = Array.isArray(wl) ? wl.filter((s) => this.syms[s]) : []; // whitelist ∩ what the mock venue lists
+    if (wlIn.length) return wlIn;
     const size = this.settings.universe_size;
     const ranked = this.order.slice().sort((a, b) => this._score(this.syms[b]) - this._score(this.syms[a]));
     if (!current) return ranked.slice(0, size);
@@ -1256,6 +1260,11 @@ export class MockServer {
       if (typeof v !== 'number' || !Number.isFinite(v)) return `${path}: must be a number`;
       if (v < lo || v > hi) return `${path}: must be between ${lo} and ${hi}`;
       if (int && !Number.isInteger(v)) return `${path}: must be an integer`;
+    }
+    const wl = merged.universe_whitelist;
+    if (wl !== null && wl !== undefined) {
+      if (!Array.isArray(wl) || !wl.length || wl.length > 50 || new Set(wl).size !== wl.length
+        || !wl.every((x) => typeof x === 'string' && /^[A-Z0-9]{2,20}(USDT|USDC|BUSD)$/.test(x))) return 'universe_whitelist: must be null or 1..50 distinct symbols like BTCUSDT';
     }
     if (!['fixed', 'atr'].includes(merged.exit_mode)) return 'exit_mode: must be "fixed" or "atr"';
     for (const k of ['short_enabled', 'sound']) if (typeof merged[k] !== 'boolean') return `${k}: must be a boolean`;

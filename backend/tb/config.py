@@ -6,6 +6,7 @@ masks them and the dataclass fields are excluded from repr.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -172,7 +173,7 @@ CONTRACT_KEYS = (
     "slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
     "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr",
     "sl_atr", "trail", "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap",
-    "universe_size", "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
+    "universe_size", "universe_refresh_s", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd",
     "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
     "maker_reprices", "maker_on_timeout",
     "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
@@ -200,6 +201,7 @@ class Settings:
     corr_cap: CorrCap = CorrCap()
     universe_size: int = 8
     universe_refresh_s: int = 3600
+    universe_whitelist: list[str] | None = None   # null = hot-list ranking; else exactly these coins (∩ symbols TRADING on the order venue)
     kill_dd_pct: float = 50.0           # paper default; live is capped at LIVE_KILL_DD_PCT
     dd_basis: str = "start"             # drawdown for kill/derating vs the starting stake ("start") or the high-water mark ("peak")
     fee_taker: float = 0.0005
@@ -320,6 +322,10 @@ class Settings:
         chk(self.corr_cap.max_correlated >= 1, "corr_cap.max_correlated must be >= 1")
         chk(1 <= self.universe_size <= 50, "universe_size must be 1..50")
         chk(self.universe_refresh_s >= 30, "universe_refresh_s must be >= 30")
+        wl = self.universe_whitelist
+        chk(wl is None or (isinstance(wl, list) and 1 <= len(wl) <= 50 and len(set(wl)) == len(wl)
+                           and all(isinstance(x, str) and _SYMBOL_RE.match(x) for x in wl)),
+            "universe_whitelist must be null or 1..50 distinct symbols like BTCUSDT")
         chk(0 < self.kill_dd_pct <= 100, "kill_dd_pct must be (0,100]")
         chk(0 <= self.fee_taker < 0.01, "fee_taker must be a fraction in [0, 0.01)")
         chk(self.paper_start_equity > 0, "paper_start_equity must be > 0")
@@ -374,12 +380,33 @@ def _cast(tp: Any, v: Any, name: str) -> Any:
     return v
 
 
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}(USDT|USDC|BUSD)$")
+
+
+def _coerce_whitelist(v: Any) -> list[str] | None:
+    """null stays null; a list (or comma-separated string) of symbols is upper-cased, stripped and de-duplicated (order kept)."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = [x for x in v.replace(";", ",").split(",")]
+    if not isinstance(v, (list, tuple)) or not all(isinstance(x, str) for x in v):
+        raise ValueError("setting 'universe_whitelist' must be null or a list of symbols")
+    out: list[str] = []
+    for x in v:
+        x = x.strip().upper()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
 def _coerce_settings(s: Settings) -> Settings:
     kw: dict[str, Any] = {}
     for f in fields(s):
         v = getattr(s, f.name)
         if f.name in ("trail", "corr_cap"):
             kw[f.name] = v
+        elif f.name == "universe_whitelist":
+            kw[f.name] = _coerce_whitelist(v)
         else:
             kw[f.name] = _cast(f.type, v, f.name)
     return Settings(**kw)

@@ -19,6 +19,11 @@ class ExchangeError(Exception):
         self.status = status
 
 
+class OrderNotFilled(ExchangeError):
+    """A market order was accepted but nothing executed (thin / synthetic testnet books). The order has been cancelled:
+    the position did NOT change. Callers must treat it as a failed order, never as a fill."""
+
+
 class NetworkError(ExchangeError):
     """Transport-level failure (timeout, DNS, 5xx). Safe to retry reads."""
 

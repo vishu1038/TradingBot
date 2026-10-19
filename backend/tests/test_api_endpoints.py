@@ -154,7 +154,7 @@ def test_settings_get_put_merge(env):
     assert set(g) == {"slice_margin_usd", "leverage", "max_positions", "max_leverage", "max_total_leverage", "max_margin_ratio",
                       "max_open_risk_pct", "exit_mode", "tp_usd", "sl_usd", "tp_atr", "sl_atr", "trail",
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
-                      "universe_refresh_s", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
+                      "universe_refresh_s", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
                           "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
                           "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": True, "activate_r": 1.5, "distance_atr": 1.0}
@@ -166,6 +166,13 @@ def test_settings_get_put_merge(env):
     for bad in ({"leverage": 0}, {"exit_mode": "wat"}, {"nonsense": 1}, {"paper_start_equity": 1}, {"prob_threshold_long": 2}):
         assert c.put("/api/settings", json=bad).status_code == 422
     assert c.get("/api/settings").json() == r.json()
+    assert g["universe_whitelist"] is None
+    w = c.put("/api/settings", json={"universe_whitelist": ["btcusdt", "ETHUSDT"]})
+    assert w.status_code == 200 and w.json()["universe_whitelist"] == ["BTCUSDT", "ETHUSDT"]
+    assert s.get_settings().universe_whitelist == ["BTCUSDT", "ETHUSDT"]
+    for bad in ([], ["not a symbol"], 5):
+        assert c.put("/api/settings", json={"universe_whitelist": bad}).status_code == 422
+    assert c.put("/api/settings", json={"universe_whitelist": None}).json()["universe_whitelist"] is None
 
 
 def test_control_validation(env):
