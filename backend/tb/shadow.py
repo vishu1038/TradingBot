@@ -22,8 +22,9 @@ from .config import Settings
 from .entry import EntryCfg
 from .exchange.base import SymbolFilters
 from .exits import ExitSpec
-from .protect import Protect, breakeven_price, next_stop, partial_level, partial_split, stop_loss_usd, tighter
-from .risk import levels, size_trade
+from .protect import Protect, breakeven_price, next_stop, partial_gain_ok, partial_level, partial_split, stop_loss_usd, tighter
+from .reversal import ReversalBook, ReversalCfg, RevSignal, lock_stop, net_side as _net_side, signed_net
+from .risk import dollar_floor, levels, net_exposure_check, size_trade
 
 log = logging.getLogger("tb.shadow")
 
@@ -110,6 +111,9 @@ class ShadowBook:
         self.pos: dict[str, ShadowPos] = {}
         self.pending: dict[str, ShadowPending] = {}
         self.stats: dict[str, dict[str, int]] = {}          # model -> maker entry outcomes (placed / filled / dropped)
+        self.betas: dict[str, float] = {}                   # symbol -> beta vs BTC (the engine keeps it fresh; missing = 1.0)
+        self.rev: dict[str, ReversalBook] = {}              # model -> reversal block / lock windows of its own book
+        self.skips: dict[str, int] = {}                     # "floor" / "net" / "reversal" -> entries refused by the new risk rules
 
     @staticmethod
     def _key(model: str, symbol: str) -> str:
@@ -134,13 +138,20 @@ class ShadowBook:
             if lv is None:
                 return None
             sl, tp = lv[0], lv[1]
+            if dollar_floor(cfg, qty * abs(fill - sl), qty * abs(tp - fill)):      # dollar floor (mult 1.0 still applies it)
+                self._skip("floor")
+                return None
         else:
-            sz = size_trade(spec.effective(cfg), side, fill, spec.atr_arg(atr, fill), f, None, 1.0, None)
+            sz = size_trade(spec.effective(cfg), side, fill, spec.atr_arg(atr, fill), f, None, 1.0, None, tp_floor=spec.tp_enabled)
             if not sz.ok:
+                if sz.reason.startswith("target below"):
+                    self._skip("floor")
                 return None
             qty, sl, tp = sz.qty, sz.sl_price, (sz.tp_price if spec.tp_enabled else None)
         dl = int(t) + int(spec.horizon_bars) * 300 if spec is not None and spec.horizon_bars else None
         if not self._side_ok(model, side, qty, fill, sl):
+            return None
+        if not self._reversal_ok(model, symbol, side, qty * fill, t):
             return None
         trail_atr = None if (spec is not None and spec.mode == "pct") else atr
         return ShadowPos(model, symbol, side, fill, qty, sl, tp, int(t), float(prob), qty * fill * fee_rate, dl,
@@ -149,6 +160,67 @@ class ShadowBook:
 
     def _pc(self) -> Protect:
         return Protect.from_settings(self.cfg)
+
+    def _skip(self, what: str) -> None:
+        self.skips[what] = self.skips.get(what, 0) + 1
+
+    def beta(self, symbol: str) -> float:
+        return float(self.betas.get(symbol, 1.0))
+
+    def net(self, model: str) -> float:
+        """Beta-weighted signed notional of one model's open positions (+ long / - short)."""
+        return signed_net((q.side, q.qty * q.entry, self.beta(q.symbol)) for q in self.pos.values() if q.model == model)
+
+    def _equity(self) -> float:
+        return float(self.cfg.capital_usd or self.cfg.paper_start_equity)
+
+    def _reversal_ok(self, model: str, symbol: str, side: str, notional: float, t: float) -> bool:
+        """Reversal protection for a NEW shadow entry: the side is not blocked by a reversal signal, and the beta-weighted net
+        exposure of the model's book stays under ``max_net_exposure_pct`` (an entry that reduces |net| is always allowed)."""
+        cfg = self.cfg
+        rb = self.rev.get(model)
+        if rb is not None and rb.blocked(side, int(t * 1000)):
+            self._skip("reversal")
+            return False
+        if cfg.max_net_exposure_pct > 0:
+            signed = (1.0 if side == "long" else -1.0) * notional * self.beta(symbol)
+            ok, _ = net_exposure_check(self.net(model), signed, cfg.max_net_exposure_pct / 100.0 * self._equity())
+            if not ok:
+                self._skip("net")
+                return False
+        return True
+
+    def apply_reversal(self, sig: RevSignal | None, marks: Mapping[str, float], now_ms: int | None = None) -> list[dict]:
+        """Reversal detector for every model's own book: when the basket moved against the book's net side (z >= ``reversal_z``)
+        that side's NEW entries are blocked for ``reversal_block_bars``, and while the window is open its winners (profit >=
+        ``reversal_lock_r`` x initial risk) get their stop tightened (never loosened, never through the market; nothing is closed).
+        Returns one event dict per trigger (``new`` = the window was not already open)."""
+        rc = ReversalCfg.from_settings(self.cfg)
+        out: list[dict] = []
+        if not rc.detector_on:
+            return out
+        eq = self._equity()
+        for model in sorted({q.model for q in self.pos.values()}):
+            rb = self.rev.setdefault(model, ReversalBook())
+            side = _net_side(self.net(model), eq)
+            tr = rb.step(sig, side, rc)
+            if tr is not None:
+                tr = {**tr, "model": model, "locked": 0}
+                out.append(tr)
+            now = now_ms if now_ms is not None else (int(sig.t_ms) + 300_000 if sig is not None else int(time.time() * 1000))
+            for s_ in ("long", "short"):
+                if not rb.locking(s_, now):
+                    continue
+                n = 0
+                for q in [q for q in self.pos.values() if q.model == model and q.side == s_]:
+                    m = marks.get(q.symbol)
+                    lk = lock_stop(s_, q.entry, q.sl0 or q.sl, q.sl, float(m), self.cfg.fee_taker, rc.lock_r) if m else None
+                    if lk is not None:
+                        q.sl = lk
+                        n += 1
+                if n and tr is not None and tr["side"] == s_:
+                    tr["locked"] = n
+        return out
 
     def _side_ok(self, model: str, side: str, qty: float, entry: float, sl: float) -> bool:
         """max_side_risk_pct against the open-risk budget (max_open_risk_pct x a static equity proxy: ``capital_usd`` or
@@ -246,6 +318,9 @@ class ShadowBook:
         if split is None:
             return
         q, rem = split
+        if not partial_gain_ok(p.side, p.entry, lvl, q, pc):        # dollar floor: the piece gains too little -> run to the full TP
+            self._skip("partial_floor")
+            return
         px = lvl * (1.0 - d * self.cfg.slippage_pct)
         frac = q / p.qty
         p.part_gross += (px - p.entry) * q * d

@@ -39,9 +39,15 @@ class SimConfig:
     max_side_risk_pct: float = 60.0        # open stop-out risk of ONE side (incl. the new entry) <= this % of that budget; >= 100 = off
     partial_tp_r: float = 1.5              # close partial_tp_frac of the position at this many initial risks in favour (0 = off)
     partial_tp_frac: float = 0.5
-    short_enabled: bool = False
+    short_enabled: bool = True             # symmetric long/short (2026-10-19): same defaults as tb.config.Settings
     thr_long: float = 0.70
-    thr_short: float = 0.80
+    thr_short: float = 0.70
+    min_tp_usd: float = 2.0                # dollar floor (user 2026-10-19): skip a trade whose TP / SL span fewer USD (0 = off); also the
+    min_sl_usd: float = 2.0                # floor of the partial take-profit's gain (otherwise: no partial, run to the full TP)
+    max_net_exposure_pct: float = 150.0    # reversal protection (tb.reversal): |sum(side x notional x beta)| <= this % of equity (0 = off)
+    reversal_z: float = 2.5                # basket z-score against the book's net side that locks winners + blocks that side (0 = off)
+    reversal_lock_r: float = 0.5
+    reversal_block_bars: int = 6
     fee_taker: float = 0.0005
     slippage: float = 0.0002
     stop_slippage_extra: float = 0.0005   # same as labels' stop_slippage_pct

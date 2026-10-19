@@ -58,13 +58,12 @@ class Venue:
         self.pos: dict[str, PositionInfo] = {}
         self.orders: list[ConditionalOrder] = []
         self.calls: list[tuple] = []
-        self.reduce_reject: set[str] = set()      # reduce-only market orders rejected with -2022
-        self.plain_reject: set[str] = set()       # plain market orders rejected
-        self.stops_block_reduce = False           # reduce-only close rejected while a reduce-only stop covers the position
+        self.close_reject: set[str] = set()       # market orders rejected (a jammed venue)
         self.no_stop: set[str] = set()            # place_stop -> -2021 (price already through the level)
         self.fail_positions = False
         self.equity = 100.0
-        self.on_reduce_reject = None              # hook called once when a reduce-only close is rejected
+        self.on_market = None                     # hook called once at the start of the next market order (a race)
+        self.delay = 0.0
 
     def filters(self, s):
         return SymbolFilters(0.01, 0.001, 0.001, 5)
@@ -80,11 +79,11 @@ class Venue:
     def balance(self):
         return Balance(self.equity, self.equity, 0.0)
 
-    def place_stop(self, sym, side, price, qty):
+    def place_stop(self, sym, side, price, qty=None):
         self.calls.append(("stop", sym, side, price, qty))
         if sym in self.no_stop:
             raise ExchangeError("Order would immediately trigger.", code=-2021)
-        o = ConditionalOrder(f"a:{len(self.calls)}", sym, "SL", side, price, qty, True)
+        o = ConditionalOrder(f"a:{len(self.calls)}", sym, "SL", side, price, 0.0, True)       # closePosition: no quantity
         self.orders.append(o)
         return o.order_id
 
@@ -96,23 +95,33 @@ class Venue:
         self.calls.append(("cancel_all", sym))
         self.orders = [o for o in self.orders if o.symbol != sym]
 
-    def market_order(self, sym, side, qty, reduce_only=False):
-        self.calls.append(("market", sym, side, qty, reduce_only))
-        covered = any(o.symbol == sym and o.reduce_only and o.qty >= qty * 0.999 for o in self.orders)
-        if reduce_only and (sym in self.reduce_reject or (self.stops_block_reduce and covered)):
-            hook, self.on_reduce_reject = self.on_reduce_reject, None
-            if hook:
-                hook()
-            raise ExchangeError("HTTP 400 on POST /fapi/v1/order: code=-2022 ReduceOnly Order is rejected.", code=-2022)
-        if not reduce_only and sym in self.plain_reject:
-            raise ExchangeError("not filled", code=-9)
-        self.pos.pop(sym, None)
+    def market_order(self, sym, side, qty):
+        """A NORMAL market order in one-way mode: against a position it reduces / closes (or flips past it), otherwise opens."""
+        self.calls.append(("market", sym, side, qty))
+        hook, self.on_market = self.on_market, None
+        if hook:
+            hook()
+        if self.delay:
+            time.sleep(self.delay)
+        if sym in self.close_reject:
+            raise ExchangeError("HTTP 400 on POST /fapi/v1/order: code=-1000 jammed", code=-1000)
+        cur = self.pos.get(sym)
+        if cur is not None and ((cur.side == "long") == (side == "SELL")):
+            left = round(cur.qty - qty, 9)
+            if left > 0:
+                self.pos[sym] = dataclasses.replace(cur, qty=left)
+            else:
+                self.pos.pop(sym)
+                if left < 0:                                       # past the position: the rest opens the other way
+                    self.pos[sym] = dataclasses.replace(cur, side="short" if side == "SELL" else "long", qty=-left)
+        else:
+            self.pos[sym] = PositionInfo(sym, "long" if side == "BUY" else "short", qty + (cur.qty if cur else 0), 100.0, 100.0,
+                                         0.0, 8, 88.0 if side == "BUY" else 112.0, 20.0)
         return OrderResult("o:1", sym, side, qty, 1.0, "FILLED")
 
     # helpers
-    def n(self, kind, sym=None, reduce_only=None):
-        return [c for c in self.calls if c[0] == kind and (sym is None or c[1] == sym)
-                and (reduce_only is None or c[-1] is reduce_only)]
+    def n(self, kind, sym=None):
+        return [c for c in self.calls if c[0] == kind and (sym is None or c[1] == sym)]
 
 
 def long_(sym, qty=1.6, mark=100.0, liq=88.0, margin=20.0, entry=100.0):
@@ -123,8 +132,8 @@ def short_(sym, qty=1.6, mark=100.0, liq=112.0, margin=20.0, entry=100.0):
     return PositionInfo(sym, "short", qty, entry, mark, 0.0, 8, liq, margin)
 
 
-def sl_order(sym, side="SELL", price=93.75, qty=1.6, oid="a:9"):
-    return ConditionalOrder(oid, sym, "SL", side, price, qty, True)
+def sl_order(sym, side="SELL", price=93.75, qty=0.0, oid="a:9"):
+    return ConditionalOrder(oid, sym, "SL", side, price, qty, True)          # closePosition: no quantity
 
 
 def db_row(store, sym, side="long", sl=93.75, qty=1.6):
@@ -171,69 +180,71 @@ def test_liquidation_reason_long_short_margin_and_cross():
 
 
 # ------------------------------------------------------------------ emergency_close (the order of operations)
-def test_emergency_close_cancels_reduce_only_stops_first_then_closes_reduce_only():
+def test_emergency_close_cancels_tp_sl_first_then_closes_with_a_normal_market_order():
     ex = Venue()
     ex.pos["A"] = long_("A")
-    ex.orders = [sl_order("A", oid="a:9"), ConditionalOrder("o:5", "A", "TP", "SELL", 110, 1.6, True),
-                 ConditionalOrder("a:7", "B", "SL", "SELL", 90, 1.0, True)]
-    ex.stops_block_reduce = True                                # the covering stops would make the venue reject the close
+    ex.orders = [sl_order("A", oid="a:9"), ConditionalOrder("o:5", "A", "TP", "SELL", 110, 0.0, True),
+                 ConditionalOrder("a:7", "B", "SL", "SELL", 90, 0.0, True)]
     out = EM.emergency_close(ex, "A")
-    assert out.ok and out.flat and out.method == "reduce_only"
+    assert out.ok and out.flat and out.method == "market" and not out.flipped
     kinds = [c[0] for c in ex.calls]
     assert kinds.index("cancel") < kinds.index("market")        # cancelled BEFORE the close
     assert ("cancel", "A", "a:9") in ex.calls and ("cancel", "A", "o:5") in ex.calls   # algo + legacy ids
     assert not [c for c in ex.calls if c[:2] == ("cancel", "B")]                        # only THIS symbol's orders
-    assert ex.n("market", "A") == [("market", "A", "SELL", 1.6, True)]
+    assert ex.n("market", "A") == [("market", "A", "SELL", 1.6)]                        # the exchange-reported quantity, once
 
 
-def test_emergency_close_without_cancel_first_cancels_and_retries_on_minus_2022():
+def test_close_without_cancel_first_closes_then_clears_the_leftover_orders():
     ex = Venue()
     ex.pos["A"] = long_("A")
     ex.orders = [sl_order("A")]
-    ex.stops_block_reduce = True
-    out = EM.emergency_close(ex, "A", cancel_first=False)
-    assert out.ok and out.method == "cancel_retry"
-    assert [c[0] for c in ex.calls[:3]] == ["market", "cancel", "market"]
+    out = EM.close_flat(ex, "A", cancel_first=False)
+    assert out.ok and out.method == "market"
+    assert [c[0] for c in ex.calls if c[0] in ("market", "cancel_all", "cancel")] == ["market", "cancel_all"]
+    assert ex.orders == []
 
 
-def test_minus_2022_with_position_still_open_falls_back_to_one_plain_market_of_the_exchange_qty():
-    ex = Venue()
-    ex.pos["A"] = long_("A", qty=1.6)
-    ex.reduce_reject.add("A")                                   # cancelling does not help: the venue is jammed
-
-    def shrink():                                               # a partial fill happened meanwhile: re-read, never the old qty
-        ex.pos["A"] = long_("A", qty=1.0)
-    ex.on_reduce_reject = shrink
-    out = EM.emergency_close(ex, "A")
-    assert out.ok and out.method == "plain_market"
-    plain = ex.n("market", "A", reduce_only=False)
-    assert plain == [("market", "A", "SELL", 1.0, False)]       # exactly the exchange-reported quantity, one order
-
-
-def test_plain_market_fallback_is_attempted_once_then_gives_up():
+def test_a_rejected_close_is_one_attempt_the_caller_backs_off():
     ex = Venue()
     ex.pos["A"] = long_("A")
-    ex.reduce_reject.add("A")
-    ex.plain_reject.add("A")
+    ex.close_reject.add("A")
     out = EM.emergency_close(ex, "A")
-    assert not out.ok and not out.liquidation and "plain market close failed" in out.detail
-    assert len(ex.n("market", "A", reduce_only=False)) == 1
-    assert "A" in ex.pos                                        # still open: the caller backs off
+    assert not out.ok and not out.liquidation and "close rejected" in out.detail
+    assert len(ex.n("market", "A")) == 1                        # no fallback order of any kind
+    assert "A" in ex.pos
 
 
-def test_no_plain_market_when_the_position_went_into_liquidation_or_vanished_meanwhile():
+def test_reverse_position_from_a_racing_stop_is_flattened_and_reported():
     ex = Venue()
     ex.pos["A"] = long_("A")
-    ex.reduce_reject.add("A")
-    ex.on_reduce_reject = lambda: ex.pos.__setitem__("A", long_("A", mark=85.0, liq=88.0))
+    ex.on_market = lambda: ex.pos.pop("A")                      # the stop filled between our read and our (normal) order
     out = EM.emergency_close(ex, "A")
-    assert out.liquidation and not out.ok and not ex.n("market", "A", reduce_only=False)
-    ex2 = Venue()
-    ex2.pos["A"] = long_("A")
-    ex2.reduce_reject.add("A")
-    ex2.on_reduce_reject = lambda: ex2.pos.pop("A")
-    out2 = EM.emergency_close(ex2, "A")
-    assert out2.ok and out2.flat and not ex2.n("market", "A", reduce_only=False)
+    assert out.ok and out.flipped and out.method == "market+flip_undone"
+    assert ex.n("market", "A") == [("market", "A", "SELL", 1.6), ("market", "A", "BUY", 1.6)]   # opened a short, then flattened
+    assert "A" not in ex.pos
+
+
+def test_two_close_paths_of_one_symbol_cannot_race():
+    import threading
+
+    ex = Venue()
+    ex.pos["A"] = long_("A")
+    ex.delay = 0.15
+    outs = []
+    ts = [threading.Thread(target=lambda: outs.append(EM.close_flat(ex, "A"))) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert len(ex.n("market", "A")) == 1                        # the second one waited, re-read, found it flat
+    assert sorted(o.flat for o in outs) == [True, True] and all(o.ok for o in outs) and "A" not in ex.pos
+
+
+def test_position_that_goes_into_liquidation_before_the_close_gets_no_order():
+    ex = Venue()
+    ex.pos["A"] = long_("A", mark=85.0, liq=88.0)
+    out = EM.emergency_close(ex, "A")
+    assert out.liquidation and not out.ok and not ex.n("market", "A")
 
 
 def test_emergency_close_sends_nothing_for_a_liquidating_or_flat_symbol():
@@ -248,8 +259,8 @@ def test_emergency_close_unfilled_order_is_not_a_close():
     ex = Venue()
     ex.pos["A"] = long_("A")
     orig = ex.market_order
-    ex.market_order = lambda sym, side, qty, reduce_only=False: (ex.calls.append(("market", sym, side, qty, reduce_only)),
-                                                                 OrderResult("o:1", sym, side, qty, 0.0, "NEW"))[1]
+    ex.market_order = lambda sym, side, qty: (ex.calls.append(("market", sym, side, qty)),
+                                              OrderResult("o:1", sym, side, qty, 0.0, "NEW"))[1]
     out = EM.emergency_close(ex, "A")
     assert not out.ok and "still open" in out.detail           # accepted but never filled -> the position is still there
 
@@ -264,8 +275,7 @@ def test_one_jammed_coin_degrades_but_never_flattens_the_account_and_backs_off(s
         db_row(store, s)
     ex.orders = [sl_order("AAAUSDT")]                           # AAA is healthy, BBB's trailed stop triggered and vanished
     ex.pos["BBBUSDT"] = long_("BBBUSDT", mark=92.0)             # mark already through the stop level (93.75)
-    ex.reduce_reject.add("BBBUSDT")
-    ex.plain_reject.add("BBBUSDT")
+    ex.close_reject.add("BBBUSDT")
     g = G.Guard(store, "binance_demo", ex, alerts, clock=clk)
     states, t0 = [], clk.t
     for _ in range(121):                                        # 10 minutes of 5 s guard cycles
@@ -273,14 +283,14 @@ def test_one_jammed_coin_degrades_but_never_flattens_the_account_and_backs_off(s
     assert FLATTEN not in states and HALTED not in states
     assert states[-1] == DEGRADED                               # entries blocked while the problem persists ...
     assert not [c for c in ex.calls if c[1] == "AAAUSDT"]       # ... and the healthy coin was never touched
-    attempts = len(ex.n("market", "BBBUSDT", reduce_only=True))
+    attempts = len(ex.n("market", "BBBUSDT"))
     assert 6 <= attempts <= 8, attempts                         # 5 s, 10 s, 20 s ... 5 min: ~7 tries in 10 min, not 120
     assert alerts.sym == [("BBBUSDT", "emergency close")]       # ONE alert per symbol per incident
     msgs = [r["msg"] for r in store.query("SELECT msg FROM logs WHERE msg LIKE '%emergency close on BBBUSDT%'")]
     assert len(msgs) == attempts and any("next try in 300s" in m for m in msgs)    # one log line per backoff step
     assert "stop missing on BBBUSDT" in " ".join(store.kv_get("safety_guard")["reasons"])
     # the venue recovers: the next due attempt closes it, state returns to NORMAL (hysteresis)
-    ex.reduce_reject.clear()
+    ex.close_reject.clear()
     for _ in range(80):
         r = cycle(g, store, clk)
         if "BBBUSDT" not in ex.pos:
@@ -369,8 +379,7 @@ def test_account_flatten_closes_what_it_can_skips_liquidation_and_halts_once_fla
         db_row(store, s)
     ex.orders = [sl_order(s) for s in ("AAAUSDT", "BBBUSDT")]
     ex.pos["LIQUSDT"] = long_("LIQUSDT", mark=80.0, liq=88.0)
-    ex.reduce_reject.add("BBBUSDT")
-    ex.plain_reject.add("BBBUSDT")
+    ex.close_reject.add("BBBUSDT")
     store.kv_set("peak_equity", 100.0)
     store.kv_set("capital_floor_trade_id", 0)
     alerts = Rec()
@@ -381,9 +390,9 @@ def test_account_flatten_closes_what_it_can_skips_liquidation_and_halts_once_fla
     assert set(states) == {FLATTEN}                                             # BBB is still open: stays FLATTEN, no HALTED yet
     assert "AAAUSDT" not in ex.pos and "BBBUSDT" in ex.pos                      # AAA closed despite BBB failing
     assert not ex.n("market", "LIQUSDT") and not ex.n("cancel", "LIQUSDT")      # liquidating coin untouched
-    assert len(ex.n("market", "BBBUSDT", reduce_only=True)) <= 5                # backed off: 0,5,15,35,75 s in 100 s
+    assert len(ex.n("market", "BBBUSDT")) <= 5                # backed off: 0,5,15,35,75 s in 100 s
     assert alerts.sym == [("BBBUSDT", "flatten")]
-    ex.reduce_reject.clear()
+    ex.close_reject.clear()
     for _ in range(40):
         r = cycle(g, store, clk)
         if r["state"] == HALTED:
@@ -455,10 +464,10 @@ def test_engine_close_loop_on_a_jammed_venue_backs_off(store, tmp_path):
     eng.clock = lambda: t[0]
     jam = {"n": 0}
 
-    def jammed(symbol, side, qty, reduce_only=False):
+    def jammed(symbol, side, qty):
         jam["n"] += 1
-        venue.log.append(("market", symbol, side, qty, reduce_only, 0))
-        raise ExchangeError("HTTP 400 code=-2022 ReduceOnly Order is rejected.", code=-2022)
+        venue.log.append(("market", symbol, side, qty, False, 0))
+        raise ExchangeError("HTTP 400 code=-1000 the venue is jammed", code=-1000)
     venue.market_order = jammed
     venue.orders.clear()                                                        # the trailed stop triggered but did not fill
     venue.marks["AAAUSDT"] = p["sl_price"] * 0.98                               # beyond the stop by > 0.3%
@@ -497,10 +506,10 @@ def test_engine_unprotected_fill_that_cannot_be_closed_does_not_trip_the_kill_sw
                                venue_marks={"AAAUSDT": 100.0, "BTCUSDT": 100.0})
     real = venue.market_order
 
-    def jammed(symbol, side, qty, reduce_only=False):
-        if reduce_only:
-            raise ExchangeError("HTTP 400 code=-2022 ReduceOnly Order is rejected.", code=-2022)
-        return real(symbol, side, qty, reduce_only)
+    def jammed(symbol, side, qty):
+        if side == "SELL":                                                      # entries (BUY) work, closes are jammed
+            raise ExchangeError("HTTP 400 code=-1000 the venue is jammed", code=-1000)
+        return real(symbol, side, qty)
     venue.market_order = jammed
     venue.next_mark = 90.0                                                      # stop can not be placed -> flatten the fill
     open_(eng, "AAAUSDT")
@@ -566,7 +575,7 @@ def test_binance_market_order_accepted_but_not_filled_is_an_error_and_is_cancell
                Resp(200, {"orderId": 5, "status": "NEW", "executedQty": "0"}),            # re-read: still unfilled
                Resp(200, {"orderId": 5, "status": "CANCELED"}))                           # our cancel
     with pytest.raises(OrderNotFilled):
-        ex.market_order("ETHUSDT", "SELL", 0.067, reduce_only=True)
+        ex.market_order("ETHUSDT", "SELL", 0.067)
     assert [c["method"] for c in s.calls] == ["POST", "GET", "DELETE"]
 
 

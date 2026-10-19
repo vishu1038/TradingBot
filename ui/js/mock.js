@@ -69,10 +69,16 @@ export const DEFAULT_SETTINGS = () => ({
   max_side_risk_pct: 60, // one side's open stop-out risk as % of the open-risk budget
   partial_tp_r: 1.5, // partial take-profit level in R (0 = off)
   partial_tp_frac: 0.5, // share of the quantity closed there
+  min_tp_usd: 2, // dollar floor: skip a trade whose TP spans fewer USD (0 = off)
+  min_sl_usd: 2, // ... or whose SL does
+  max_net_exposure_pct: 150, // |sum(side x notional x beta vs BTC)| as % of equity (0 = off)
+  reversal_z: 2.5, // basket move against the net side (z) that locks winners + blocks that side (0 = off)
+  reversal_lock_r: 0.5, // winners in profit >= this many R get their stop tightened
+  reversal_block_bars: 6, // no new entries on the hurt side for this many 5m bars
   trail: { enabled: true, activate_r: 1.5, distance_atr: 1.0 },
-  short_enabled: false,
+  short_enabled: true,
   prob_threshold_long: 0.7,
-  prob_threshold_short: 0.8,
+  prob_threshold_short: 0.7,
   corr_cap: { max_corr: 0.8, max_correlated: 2 },
   universe_size: 8,
   universe_refresh_s: 3600,
@@ -99,6 +105,12 @@ const SETTINGS_RULES = [
   ['max_side_risk_pct', 1, 100],
   ['partial_tp_r', 0, 20],
   ['partial_tp_frac', 0.05, 0.95],
+  ['min_tp_usd', 0, 10000],
+  ['min_sl_usd', 0, 10000],
+  ['max_net_exposure_pct', 0, 10000],
+  ['reversal_z', 0, 10],
+  ['reversal_lock_r', 0, 20],
+  ['reversal_block_bars', 0, 1000, true],
   ['trail.activate_r', 0.1, 10],
   ['trail.distance_atr', 0.1, 10],
   ['prob_threshold_long', 0.5, 0.99],

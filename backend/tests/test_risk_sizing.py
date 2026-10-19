@@ -335,9 +335,12 @@ def test_positions_without_stop():
     assert positions_without_stop(pos, orders) == ["B"]
     orders.append(ConditionalOrder("3", "B", "SL", "SELL", 110, 2.0, True))  # wrong side
     assert positions_without_stop(pos, orders) == ["B"]
-    orders.append(ConditionalOrder("4", "B", "SL", "BUY", 110, 1.0, True))   # too small
+    orders.append(ConditionalOrder("4", "B", "SL", "BUY", 110, 1.0, False))  # an old-style stop with a quantity that is too small
     assert positions_without_stop(pos, orders) == ["B"]
-    orders.append(ConditionalOrder("5", "B", "SL", "BUY", 110, 2.0, True))
+    orders.append(ConditionalOrder("5", "B", "SL", "BUY", 110, 2.0, False))  # an old-style stop that covers the quantity
+    assert positions_without_stop(pos, orders) == []
+    orders.pop()
+    orders.append(ConditionalOrder("6", "B", "SL", "BUY", 110, 0.0, True))   # closePosition: no quantity, covers whatever is open
     assert positions_without_stop(pos, orders) == []
 
 

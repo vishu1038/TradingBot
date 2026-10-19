@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS depth_5m (
     symbol TEXT NOT NULL, open_time INTEGER NOT NULL, t REAL NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (symbol, open_time)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS mirror_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, t REAL NOT NULL, symbol TEXT, action TEXT NOT NULL,
+    paper_position_id INTEGER, venue_order_id TEXT, ok INTEGER NOT NULL, error_code TEXT, error_msg TEXT,
+    latency_ms INTEGER, cls TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_mirror_t ON mirror_events(t);
 CREATE TABLE IF NOT EXISTS candles (
     symbol TEXT NOT NULL, tf TEXT NOT NULL, t INTEGER NOT NULL,
     o REAL, h REAL, l REAL, c REAL, v REAL,

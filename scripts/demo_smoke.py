@@ -11,7 +11,7 @@ Target: BINANCE_ENV=testnet -> https://testnet.binancefuture.com, otherwise http
 Steps (each prints OK/FAIL and the key facts of the response):
   1 server time/clock skew   2 account balance   3 position mode (must be ONE-WAY)   4 symbol filters/mark
   --- everything below is skipped with --dry-run ---
-  5 isolated margin + 8x     6 smallest valid MARKET entry   7 reduce-only SL (algo endpoint on -4120) and TP
+  5 isolated margin + 8x     6 smallest valid MARKET entry   7 closePosition SL (algo endpoint on -4120) and TP
   8 list open orders + algo orders   9 cancel them   10 close the position   11 final state check
 If anything fails after the entry, the script still cancels the orders and closes the position.
 Exit code 0 = all steps passed.
@@ -126,20 +126,20 @@ def run(ex: BinanceExchange, symbol: str, leverage: int, dry_run: bool, rep: Rep
         if not (sl_px < mark_now < tp_px):
             rep.fail("levels", f"mark {mark_now:g} is outside SL {sl_px:g} / TP {tp_px:g}; the market moved >5%?")
         else:
-            sl_id = ex.place_stop(symbol, opposite("BUY"), sl_px, res.qty)
-            rep.ok("stop-loss", f"reduce-only STOP_MARKET SELL @ {sl_px:g}, id {sl_id} "
+            sl_id = ex.place_stop(symbol, opposite("BUY"), sl_px)
+            rep.ok("stop-loss", f"closePosition STOP_MARKET SELL @ {sl_px:g}, id {sl_id} "
                                 f"({'algo endpoint' if sl_id.startswith('a:') else 'regular order endpoint'})")
-            tp_id = ex.place_take_profit(symbol, opposite("BUY"), tp_px, res.qty)
-            rep.ok("take-profit", f"reduce-only TAKE_PROFIT_MARKET SELL @ {tp_px:g}, id {tp_id}")
+            tp_id = ex.place_take_profit(symbol, opposite("BUY"), tp_px)
+            rep.ok("take-profit", f"closePosition TAKE_PROFIT_MARKET SELL @ {tp_px:g}, id {tp_id}")
         # 8 ---------------------------------------------------------------------------- list
         orders = ex.open_conditional_orders(symbol)
         for o in orders:
-            rep.info(f"open: {o.order_id} {o.kind} {o.side} trigger {o.trigger_price:g} qty {o.qty:g} reduceOnly={o.reduce_only}")
+            rep.info(f"open: {o.order_id} {o.kind} {o.side} trigger {o.trigger_price:g} closePosition={o.close_position}")
         kinds = sorted(o.kind for o in orders)
         (rep.ok if kinds == ["SL", "TP"] else rep.fail)("list orders", f"found {kinds} (expected ['SL', 'TP'])")
-        stops_ok = all(o.reduce_only for o in orders)
-        (rep.ok if stops_ok else rep.fail)("reduce-only flag", "all conditional orders are reduce-only" if stops_ok
-                                           else "a conditional order is not reduce-only")
+        stops_ok = all(o.close_position for o in orders)
+        (rep.ok if stops_ok else rep.fail)("closePosition flag", "all conditional orders are closePosition" if stops_ok
+                                           else "a conditional order is not closePosition")
     except ExchangeError as e:
         rep.fail("order flow", f"{e} (code {e.code}, http {e.status})")
     finally:
@@ -156,8 +156,8 @@ def run(ex: BinanceExchange, symbol: str, leverage: int, dry_run: bool, rep: Rep
             pos = [p for p in ex.positions() if p.symbol == symbol]
             if pos or entered:
                 for p in pos:
-                    r = ex.market_order(symbol, opposite("BUY"), p.qty, reduce_only=True)
-                    rep.ok("close position", f"SELL {r.qty:g} reduce-only @ {r.avg_price:g}")
+                    r = ex.market_order(symbol, opposite("BUY"), p.qty)
+                    rep.ok("close position", f"SELL {r.qty:g} (normal market order) @ {r.avg_price:g}")
         except ExchangeError as e:
             rep.fail("close position", f"{e} - CLOSE {symbol} MANUALLY on the exchange")
         # 11 ---------------------------------------------------------------------------- final state

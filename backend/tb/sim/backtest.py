@@ -19,8 +19,12 @@ import numpy as np
 import pandas as pd
 
 from . import safety, signals as sig
-from ..protect import Protect, breakeven_price, is_loss_exit, next_stop, partial_level, partial_split, stop_loss_usd, tighter
+from ..protect import (Protect, breakeven_price, is_loss_exit, next_stop, partial_gain_ok, partial_level, partial_split,
+                       stop_loss_usd, tighter)
 from ..exchange.base import SymbolFilters
+from ..reversal import (HOUR_MS, MIN_COVER, Z_WINDOWS, ReversalBook, ReversalCfg, RevSignal, lock_stop, net_side, rolling_beta,
+                        rolling_z)
+from ..risk import dollar_floor_usd, net_exposure_check
 from .template import SimConfig, atr_wilder, liq_price, size_and_levels
 
 BAR_MS = 300_000
@@ -94,7 +98,8 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
     stats = {k: 0 for k in (
         "signals", "entries", "skip_kill", "skip_has_position", "skip_fault", "skip_no_slot",
         "skip_no_margin", "skip_corr", "skip_no_atr", "skip_min_notional", "skip_drift_block",
-        "skip_sl_cooldown", "skip_side_risk", "partials", "breakeven_moves",
+        "skip_sl_cooldown", "skip_side_risk", "skip_dollar_floor", "skip_net_exposure", "skip_reversal_block",
+        "reversal_triggers", "reversal_locks", "partials", "partials_floor_skipped", "breakeven_moves",
         "derated_trades", "drift_half_trades", "shadow_trades", "shadow_wins", "kill_closes",
         "faults_bars", "fault_episodes", "fault_excluded_bars", "drift_fired_half",
         "drift_fired_block")}
@@ -137,6 +142,50 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
             r[np.diff(t) != BAR_MS] = np.nan
             rets[k, gi[k][1:]] = r
 
+    # ---- reversal protection inputs (tb.reversal): hourly betas vs BTC (or the equal-weight basket when BTC is not simulated)
+    # and the 15 min / 1 h z-scores of the equal-weight basket + BTC, on the global 5m grid
+    rc = ReversalCfg.from_sim(cfg)
+    use_net = rc.max_net_exposure_pct > 0
+    beta_h: np.ndarray | None = None
+    hidx = np.zeros(0, dtype=np.int64)
+    zser: dict[str, np.ndarray] = {}
+    if use_net or rc.detector_on:
+        btc_k = syms.index("BTCUSDT") if "BTCUSDT" in syms else None
+        if use_net:
+            hidx = np.nonzero(ts % HOUR_MS == HOUR_MS - BAR_MS)[0]
+            Cg = np.full((S, nT), np.nan)
+            for k in range(S):
+                Cg[k, gi[k]] = C[k]
+            ch = Cg[:, hidx]
+            rh = np.full_like(ch, np.nan)
+            if len(hidx) > 1:
+                rh[:, 1:] = ch[:, 1:] / ch[:, :-1] - 1.0
+                rh[:, 1:][:, np.diff(hidx) != 12] = np.nan
+            if len(hidx):
+                if btc_k is not None:
+                    ref = rh[btc_k]
+                else:
+                    cnt_h = np.isfinite(rh).sum(axis=0)
+                    ref = np.where(cnt_h > 0, np.nansum(rh, axis=0) / np.maximum(cnt_h, 1), np.nan)
+                beta_h = np.stack([rolling_beta(rh[k], ref) for k in range(S)])
+        if rc.detector_on:
+            cover = rets[:, :]
+            cnt = np.isfinite(cover).sum(axis=0)
+            need = max(1, math.ceil(MIN_COVER * S))
+            bsk = np.where(cnt >= need, np.nansum(cover, axis=0) / np.maximum(cnt, 1), 0.0)
+            for nm, w in Z_WINDOWS.items():
+                zser[f"basket_{nm}"] = rolling_z(bsk, w)
+                if btc_k is not None:
+                    zser[f"btc_{nm}"] = rolling_z(rets[btc_k], w)
+
+    def beta_at(k: int, step: int) -> float:
+        if beta_h is None or not len(hidx):
+            return 1.0
+        j = int(np.searchsorted(hidx, step - 1, side="right")) - 1
+        return float(beta_h[k, j]) if j >= 0 else 1.0
+
+    rbook = ReversalBook()
+
     # ---- funding events mapped to global step index: {sidx: {gi: rate}}
     fund_at: list[dict[int, float]] = [dict() for _ in range(S)]
     if cfg.apply_funding and funding:
@@ -158,9 +207,10 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
         long_ok = pl >= cfg.thr_long
         short_ok = (ps >= cfg.thr_short) if cfg.short_enabled else np.zeros(len(pl), bool)
         both = long_ok & short_ok
-        side = np.where(both, np.where(pl - cfg.thr_long >= ps - cfg.thr_short, 1, -1),
+        tie = both & (pl - cfg.thr_long == ps - cfg.thr_short)        # exactly equal edge on both sides: no side is favoured -> no trade
+        side = np.where(both, np.where(pl - cfg.thr_long > ps - cfg.thr_short, 1, -1),
                         np.where(long_ok, 1, -1))
-        rows = np.nonzero(long_ok | short_ok)[0]
+        rows = np.nonzero((long_ok | short_ok) & ~tie)[0]
         rows = rows[rows + 1 < len(T[k])]
         rows = rows[T[k][rows + 1] - T[k][rows] == BAR_MS]
         if len(rows) == 0:
@@ -261,6 +311,24 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                         pay = p.side * rate * p.qty * O[p.sidx][r]
                         p.funding += pay
                         wallet -= pay
+        # 1b. reversal protection: basket z-score (information up to the previous bar's close) against the book's net side ->
+        # tighten the winners of that side (effective from this bar on) and block new entries on it for reversal_block_bars
+        if rc.detector_on and ti > 0 and open_pos:
+            real_o = [p for p in open_pos if not p.shadow]
+            if real_o:
+                eq_o = wallet + sum(unreal(p) for p in real_o)
+                nside = net_side(sum(p.side * p.qty * p.entry_price * beta_at(p.sidx, ti) for p in real_o), eq_o)
+                rsig = RevSignal(int(ts[ti - 1]), {k: float(v[ti - 1]) for k, v in zser.items()})
+                tr = rbook.step(rsig, nside, rc)
+                if tr is not None and tr["new"]:
+                    stats["reversal_triggers"] += 1
+                for p in real_o:
+                    sd = "long" if p.side > 0 else "short"
+                    if rbook.locking(sd, T0):
+                        lk = lock_stop(sd, p.entry_price, p.sl0, p.sl, p.last, fee, rc.lock_r)
+                        if lk is not None:
+                            p.sl = lk
+                            stats["reversal_locks"] += 1
         # 2. entries
         while ep < n_ev and ev_gi[ep] == ti:
             k = int(ev_s[ep]); r = int(ev_row[ep]); side = int(ev_side[ep]); prob = float(ev_prob[ep])
@@ -277,6 +345,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
             if ti < cooldown_until.get(k, 0):
                 stats["skip_sl_cooldown"] += 1
                 continue
+            if rc.detector_on and rbook.blocked("long" if side > 0 else "short", T0):
+                stats["skip_reversal_block"] += 1
+                continue
             o = O[k][r]
             real = [p for p in open_pos if not p.shadow]
             atr_sig = ATR[k][r - 1]
@@ -285,7 +356,8 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                 # no real entries; run the trade as a shadow so the monitor can recover
                 lv = size_and_levels(o, fill, side, atr_sig, cfg, 1.0)
                 stats["skip_drift_block"] += 1
-                if lv is not None:
+                if lv is not None and dollar_floor_usd(cfg.min_tp_usd, cfg.min_sl_usd, lv[0] * abs(fill - lv[2]),
+                                                       lv[0] * abs(lv[1] - fill)) is None:
                     qty, tp, sl = lv
                     open_pos.append(Position(0, syms[k], k, side, ti, T0, fill, qty, qty * fill, 0.0, tp, sl,
                                              sl, liq_price(fill, side, cfg.leverage, cfg.mmr),
@@ -313,6 +385,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
             if notional < cfg.min_notional_usd:
                 stats["skip_min_notional"] += 1
                 continue
+            if dollar_floor_usd(cfg.min_tp_usd, cfg.min_sl_usd, qty * abs(fill - sl), qty * abs(tp - fill)) is not None:
+                stats["skip_dollar_floor"] += 1                  # dollar floor: skipped, never shrunk below it
+                continue
             margin = notional / cfg.leverage
             efee = fee * notional
             free = wallet - sum(p.margin for p in real)
@@ -339,6 +414,12 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                            for q in same)
                 if used + stop_loss_usd("long" if side > 0 else "short", qty, fill, sl, *c, entry_fee=True) > cap + 1e-9:
                     stats["skip_side_risk"] += 1
+                    continue
+            if use_net:
+                net_b = sum(q.side * q.qty * q.entry_price * beta_at(q.sidx, ti) for q in real)
+                ok_n, _ = net_exposure_check(net_b, side * notional * beta_at(k, ti), rc.max_net_exposure_pct / 100.0 * equity_now)
+                if not ok_n:
+                    stats["skip_net_exposure"] += 1
                     continue
             wallet -= efee
             if scale_eff < 1.0:
@@ -385,6 +466,9 @@ def run_backtest(klines: dict[str, pd.DataFrame], signals, cfg: SimConfig | None
                         p.part_done = True
                         fillp = (max(lvl, o) if d > 0 else min(lvl, o)) * (1.0 - d * slip)
                         split = partial_split(p.qty, fillp, prot.partial_tp_frac, lot)
+                        if split is not None and not partial_gain_ok("long" if d > 0 else "short", p.entry_price, lvl, split[0], prot):
+                            stats["partials_floor_skipped"] += 1        # dollar floor: the piece gains too little -> run to the full TP
+                            split = None
                         if split is not None:
                             q, rem_q = split
                             frac = q / p.qty

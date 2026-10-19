@@ -131,6 +131,25 @@ def choose_leverage(side: str, entry: float, sl: float, notional: float, max_lev
     return None
 
 
+FLOOR_REASON = "target below $ floor"
+
+
+def dollar_floor(cfg: Settings, risk_usd: float, reward_usd: float | None) -> str | None:
+    """None when the trade clears the dollar floor, else a human reason. ``risk_usd`` / ``reward_usd`` are the USD moves to the
+    stop-loss / take-profit for the ACTUAL quantity (after derating, caps and tick rounding); ``reward_usd`` None = the position has
+    no take-profit (stop only), so only the stop is checked. A trade is skipped, never shrunk below the floor (user 2026-10-19)."""
+    return dollar_floor_usd(cfg.min_tp_usd, cfg.min_sl_usd, risk_usd, reward_usd)
+
+
+def dollar_floor_usd(min_tp_usd: float, min_sl_usd: float, risk_usd: float, reward_usd: float | None) -> str | None:
+    """``dollar_floor`` with the two floors spelled out (the backtester has no ``Settings``)."""
+    if min_sl_usd > 0 and risk_usd < min_sl_usd * (1.0 - 1e-6):
+        return f"{FLOOR_REASON}: SL ${risk_usd:.2f} < ${min_sl_usd:g}"
+    if reward_usd is not None and min_tp_usd > 0 and reward_usd < min_tp_usd * (1.0 - 1e-6):
+        return f"{FLOOR_REASON}: TP ${reward_usd:.2f} < ${min_tp_usd:g}"
+    return None
+
+
 @dataclass
 class Sizing:
     ok: bool
@@ -150,12 +169,14 @@ class Sizing:
 
 
 def size_trade(cfg: Settings, side: str, entry: float, atr: float | None, f: SymbolFilters,
-               available: float | None = None, risk_mult: float = 1.0, brackets=None) -> Sizing:
+               available: float | None = None, risk_mult: float = 1.0, brackets=None, tp_floor: bool = True) -> Sizing:
     """Qty + SL/TP prices for the trade template. ``side`` is 'long' | 'short'.
 
     ``risk_mult`` (drawdown derating / drift / first-live-trades) scales the position: the USD risk
     becomes sl_usd * risk_mult while the stop distance in price terms is unchanged. A result below
-    the exchange min notional is rejected ("skip the trade")."""
+    the exchange min notional is rejected ("skip the trade"). Dollar floor: after ALL sizing (derating, caps, lot rounding) the
+    USD move to the stop / take-profit must be >= ``min_sl_usd`` / ``min_tp_usd``, else the trade is skipped, never shrunk below
+    it (``tp_floor=False`` for a stop-only position, e.g. a cross-sectional leg: only the stop is checked)."""
     if risk_mult <= 0:
         return Sizing(False, "risk multiplier is 0 (derated to zero)")
     if side not in ("long", "short"):
@@ -205,6 +226,9 @@ def size_trade(cfg: Settings, side: str, entry: float, atr: float | None, f: Sym
     liq = liq_price(side, entry, lev, t.mmr if t else cfg.maint_margin_rate, (t.cum / notional) if t else 0.0)
     if available is not None and margin * 1.01 > available:
         return Sizing(False, f"insufficient available margin ({available:.2f} < {margin:.2f})")
+    why = dollar_floor(cfg, qty * abs(entry - sl), qty * abs(tp - entry) if tp_floor else None)
+    if why:
+        return Sizing(False, why)
     return Sizing(True, "", qty, notional, margin, entry, sl, tp, qty * abs(entry - sl), qty * abs(tp - entry),
                   used_atr, liq, lev, maintenance_margin(notional, brackets, cfg.maint_margin_rate))
 
@@ -256,22 +280,39 @@ class Book:
     open_risk: float = 0.0
     open_risk_long: float = 0.0        # share of ``open_risk`` held by long positions
     open_risk_short: float = 0.0       # ... and by shorts (side_risk rule)
+    open_net: float = 0.0              # signed beta-weighted notional: sum(+1 long / -1 short x notional x beta vs BTC) (net_exposure rule)
 
 
 @dataclass
 class EntryCheck:
     ok: bool
-    rule: str = ""          # total_leverage | margin_ratio | open_risk | side_risk | free_margin | "" (ok)
+    rule: str = ""          # total_leverage | margin_ratio | open_risk | side_risk | net_exposure | free_margin | "" (ok)
     detail: str = ""
 
 
+def net_exposure_check(net_before: float, new_signed: float, cap_usd: float) -> tuple[bool, str]:
+    """Beta-weighted net exposure cap. ``net_before`` = signed beta-weighted notional of the open book, ``new_signed`` = that of the
+    entry (+ long / - short). Rejected only when |net after| > cap AND |net after| > |net before| AND |net after| > |new|:
+    an entry that REDUCES |net| is always allowed, and a lone position into a flat book is never blocked by the cap alone
+    (otherwise a $160 slice on a $100 stake could never trade at the 150 % default). cap_usd <= 0 = off."""
+    if cap_usd <= 0:
+        return True, ""
+    after = net_before + new_signed
+    if abs(after) <= cap_usd + 1e-9 or abs(after) <= abs(net_before) + 1e-9 or abs(after) <= abs(new_signed) + 1e-9:
+        return True, ""
+    return False, (f"net exposure ${after:+.0f} (beta-weighted) would exceed the cap ${cap_usd:.0f} "
+                   f"(book ${net_before:+.0f}, entry ${new_signed:+.0f})")
+
+
 def check_entry(cfg: Settings, book: Book, new_notional: float, new_mm: float, new_risk: float, margin: float,
-                fee: float, side: str | None = None) -> EntryCheck:
+                fee: float, side: str | None = None, beta: float = 1.0) -> EntryCheck:
     """A new position is allowed only if, INCLUDING it:
     (1) sum(notional)/equity <= max_total_leverage, (2) sum(maintenance margin)/equity <= max_margin_ratio,
     (3) sum(loss if every SL fills)/equity <= max_open_risk_pct %, (4) free margin >= its margin + entry fee,
     (5) with ``side``: the stop-out risk of ONE side (longs or shorts) <= max_side_risk_pct % of the open-risk BUDGET
-    (max_open_risk_pct % x equity), so one correlated direction cannot use the whole budget."""
+    (max_open_risk_pct % x equity), so one correlated direction cannot use the whole budget,
+    (6) with ``side``: the beta-weighted NET exposure |sum(side x notional x beta)| <= max_net_exposure_pct % x equity
+    (``net_exposure_check``; entries that reduce |net| are always allowed)."""
     eq = book.equity
     if eq <= 0:
         return EntryCheck(False, "total_leverage", "no equity")
@@ -292,6 +333,11 @@ def check_entry(cfg: Settings, book: Book, new_notional: float, new_mm: float, n
             return EntryCheck(False, "side_risk",
                               f"{side} stop-out risk ${side_risk:.2f} > {cfg.max_side_risk_pct:g}% of the open-risk budget "
                               f"${budget:.2f} (max ${cap:.2f})")
+    if side in ("long", "short") and cfg.max_net_exposure_pct > 0:
+        signed = (1.0 if side == "long" else -1.0) * new_notional * beta
+        ok, why = net_exposure_check(book.open_net, signed, cfg.max_net_exposure_pct / 100.0 * eq)
+        if not ok:
+            return EntryCheck(False, "net_exposure", why)
     if book.available + 1e-9 < margin + fee:
         return EntryCheck(False, "free_margin", f"free margin {book.available:.2f} < slice margin + fee {margin + fee:.2f}")
     return EntryCheck(True)
@@ -312,7 +358,7 @@ def slots_fit(cfg: Settings, book: Book, n_open: int, brackets=None) -> int:
     for side in ("long", "short"):          # a slice fits on whichever side still has room
         n = 0
         b = Book(book.equity, book.available, book.open_notional, book.open_mm, book.open_risk,
-                 book.open_risk_long, book.open_risk_short)
+                 book.open_risk_long, book.open_risk_short, book.open_net)
         while n < 100:
             if cfg.max_positions is not None and n_open + n >= cfg.max_positions:
                 break
@@ -322,6 +368,7 @@ def slots_fit(cfg: Settings, book: Book, n_open: int, brackets=None) -> int:
             b.open_notional += notional
             b.open_mm += mm
             b.open_risk += risk
+            b.open_net += notional if side == "long" else -notional
             if side == "long":
                 b.open_risk_long += risk
             else:
@@ -414,12 +461,11 @@ def correlation_gate(cand_side: str, cand_close: pd.Series,
 
 # ----------------------------------------------------------------------------- stop invariant
 def positions_without_stop(positions: Sequence[dict], orders: Sequence[ConditionalOrder]) -> list[str]:
-    """Symbols of open positions that lack a live reduce-only SL on the closing side covering the qty."""
+    """Symbols of open positions that lack a live SL on the closing side covering the qty (a closePosition stop always does)."""
     bad = []
     for p in positions:
         want = "SELL" if p["side"] == "long" else "BUY"
-        ok = any(o.symbol == p["symbol"] and o.kind == "SL" and o.side == want and o.reduce_only
-                 and o.qty >= p["qty"] * 0.999 for o in orders)
+        ok = any(o.symbol == p["symbol"] and o.kind == "SL" and o.side == want and o.covers(p["qty"]) for o in orders)
         if not ok:
             bad.append(p["symbol"])
     return bad

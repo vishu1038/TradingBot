@@ -6,7 +6,8 @@ consumer must change with it.
 ## Goal
 Grow a small Binance USDⓈ-M futures account (~$100 real, after paper). 5m-chart trading on the
 most volatile liquid perps, entries chosen by a neural network running on the GPU, exits by a
-fixed-risk template. Mostly long; shorts only on a stricter threshold.
+fixed-risk template. Long and short are symmetric (user 2026-10-19): the side comes from the model's data, never from a built-in
+lean (equal default thresholds, shorts on, no side-specific caps), and the book is protected against a market reversal ("Reversal protection").
 
 ## Process layout (the UI can never hurt trading)
 ```
@@ -142,10 +143,46 @@ coin was stopped out twice within 3 minutes. Five settings (in `/api/settings`, 
   (`trade_stats`, drift) count a scaled-out position once. Not used for cross-sectional legs. Exchange close-outs rebuilt from fills
   (`last_close(..., booked=)`) exclude the booked partial. State per position lives in kv `protect`.
 - **Simulators.** `SimConfig` has the same five flags with the same defaults (and `trail_enabled` True / `trail_activate_r` 1.5);
-  `tb.sim.run` exposes them (`--no-trail`, `--breakeven-r`, `--sl-cooldown-bars`, `--max-side-risk`, `--partial-r`, ...). Break-even /
+  `tb.sim.run` exposes them (symmetric defaults: `--shorts` on, `--thr-long` = `--thr-short` = 0.70, `--side both`) (`--no-trail`, `--breakeven-r`, `--sl-cooldown-bars`, `--max-side-risk`, `--partial-r`, ...). Break-even /
   trail moves take effect from the NEXT bar; the partial fires after the stop check (SL first) and before the TP, at its level (gap: the
   open) with slippage + taker fee. Sim and shadow fold a partial into the position's single trade row. Labels (`tb.labels`) and
   `tb.sim.xsec` do not model any of this: the label-parity tests run with the protection off.
+
+## Dollar floor (user 2026-10-19; `tb.risk.dollar_floor`, `size_trade`, shadow, `tb.sim`)
+"TP was taken on coins for just cents": drawdown derating (mult down to 0.07) shrank positions and the 50 % partial booked tiny amounts.
+- `min_tp_usd` / `min_sl_usd` (2.0 each; 0 = off). At entry, AFTER all sizing (derating, drift, slippage / staged multipliers, caps, lot
+  rounding) the dollar move to the TP and to the SL for the ACTUAL quantity (`qty × |level − entry|`) must be >= its floor, else the trade is
+  SKIPPED (`skip ...: target below $ floor: SL $1.60 < $2`), never shrunk below it. A stop-only position (cross-sectional leg, `tp_enabled`
+  false) is checked on the stop only. Live champion (`size_trade`), shadow (`ShadowBook._make_pos`, sizing at mult 1.0 still applies it) and
+  `tb.sim.backtest` (`skip_dollar_floor`) apply the same rule. No cross-validation against `tp_usd` / `sl_usd`: a `tp_usd` below the floor
+  simply never trades.
+- **Partial take-profit**: only when the closed piece gains >= `min_tp_usd` at the partial level (`protect.partial_gain_ok`); otherwise there
+  is no partial (`partial` state "skipped") and the position runs to its full TP.
+
+## Reversal protection (user-approved 2026-10-19; `tb/reversal.py`, shared by engine, shadow and `tb.sim`)
+Symmetric trading "in such a way that if the market reverses, the bots don't lose money on their other edges". Together with the
+60 % `max_side_risk_pct` cap (unchanged):
+1. **Beta-weighted net exposure cap** (`max_net_exposure_pct`, 150; 0 = off). Beta of each coin vs BTC = cov/var of the last 7 days of 1h returns
+   (up to 168; needs >= 48; fallback 1.0; clipped to [0.25, 3]); the engine refreshes it hourly from 1h klines (`refresh_betas`, <= 3 requests
+   per bars cycle; the sim derives it rolling from its own data, BTC or the equal-weight basket as the reference). Net exposure = Σ side × notional ×
+   beta (+1 long, −1 short), book = open positions + in-flight maker entries. Meaning: `|net| <= max_net_exposure_pct % × equity`. An entry that
+   would push |net| beyond the cap is rejected (`blocked by rule net_exposure`); one that REDUCES |net| is always allowed, and so is a lone position
+   into a flat book (otherwise a $160 slice on a $100 stake could never trade). NOTE: at 150 % and a $100–200 stake that is about one slice
+   of net exposure: more positions need the other side to hedge them. `Book.open_net`, `risk.net_exposure_check`.
+2. **Basket reversal detector.** On every new closed 5m bar the equal-weight return of the current universe and BTC over 15 min (3 bars) and 1 h
+   (12 bars) is turned into a z-score against its own volatility (RMS of the earlier, non-overlapping windows of the last 576 bars; needs 96;
+   `reversal.market_signal`). The book's net side = sign of net exposure (needs |net| >= 5 % of equity). When the move is AGAINST that side with
+   z >= `reversal_z` (2.5; 0 = off) for any of the four series: (a) every open position of that side in profit >= `reversal_lock_r` (0.5) initial risks
+   gets its exchange-side stop tightened to keep half of the open profit but at least break-even + round-trip fees (`reversal.lock_stop`: never
+   loosens, never through the market, nothing is closed in a panic; the move goes through the normal stop-replace path of `_protect`, so the
+   stop is replaced, not duplicated, and the usual 0.1 % / once-per-bar throttle applies; winners that appear while the window is open are locked
+   too); (b) new entries on that side are blocked for `reversal_block_bars` (6) bars (`skip ...: entries are blocked after a market reversal`);
+   (c) an event `reversal` + a line in the alert digest. Losing positions keep their stops. The window is persisted (kv `reversal`).
+   `/api/status` adds `net_exposure_pct`, `max_net_exposure_pct` and `reversal {blocked, last, z}`.
+3. **Shadow books** run the same rules per model book (`ShadowBook.apply_reversal`, `betas`, a static equity proxy like the side cap; counters in
+   `ShadowBook.skips`). **Simulator**: `SimConfig.max_net_exposure_pct / reversal_z / reversal_lock_r / reversal_block_bars` and
+   `tb.sim.run --max-net-exposure --reversal-z --reversal-lock-r --reversal-block-bars` (0 = off), stats `skip_net_exposure`,
+   `skip_reversal_block`, `reversal_triggers`, `reversal_locks`; the lock applies from the next bar. `tb.sim.model_backtest` and the labels do not model it.
 
 ## Hard safety invariants (engine)
 1. The SL is placed **on the exchange** (reduce-only STOP_MARKET, workingType MARK_PRICE) right
@@ -239,8 +276,9 @@ class Scorer(Protocol):
 ```
 `feats` is the `[T, F]` float32 window from `features.build_features` (latest bar last).
 Default scorer when no model file exists: `NullScorer` → probs 0, never trades.
-Trade if `prob_long ≥ prob_threshold_long` (default 0.70) or, when `short_enabled`,
-`prob_short ≥ prob_threshold_short` (default 0.80). Thresholds are configurable and the Lab
+Trade if `prob_long ≥ prob_threshold_long` (default 0.70) or, when `short_enabled` (default on),
+`prob_short ≥ prob_threshold_short` (default 0.70, equal to the long one). When both qualify, the larger margin over its OWN threshold
+wins and an exact tie trades neither (`adaptive.pick_side`, also used for adaptive events). Thresholds are configurable and the Lab
 reports which value is break-even after fees for the chosen exit mode.
 
 ### V3 engine (docs/V3_EXPERIMENTS.md is the model-side contract)
@@ -381,7 +419,8 @@ All timestamps unix **seconds** in the API. JSON.
 - `GET /api/logs?limit=200` → `[{t, level, msg}]`
 - `GET /api/settings` / `PUT /api/settings` (partial merge) → `{slice_margin_usd, leverage,
   max_positions, exit_mode, tp_usd, sl_usd, tp_atr, sl_atr, trail:{enabled, activate_r,
-  distance_atr}, breakeven_r, sl_cooldown_bars, max_side_risk_pct, partial_tp_r, partial_tp_frac, short_enabled, prob_threshold_long, prob_threshold_short,
+  distance_atr}, breakeven_r, sl_cooldown_bars, max_side_risk_pct, partial_tp_r, partial_tp_frac, min_tp_usd, min_sl_usd,
+  max_net_exposure_pct, reversal_z, reversal_lock_r, reversal_block_bars, short_enabled, prob_threshold_long, prob_threshold_short,
   corr_cap:{max_corr, max_correlated}, universe_size, universe_refresh_s, universe_whitelist (null | [symbol]),
   kill_dd_pct, fee_taker, sound}`
 - `POST /api/control` `{action:"start"|"stop"|"kill"|"reset_kill"|"close_position"|"close_all"|

@@ -36,7 +36,7 @@ def test_slippage_applied_to_market_fills():
     cfg = Settings().merge({"slippage_pct": 0.001}, allow_internal=True)
     p = mk(cfg)
     assert p.market_order("AAAUSDT", "BUY", 1.0).avg_price == pytest.approx(100.1)
-    assert p.market_order("AAAUSDT", "SELL", 1.0, reduce_only=True).avg_price == pytest.approx(99.9)
+    assert p.market_order("AAAUSDT", "SELL", 1.0).avg_price == pytest.approx(99.9)
 
 
 def test_insufficient_margin_rejected():
@@ -51,7 +51,7 @@ def test_round_trip_pnl_and_fees():
     p.market_order("AAAUSDT", "BUY", 1.6)
     p.tick({"AAAUSDT": 103.125})
     p.marks["AAAUSDT"] = 103.125
-    r = p.market_order("AAAUSDT", "SELL", 1.6, reduce_only=True)
+    r = p.market_order("AAAUSDT", "SELL", 1.6)
     info = p.last_close("AAAUSDT", "long", 0)
     assert info.pnl == pytest.approx(5.0)                         # +3.125% on 160 = +5
     assert info.fees == pytest.approx(1.6 * 100 * 0.0005 + 1.6 * 103.125 * 0.0005)
@@ -163,7 +163,7 @@ def test_funding_long_pays_positive_rate():
     assert paid["AAAUSDT"] == pytest.approx(-1.6 * 100 * 0.001)
     assert p.balance().wallet == pytest.approx(w0 - 0.16)
     assert p.apply_funding({"AAAUSDT": 0.001}, now) == {}       # already applied for this slot
-    info = (p.market_order("AAAUSDT", "SELL", 1.6, True), p.last_close("AAAUSDT", "long", 0))[1]
+    info = (p.market_order("AAAUSDT", "SELL", 1.6), p.last_close("AAAUSDT", "long", 0))[1]
     assert info.funding == pytest.approx(-0.16)
 
 
@@ -180,7 +180,27 @@ def test_state_roundtrip():
     assert len(q.open_conditional_orders()) == 1
 
 
-def test_reduce_only_without_position_rejected():
+def test_normal_opposite_order_reduces_closes_and_flips_like_the_venue():
+    """No reduce-only orders exist: a SELL with no position opens a short, a partial SELL reduces, an oversized one flips."""
     p = mk()
-    with pytest.raises(ExchangeError):
-        p.market_order("AAAUSDT", "SELL", 1.0, reduce_only=True)
+    p.market_order("AAAUSDT", "SELL", 1.0)                       # no position: a NEW short (the venue would not reject it either)
+    assert [(x.side, x.qty) for x in p.positions()] == [("short", 1.0)]
+    p.market_order("AAAUSDT", "BUY", 0.4)                        # reduces
+    assert [(x.side, round(x.qty, 6)) for x in p.positions()] == [("short", 0.6)]
+    p.market_order("AAAUSDT", "BUY", 1.0)                        # 0.6 closes the short, 0.4 opens a long
+    assert [(x.side, round(x.qty, 6)) for x in p.positions()] == [("long", 0.4)]
+
+
+def test_close_position_stops_cover_the_whole_position_and_only_one_per_direction():
+    p = mk()
+    p.market_order("AAAUSDT", "BUY", 1.6)
+    p.place_stop("AAAUSDT", "SELL", 93.75)
+    p.place_take_profit("AAAUSDT", "SELL", 110.0)
+    with pytest.raises(ExchangeError) as e:
+        p.place_stop("AAAUSDT", "SELL", 94.0)                     # the venue answers -4130 to a second closePosition stop
+    assert e.value.code == -4130
+    assert all(o.close_position for o in p.open_conditional_orders())
+    p.market_order("AAAUSDT", "SELL", 0.6)                       # a partial normal order: the stop still covers the remainder
+    ev = p.tick({"AAAUSDT": 93.0})
+    assert ev[0][1].reason == "sl" and p.positions() == []
+    assert ev[0][1].pnl == pytest.approx((93.0 - 100) * 1.0)       # the remaining 1.0, not the original 1.6

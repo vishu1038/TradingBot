@@ -236,7 +236,7 @@ def test_engine_moves_stop_to_breakeven_on_the_exchange_and_never_loosens(store,
     assert q["sl_price"] == pytest.approx(be, abs=0.011) and q["sl_order_id"] != old_id and not q["trail_active"]
     sl_orders = [o for o in eng.ex.open_conditional_orders("AAAUSDT") if o.kind == "SL"]
     assert [o.trigger_price for o in sl_orders] == [q["sl_price"]]            # old exchange stop replaced, not duplicated
-    assert all(o.qty == pytest.approx(p["qty"]) and o.reduce_only for o in sl_orders)
+    assert all(o.close_position for o in sl_orders)                       # closePosition: no quantity to resize
     pump(eng, data, entry + 0.4 * risk, dt=900)                # pull back: stays at break-even
     assert store.get_positions()[0]["sl_price"] == q["sl_price"]
     pump(eng, data, q["sl_price"] * 0.9995, dt=1200)           # through the break-even stop: exits ~flat, NOT a big loss
@@ -270,7 +270,7 @@ def test_trailing_off_and_breakeven_off_leave_the_stop_alone(store, tmp_path):
     assert store.get_positions()[0]["sl_price"] == p["sl_price"]
 
 
-def test_failed_stop_replacement_keeps_the_old_stop_and_retries(store, tmp_path, caplog):
+def test_failed_stop_replacement_restores_the_old_level_and_retries(store, tmp_path, caplog):
     prod = {"AAAUSDT": 100.0, "BBBUSDT": 100.0, "BTCUSDT": 100.0}
     eng, data, venue = mk_demo(store, tmp_path, prod_marks=prod, venue_marks=dict(prod), wallet=100.0,
                                settings={**ATR_EXITS, "max_open_risk_pct": 100.0})
@@ -280,15 +280,21 @@ def test_failed_stop_replacement_keeps_the_old_stop_and_retries(store, tmp_path,
     entry, risk = p["entry_price"], p["entry_price"] - p["sl_price"]
     old = [o for o in venue.orders if o.kind == "SL"][0]
     real = venue.place_stop
-    venue.place_stop = lambda *a: (_ for _ in ()).throw(ExchangeError("temporarily unavailable", code=-1001))
+
+    def flaky(sym, side, price, qty=None):                  # the NEW (tighter) level is refused, the old level is accepted again
+        if price > p["sl_price"]:
+            raise ExchangeError("temporarily unavailable", code=-1001)
+        return real(sym, side, price, qty)
+    venue.place_stop = flaky
     venue.marks["AAAUSDT"] = entry + 1.1 * risk
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="tb.engine"):
         run(eng.prices_cycle())
     q = store.get_positions()[0]
-    assert q["sl_price"] == p["sl_price"] and q["sl_order_id"] == old.order_id            # DB unchanged
-    assert [o.order_id for o in venue.orders if o.kind == "SL"] == [old.order_id]         # the old stop is still live
-    assert any("FAILED" in r.message and "old stop stays live" in r.message for r in caplog.records)
+    sls = [o for o in venue.orders if o.kind == "SL"]
+    assert q["sl_price"] == p["sl_price"]                                                  # DB level unchanged
+    assert [o.trigger_price for o in sls] == [p["sl_price"]] and q["sl_order_id"] == sls[0].order_id   # old level back, id tracked
+    assert any("FAILED" in r.message and "old level is back" in r.message for r in caplog.records)
     # still protected: the invariant check does not close it
     run(eng.prices_cycle())
     assert len(store.get_positions()) == 1
@@ -304,46 +310,50 @@ def test_failed_stop_replacement_keeps_the_old_stop_and_retries(store, tmp_path,
     assert q["sl_price"] > p["sl_price"] and [o.trigger_price for o in venue.orders if o.kind == "SL"] == [q["sl_price"]]
 
 
-def test_replace_conditional_on_binance_algo_places_new_then_cancels_old():
-    ex, s = mk_binance(Resp(200, {"algoId": 7001}), Resp(200, {"algoId": 5555}), conditional_mode="algo")
-    new, stale = ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, 0.067, old_id="a:5555")
+def test_replace_conditional_on_binance_algo_cancels_old_then_places_new_closeposition():
+    """One closePosition stop per direction (-4130): the old stop must go first, then the new one is placed."""
+    ex, s = mk_binance(Resp(200, {"algoId": 5555}), Resp(200, {"algoId": 7001}), conditional_mode="algo")
+    new, stale = ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, None, old_id="a:5555")
     assert (new, stale) == ("a:7001", None)
-    assert [(c["method"], c["url"].split("?")[0].rsplit("/", 1)[-1]) for c in s.calls] == [("POST", "algoOrder"), ("DELETE", "algoOrder")]
-    post, delete = qs(s.calls[0]), qs(s.calls[1])
-    assert post["type"] == "STOP_MARKET" and post["triggerPrice"] == "2300.5" and post["quantity"] == "0.067"
-    assert post["reduceOnly"] == "true" and post["algoType"] == "CONDITIONAL" and post["side"] == "SELL"
+    assert [(c["method"], c["url"].split("?")[0].rsplit("/", 1)[-1]) for c in s.calls] == [("DELETE", "algoOrder"), ("POST", "algoOrder")]
+    delete, post = qs(s.calls[0]), qs(s.calls[1])
+    assert post["type"] == "STOP_MARKET" and post["triggerPrice"] == "2300.5"
+    assert post["closePosition"] == "true" and "quantity" not in post and "reduceOnly" not in post
+    assert post["algoType"] == "CONDITIONAL" and post["side"] == "SELL"
     assert delete["algoId"] == "5555"
 
 
 def test_replace_conditional_legacy_order_ids_use_the_order_endpoint():
-    ex, s = mk_binance(Resp(200, {"orderId": 91}), Resp(200, {"orderId": 90}), conditional_mode="legacy")
-    new, stale = ex.replace_conditional("ETHUSDT", "TP", "SELL", 2400.0, 0.05, old_id="o:90")
+    ex, s = mk_binance(Resp(200, {"orderId": 90}), Resp(200, {"orderId": 91}), conditional_mode="legacy")
+    new, stale = ex.replace_conditional("ETHUSDT", "TP", "SELL", 2400.0, None, old_id="o:90")
     assert (new, stale) == ("o:91", None)
-    assert qs(s.calls[0])["type"] == "TAKE_PROFIT_MARKET" and s.calls[1]["method"] == "DELETE"
-    assert qs(s.calls[1])["orderId"] == "90"
+    assert s.calls[0]["method"] == "DELETE" and qs(s.calls[0])["orderId"] == "90"
+    assert qs(s.calls[1])["type"] == "TAKE_PROFIT_MARKET" and qs(s.calls[1])["closePosition"] == "true"
 
 
-def test_replace_conditional_failure_to_place_never_touches_the_old_order():
+def test_replace_conditional_failure_to_place_restores_the_old_level():
     bad = Resp(400, {"code": -1111, "msg": "Precision is over the maximum"})
-    ex, s = mk_binance(bad, bad, bad, conditional_mode="algo")
-    with pytest.raises(ExchangeError):
-        ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, 0.067, old_id="a:5555", retries=3, pause_s=0)
-    assert [c["method"] for c in s.calls] == ["POST", "POST", "POST"]            # retried, never a DELETE: old stop stays live
-    # -2021 (would trigger immediately) is not retried
-    ex2, s2 = mk_binance(Resp(400, {"code": -2021, "msg": "Order would immediately trigger."}), conditional_mode="algo")
+    ex, s = mk_binance(Resp(200, {}), bad, bad, bad, Resp(200, {"algoId": 77}), conditional_mode="algo")
     with pytest.raises(ExchangeError) as e:
-        ex2.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, 0.067, old_id="a:1", pause_s=0)
-    assert e.value.code == -2021 and len(s2.calls) == 1
-    # a retry that works on the 2nd attempt still cancels the old stop afterwards
-    ex3, s3 = mk_binance(bad, Resp(200, {"algoId": 9}), Resp(200, {}), conditional_mode="algo")
-    assert ex3.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, 0.067, old_id="a:1", pause_s=0) == ("a:9", None)
-    assert [c["method"] for c in s3.calls] == ["POST", "POST", "DELETE"]
+        ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, None, old_id="a:5555", retries=3, pause_s=0, old_price=2200.0)
+    assert [c["method"] for c in s.calls] == ["DELETE", "POST", "POST", "POST", "POST"]     # cancel, 3 tries, then the old level
+    assert qs(s.calls[-1])["triggerPrice"] == "2200" and e.value.restored_id == "a:77"
+    # -2021 (would trigger immediately) is not retried
+    ex2, s2 = mk_binance(Resp(200, {}), Resp(400, {"code": -2021, "msg": "Order would immediately trigger."}), conditional_mode="algo")
+    with pytest.raises(ExchangeError) as e2:
+        ex2.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, None, old_id="a:1", pause_s=0)
+    assert e2.value.code == -2021 and len(s2.calls) == 2
+    # a retry that works on the 2nd attempt
+    ex3, s3 = mk_binance(Resp(200, {}), bad, Resp(200, {"algoId": 9}), conditional_mode="algo")
+    assert ex3.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, None, old_id="a:1", pause_s=0) == ("a:9", None)
+    assert [c["method"] for c in s3.calls] == ["DELETE", "POST", "POST"]
 
 
-def test_replace_conditional_reports_an_old_order_that_could_not_be_cancelled():
-    ex, s = mk_binance(Resp(200, {"algoId": 12}), Resp(500, {"code": -1000, "msg": "boom"}), conditional_mode="algo")
-    new, stale = ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, 0.067, old_id="a:11")
-    assert new == "a:12" and stale == "a:11"                       # harmless (reduce-only); the engine retries the cancel
+def test_replace_conditional_that_cannot_cancel_the_old_order_places_nothing():
+    ex, s = mk_binance(Resp(500, {"code": -1000, "msg": "boom"}), conditional_mode="algo")
+    with pytest.raises(ExchangeError):
+        ex.replace_conditional("ETHUSDT", "SL", "SELL", 2300.5, None, old_id="a:11")
+    assert [c["method"] for c in s.calls] == ["DELETE"]            # the old stop is untouched and still live
 
 
 def test_binance_last_close_does_not_count_a_booked_partial_twice():
@@ -367,7 +377,7 @@ def test_binance_last_close_does_not_count_a_booked_partial_twice():
 PART = {**ATR_EXITS, "partial_tp_r": 1.5, "partial_tp_frac": 0.5, "breakeven_r": 1.0}
 
 
-def test_partial_tp_closes_half_books_net_pnl_and_resizes_stop_and_tp(store, tmp_path):
+def test_partial_tp_closes_half_books_net_pnl_and_the_closeposition_orders_cover_the_rest(store, tmp_path):
     eng, data, p = _paper(store, tmp_path, **PART)
     entry, risk, qty = p["entry_price"], p["entry_price"] - p["sl_price"], p["qty"]
     half = SymbolFilters(0.01, 0.001, 0.001, 5.0).round_qty(qty * 0.5)       # floored to the lot step
@@ -385,12 +395,12 @@ def test_partial_tp_closes_half_books_net_pnl_and_resizes_stop_and_tp(store, tmp
     assert r["funding"] == pytest.approx(0.0)
     assert r["pnl"] == pytest.approx(gross - r["fees"])                              # NET
     assert q["entry_fee"] == pytest.approx(p["entry_fee"] - entry_fee)
-    # exchange orders: stop and TP resized to the remainder, stop at least at break-even; old ones gone
+    # exchange orders: closePosition stop and TP cover the remainder by themselves (nothing resized); stop at least at break-even
     conds = eng.ex.open_conditional_orders("AAAUSDT")
-    assert sorted(o.kind for o in conds) == ["SL", "TP"] and all(o.qty == pytest.approx(qty - half) for o in conds)
+    assert sorted(o.kind for o in conds) == ["SL", "TP"] and all(o.close_position for o in conds)
     sl = [o for o in conds if o.kind == "SL"][0]
     assert sl.trigger_price >= round(entry * (1 + 2 * FEE), 2) - 1e-9 and sl.trigger_price == pytest.approx(q["sl_price"])
-    assert [o.order_id for o in conds if o.kind == "TP"] == [q["tp_order_id"]]
+    assert [o.order_id for o in conds if o.kind == "TP"] == [p["tp_order_id"] ] == [q["tp_order_id"]]     # the TP was not touched
     # once per position: a later higher price does not scale out again
     pump(eng, data, round(entry + 2.4 * risk, 2), dt=600)
     assert len(store.get_trades(5)) == 1 and store.get_positions()[0]["qty"] == pytest.approx(qty - half)
@@ -465,62 +475,51 @@ def test_partial_tp_failure_is_retried_later_without_booking_anything(store, tmp
     assert len(store.get_trades(5)) == 1 and store.get_positions()[0]["qty"] == pytest.approx(p["qty"] - SymbolFilters(0.01, 0.001, 0.001, 5.0).round_qty(p["qty"] * 0.5))
 
 
-class PartialVenue(FakeVenue):
-    """FakeVenue whose reduce-only market orders may close only part of the position (like the real exchange)."""
-
-    def market_order(self, symbol, side, qty, reduce_only=False):
-        if reduce_only and symbol in self.pos and qty < self.pos[symbol].qty - 1e-9:
-            px = self.marks[symbol]
-            pos = self.pos[symbol]
-            self.log.append(("market", symbol, side, qty, True, px))
-            pos.qty = round(pos.qty - qty, 8)
-            return OrderResult(f"o:{len(self.log)}", symbol, side, qty, px, "FILLED", qty * px * 0.0005)
-        return super().market_order(symbol, side, qty, reduce_only)
-
-
-def test_partial_tp_on_an_exchange_venue_resizes_orders_and_keeps_old_ones_on_failure(store, tmp_path):
+def test_partial_tp_on_an_exchange_venue_keeps_the_orders_and_retries_the_breakeven_move(store, tmp_path):
     prod = {"AAAUSDT": 100.0, "BBBUSDT": 100.0, "BTCUSDT": 100.0}
     eng, data, venue = mk_demo(store, tmp_path, prod_marks=prod, venue_marks=dict(prod), wallet=100.0,
                                settings={**PART, "max_open_risk_pct": 100.0})
-    venue.__class__ = PartialVenue
     eng.cfg = store.get_settings().merge({"slippage_pct": 0.0, "stop_slippage_pct": 0.0}, allow_internal=True)
     open_(eng, "AAAUSDT")
     p = store.get_positions()[0]
     entry, risk = p["entry_price"], p["entry_price"] - p["sl_price"]
-    old_sl = [o for o in venue.orders if o.kind == "SL"][0]
+    tp_id = [o for o in venue.orders if o.kind == "TP"][0].order_id
     real = venue.place_stop
-    calls = {"n": 0}
 
-    def flaky(*a):                                                   # BE move is attempted first and fails, then the resize
-        calls["n"] += 1
-        raise ExchangeError("temporarily unavailable", code=-1001)
+    def flaky(sym, side, price, qty=None):                # the tighter (break-even) level is refused; the old level is accepted
+        if price > p["sl_price"]:
+            raise ExchangeError("temporarily unavailable", code=-1001)
+        return real(sym, side, price, qty)
 
     venue.place_stop = flaky
     venue.marks["AAAUSDT"] = round(entry + 1.6 * risk, 2)
     run(eng.prices_cycle())
     q = store.get_positions()[0]
-    assert q["qty"] == pytest.approx(p["qty"] / 2) and venue.pos["AAAUSDT"].qty == pytest.approx(p["qty"] / 2)
+    half = SymbolFilters(0.01, 0.001, 0.001, 5.0).round_qty(p["qty"] * 0.5)
+    assert q["qty"] == pytest.approx(p["qty"] - half) and venue.pos["AAAUSDT"].qty == pytest.approx(p["qty"] - half)
     assert [t["exit_reason"] for t in store.get_trades(5)] == ["partial"]
-    # the resize failed: the OLD (oversized) stop is still live, so the position never lost protection
-    assert [o.order_id for o in venue.orders if o.kind == "SL"] == [old_sl.order_id]
-    assert eng.prot[str(p["id"])]["resize"] is True
-    run(eng.prices_cycle())                                          # invariant check passes (stop covers the position)
-    assert len(store.get_positions()) == 1
+    mk_ = [x for x in venue.log if x[0] == "market"][-1]
+    assert mk_[2] == "SELL" and mk_[3] == pytest.approx(half)           # a normal market order of the partial quantity only
+    # no resize: the closePosition stop (old level, restored) and the untouched TP still cover the position
+    sls = [o for o in venue.orders if o.kind == "SL"]
+    assert [o.trigger_price for o in sls] == [p["sl_price"]] and sls[0].close_position
+    assert [o.order_id for o in venue.orders if o.kind == "TP"] == [tp_id]
+    assert eng.prot[str(p["id"])]["resize"] is True                      # the break-even move is retried
+    run(eng.prices_cycle())
+    assert len(store.get_positions()) == 1                               # the invariant check passes (closePosition stop)
     venue.place_stop = real
     t0 = eng.clock()
     eng.clock = lambda: t0 + 40
     run(eng.prices_cycle())
     sls = [o for o in venue.orders if o.kind == "SL"]
-    tps = [o for o in venue.orders if o.kind == "TP"]
-    assert len(sls) == 1 and sls[0].qty == pytest.approx(p["qty"] / 2) and sls[0].trigger_price >= round(entry * (1 + 2 * FEE), 2) - 1e-9
-    assert len(tps) == 1 and tps[0].qty == pytest.approx(p["qty"] / 2)
+    assert len(sls) == 1 and sls[0].trigger_price >= round(entry * (1 + 2 * FEE), 2) - 1e-9
+    assert [o.order_id for o in venue.orders if o.kind == "TP"] == [tp_id]
     assert not eng.prot[str(p["id"])].get("resize")
-    # the exchange close-out of the remainder is told about the booked partial
-    assert eng.prot[str(p["id"])]["booked"]["order_ids"]
+    assert eng.prot[str(p["id"])]["booked"]["order_ids"]                 # the exchange close-out is told about the booked partial
 
 
 # ====================================================================== paper exchange
-def test_paper_exchange_reduce_only_partial_keeps_the_position_and_prorates_costs(cfg):
+def test_paper_exchange_normal_partial_keeps_the_position_and_prorates_costs(cfg):
     from tb.exchange.paper import PaperExchange
     data = FakeData(("AAAUSDT",))
     ex = PaperExchange(data, cfg.merge({"slippage_pct": 0.0}, allow_internal=True), 1000.0)
@@ -530,13 +529,13 @@ def test_paper_exchange_reduce_only_partial_keeps_the_position_and_prorates_cost
     sl = ex.place_stop("AAAUSDT", "SELL", 98.0, 1.6)
     ex.marks["AAAUSDT"] = 103.0
     w = ex.balance().wallet
-    r = ex.market_order("AAAUSDT", "SELL", 0.8, reduce_only=True)
+    r = ex.market_order("AAAUSDT", "SELL", 0.8)
     assert r.qty == pytest.approx(0.8) and ex.positions()[0].qty == pytest.approx(0.8)
     assert r.fee == pytest.approx(0.5 * 1.6 * 100 * FEE + 0.8 * 103 * FEE)                  # entry share + exit fee
     assert ex.balance().wallet - w == pytest.approx(0.8 * 3.0 - 0.8 * 103 * FEE)
     assert ex.positions()[0].margin == pytest.approx(1.6 * 100 / 5 / 2)
-    new_id, stale = ex.replace_conditional("AAAUSDT", "SL", "SELL", 100.1, 0.8, sl)
-    assert stale is None and [(o.order_id, o.trigger_price, o.qty) for o in ex.open_conditional_orders()] == [(new_id, 100.1, 0.8)]
+    new_id, stale = ex.replace_conditional("AAAUSDT", "SL", "SELL", 100.1, None, sl)
+    assert stale is None and [(o.order_id, o.trigger_price, o.close_position) for o in ex.open_conditional_orders()] == [(new_id, 100.1, True)]
 
 
 # ====================================================================== shadow + sim parity on one hand-made path

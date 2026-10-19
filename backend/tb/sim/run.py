@@ -3,6 +3,7 @@
   python -m tb.sim.run --signals random --exit fixed
   python -m tb.sim.run --symbols BTCUSDT,SOLUSDT --signals random --p 0.003 --exit atr --trail
   python -m tb.sim.run --signals every_n --n 48 --exit fixed --start 2026-01-01
+  python -m tb.sim.run --signals random --p 0.003 --max-net-exposure 0 --reversal-z 0     # reversal protection OFF (A/B vs the default)
 """
 from __future__ import annotations
 
@@ -59,7 +60,7 @@ def make_signals(kind: str, p: float, seed: int, side: str, n: int):
     if kind == "random":
         return sig.random_entries(p, seed, side)
     if kind == "every_n":
-        return sig.always_long_every_n(n)
+        return sig.every_n_entries(n, side)
     raise ValueError(f"unknown --signals {kind!r}")
 
 
@@ -71,6 +72,8 @@ def build_cfg(a) -> SimConfig:
         max_open_risk_pct=a.max_open_risk, partial_tp_r=a.partial_r, partial_tp_frac=a.partial_frac,
         trail_distance_atr=a.trail_atr, short_enabled=a.shorts or a.side in ("short", "both"),
         thr_long=a.thr_long, thr_short=a.thr_short, max_positions=a.max_positions,
+        min_tp_usd=a.min_tp_usd, min_sl_usd=a.min_sl_usd, max_net_exposure_pct=a.max_net_exposure,
+        reversal_z=a.reversal_z, reversal_lock_r=a.reversal_lock_r, reversal_block_bars=a.reversal_block_bars,
         kill_dd_pct=a.kill_dd, fee_taker=a.fee, slippage=a.slippage,
         stop_slippage_extra=a.stop_slip_extra, derate_enabled=not a.no_derate,
         plausibility_enabled=not a.no_plausibility, drift_enabled=not a.no_drift)
@@ -81,7 +84,8 @@ def main(argv=None) -> int:
     ap.add_argument("--symbols", default=None, help="comma list (default: every symbol in the archive)")
     ap.add_argument("--signals", default="random", choices=["random", "every_n"])
     ap.add_argument("--p", type=float, default=0.004, help="random: per-bar entry probability")
-    ap.add_argument("--side", default="long", choices=["long", "short", "both"])
+    ap.add_argument("--side", default="both", choices=["long", "short", "both"],
+                    help="side of the baseline signals (default both: no built-in long lean)")
     ap.add_argument("--n", type=int, default=48, help="every_n: bars between entries")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--exit", default="fixed", choices=["fixed", "atr"])
@@ -99,9 +103,17 @@ def main(argv=None) -> int:
     ap.add_argument("--partial-r", type=float, default=d.partial_tp_r, help="0 = off")
     ap.add_argument("--partial-frac", type=float, default=d.partial_tp_frac)
     ap.add_argument("--trail-atr", type=float, default=1.0)
-    ap.add_argument("--shorts", action="store_true")
-    ap.add_argument("--thr-long", type=float, default=0.70)
-    ap.add_argument("--thr-short", type=float, default=0.80)
+    ap.add_argument("--shorts", action=argparse.BooleanOptionalAction, default=d.short_enabled)
+    ap.add_argument("--thr-long", type=float, default=d.thr_long)
+    ap.add_argument("--thr-short", type=float, default=d.thr_short)
+    ap.add_argument("--min-tp-usd", type=float, default=d.min_tp_usd, help="dollar floor: skip trades whose TP spans fewer USD; 0 = off")
+    ap.add_argument("--min-sl-usd", type=float, default=d.min_sl_usd, help="dollar floor for the SL; 0 = off")
+    ap.add_argument("--max-net-exposure", type=float, default=d.max_net_exposure_pct,
+                    help="%% of equity: cap on |sum(side x notional x beta vs BTC)|; 0 = off")
+    ap.add_argument("--reversal-z", type=float, default=d.reversal_z,
+                    help="basket z (15 min / 1 h, universe + BTC) against the net side that locks winners and blocks that side; 0 = off")
+    ap.add_argument("--reversal-lock-r", type=float, default=d.reversal_lock_r)
+    ap.add_argument("--reversal-block-bars", type=int, default=d.reversal_block_bars)
     ap.add_argument("--max-positions", type=int, default=5)
     ap.add_argument("--start-equity", type=float, default=100.0)
     ap.add_argument("--kill-dd", type=float, default=50.0)

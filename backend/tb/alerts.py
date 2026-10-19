@@ -218,6 +218,8 @@ class AlertDispatcher:
         self._dig_lock = threading.Lock()
         self._dig_open: list[tuple] = []
         self._dig_closed: list[tuple] = []
+        self._dig_rev: list[tuple] = []              # market-reversal triggers (tb.reversal) since the last digest
+        self._dig_mirror: dict[tuple, int] = {}      # testnet mirror: (kind, code) -> count since the last digest
         self._dig_since = time.time()
         self._dig_thread: threading.Thread | None = None
         self.min_interval = min_interval
@@ -271,6 +273,37 @@ class AlertDispatcher:
             self._dig_thread.start()
         return True
 
+    # ------------------------------------------------------------------ testnet mirror (tb/mirror.py)
+    def mirror_note(self, kind: str, symbol: str, code: str = "") -> None:
+        """A mirror venue_fault / divergence: counted into the hourly digest (never an immediate message)."""
+        if not self.notifiers:
+            return
+        if self.digest_s > 0:
+            with self._dig_lock:
+                self._dig_mirror[(kind, code or "?")] = self._dig_mirror.get((kind, code or "?"), 0) + 1
+            if not (self._dig_thread and self._dig_thread.is_alive()):
+                self._dig_thread = threading.Thread(target=self._digest_loop, name="tb-alerts-digest", daemon=True)
+                self._dig_thread.start()
+        else:                                       # digests off (tests / explicit config): one short message
+            self.send(f"[mirror] {kind} {symbol} {code}".strip(), headline=f"mirror {kind} {symbol}")
+
+    def mirror_bug(self, symbol: str, action: str, code: str, msg: str) -> None:
+        """A request the testnet refused (our_bug): immediate. The caller rate-limits it to one per code + symbol per hour."""
+        rows = [("Symbol", symbol, AMBER), ("Action", action, None), ("Venue code", code, RED), ("Message", msg[:300], None),
+                ("Why it matters", "the same request would be refused on the real exchange", GREY)]
+        self.send(f"[mirror] OUR BUG {symbol} {action} code {code}: {msg}"[:500], headline=f"🐞 Mirror: {action} {symbol} refused ({code})",
+                  card=build_card(f"🐞 Mirror order refused · {symbol}", "testnet mirror", rows, "mirror_bug"))
+
+    def mirror_unusable(self, reasons: Sequence[str]) -> None:
+        rows = [("State", "account_unusable", AMBER)] + [("Reason", r, None) for r in list(reasons)[:4]]
+        rows.append(("Next step", "no orders are sent; resumes by itself (or press RETRY on the Execution page)", GREY))
+        self.send(f"[mirror] ACCOUNT UNUSABLE: {'; '.join(reasons)}", dedupe_key="mirror:unusable",
+                  headline="🧪 Testnet mirror paused: account unusable", card=build_card("🧪 Mirror paused", "testnet mirror", rows, "mirror_off"))
+
+    def mirror_recovered(self) -> None:
+        self.send("[mirror] testnet account usable again; mirroring resumed", dedupe_key="mirror:recovered",
+                  headline="🧪 Testnet mirror resumed")
+
     def _digest_loop(self) -> None:
         while not self._stop.wait(self.digest_s):
             self.flush_digest()
@@ -280,10 +313,12 @@ class AlertDispatcher:
         with self._dig_lock:
             opened, closed = self._dig_open, self._dig_closed
             self._dig_open, self._dig_closed = [], []
+            revs, self._dig_rev = self._dig_rev, []
+            mir, self._dig_mirror = self._dig_mirror, {}
             since, self._dig_since = self._dig_since, time.time()
-        if not opened and not closed:
+        if not opened and not closed and not mir and not revs:
             return
-        mode = (closed or opened)[-1][-1]
+        mode = (closed or opened)[-1][-1] if (closed or opened) else ("mirror" if mir else "engine")
         net = sum(c[2] for c in closed)
         wins = sum(1 for c in closed if c[2] > 0)
         mins = max(1, round((time.time() - since) / 60))
@@ -295,10 +330,31 @@ class AlertDispatcher:
             ("Net PnL (closed)", f"{net:+.2f} USDT", GREEN if net >= 0 else RED)]
         for c in sorted(closed, key=lambda c: -abs(c[2]))[:8]:
             rows.append((f"{c[0]} {c[1].upper()} · {c[3]}", f"{c[2]:+.2f}", GREEN if c[2] > 0 else RED))
-        head = f"🕐 Trades digest · {len(closed)} closed, net {net:+.2f}"
+        for (kind, code), n in sorted(mir.items(), key=lambda kv: -kv[1])[:6]:
+            rows.append((f"Mirror {kind}", f"{n} × {code}", AMBER))
+        for model, side, z, src, nl in revs[-4:]:
+            rows.append((f"Reversal vs {side}s" + (f" · {model}" if model else ""), f"z {z:.1f} ({src}), {nl} stops tightened", AMBER))
+        head = f"🕐 Trades digest · {len(closed)} closed, net {net:+.2f}" + (f" · mirror {sum(mir.values())} faults" if mir else "")
         text = (f"[{mode}] DIGEST {mins} min: opened {len(opened)}, closed {len(closed)} "
-                f"({wins} won), net {net:+.2f}")
+                f"({wins} won), net {net:+.2f}" + (f", mirror faults {dict((f'{k}:{c}', n) for (k, c), n in mir.items())}" if mir else ""))
         self.send(text, headline=head, card=build_card(head, mode, rows, "digest"))
+
+    def reversal(self, side: str, z: float, source: str, locked: int, block_bars: int, mode: str = "", model: str = "") -> None:
+        """The market moved against the book's net side (tb.reversal): winners' stops were tightened and new entries on that side
+        are blocked. Buffered into the trades digest (one row), or one message when digests are off."""
+        if self.digest_s > 0 and self.notifiers:
+            with self._dig_lock:
+                self._dig_rev.append((model, side, float(z), source, int(locked)))
+            if not (self._dig_thread and self._dig_thread.is_alive()):
+                self._dig_thread = threading.Thread(target=self._digest_loop, name="tb-alerts-digest", daemon=True)
+                self._dig_thread.start()
+            return
+        rows = [("Hurt side", f"{side.upper()}s (net exposure)", AMBER), ("Move", f"{source} z = {z:.1f} against them", RED),
+                ("Winners locked", f"{locked} stop(s) tightened", GREEN),
+                ("New entries", f"{side}s blocked for {block_bars} bars (5 min each)", AMBER)]
+        self.send(f"[{mode}] REVERSAL against {side}s: {source} z={z:.1f}; {locked} winner stop(s) tightened, new {side}s blocked "
+                  f"{block_bars} bars", dedupe_key=f"reversal:{model}:{side}", headline=f"↩️ Market reversal vs {side}s",
+                  card=build_card(f"↩️ Market reversal vs {side}s", mode, rows, "reversal"))
 
     def trade_opened(self, symbol: str, side: str, entry: float, qty: float, notional: float,
                      sl: float, tp: float, prob: float | None = None, mode: str = "") -> None:

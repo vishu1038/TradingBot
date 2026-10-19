@@ -156,7 +156,10 @@ def test_settings_get_put_merge(env):
                       "short_enabled", "prob_threshold_long", "prob_threshold_short", "corr_cap", "universe_size",
                       "universe_refresh_s", "universe_atr_bars", "universe_retention", "universe_whitelist", "kill_dd_pct", "dd_basis", "fee_taker", "sound", "capital_usd", "decision_every_bars", "cooldown_bars",
                           "max_trades_per_day", "entry_mode", "maker_timeout_s", "maker_reprices", "maker_on_timeout",
-                          "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac"}
+                          "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
+                          "mirror_enabled", "mirror_venue", "mirror_size",
+                          "min_tp_usd", "min_sl_usd", "max_net_exposure_pct", "reversal_z", "reversal_lock_r",
+                          "reversal_block_bars"}
     assert g["slice_margin_usd"] == 20 and g["leverage"] == 8 and g["trail"] == {"enabled": True, "activate_r": 1.5, "distance_atr": 1.0}
     r = c.put("/api/settings", json={"leverage": 5, "trail": {"enabled": False}, "short_enabled": True})
     assert r.status_code == 200 and r.json()["leverage"] == 5 and r.json()["trail"]["enabled"] is False

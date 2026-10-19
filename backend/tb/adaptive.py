@@ -181,11 +181,19 @@ class AdaptiveState:
         if not per["long"] and not per["short"]:
             return Decision()
         best: tuple[str, float] | None = None
+        best_m = 0.0
+        tied = False
         for sd, p, thr in (("long", pl, thr_l), ("short", ps, thr_s)):
             if sd == "short" and not short_enabled:
                 continue
-            if per[sd] and p >= thr + ent.ev_extra_conf and (best is None or p > best[1]):
-                best = (sd, p)
+            if per[sd] and p >= thr + ent.ev_extra_conf:
+                m = p - thr                              # margin over the side's own threshold; the larger one wins, a tie picks neither
+                if best is None or m > best_m:
+                    best, best_m, tied = (sd, p), m, False
+                elif m == best_m:
+                    tied = True
+        if tied:
+            best = None
         self._commit(sym, cs, bar, pl, ps, "event")
         if best is None:
             ev_all = {**per["long"], **{k: v for k, v in per["short"].items() if k not in per["long"]}}
@@ -213,11 +221,21 @@ class AdaptiveState:
         return {"last": dict(self.last) if self.last else None, **self.counts}
 
 
-def _pick(pl: float, ps: float, tl: float, ts: float, short_enabled: bool) -> tuple[str | None, float]:
+def pick_side(pl: float, ps: float, tl: float, ts: float, short_enabled: bool) -> tuple[str | None, float]:
+    """('long'|'short'|None, prob). Symmetric: when BOTH sides clear their threshold the larger margin over its own threshold
+    wins; an exactly equal margin picks neither (no built-in lean to long, user 2026-10-19)."""
     cand_l = pl >= tl
     cand_s = short_enabled and ps >= ts
-    if cand_l and (not cand_s or pl >= ps):
+    if cand_l and cand_s:
+        ml, ms = pl - tl, ps - ts
+        if ml == ms:
+            return None, 0.0
+        return ("long", pl) if ml > ms else ("short", ps)
+    if cand_l:
         return "long", pl
     if cand_s:
         return "short", ps
     return None, 0.0
+
+
+_pick = pick_side

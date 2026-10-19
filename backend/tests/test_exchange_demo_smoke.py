@@ -76,7 +76,8 @@ class MockBinance:
         if path == "/fapi/v1/order" and method == "POST":
             if q["type"] == "MARKET":
                 qty = float(q["quantity"])
-                if q.get("reduceOnly") == "true":
+                assert "reduceOnly" not in q                       # the bot never sends reduce-only orders
+                if self.pos and q["side"] == "SELL":               # a normal opposite order closes the position
                     self.pos = 0.0
                 else:
                     self.pos, self.entry = qty, 2400.0
@@ -85,14 +86,17 @@ class MockBinance:
                 return Resp(400, {"code": -4120, "msg": "Order type not supported for this endpoint. Please use the Algo Order API endpoints instead."})
             oid = self.nid()
             self.regular[oid] = {"orderId": oid, "symbol": "ETHUSDT", "type": q["type"], "side": q["side"], "stopPrice": q["stopPrice"],
-                                 "origQty": q["quantity"], "reduceOnly": True}
+                                 "origQty": "0", "closePosition": q.get("closePosition") == "true"}
+            assert "quantity" not in q and "reduceOnly" not in q
             return ok({"orderId": oid})
         if path == "/fapi/v1/algoOrder" and method == "POST":
             if self.fail_algo:
                 return Resp(400, {"code": -1102, "msg": "Mandatory parameter missing"})
             aid = self.nid()
             self.algos[aid] = {"algoId": aid, "symbol": "ETHUSDT", "orderType": q["type"], "side": q["side"],
-                               "triggerPrice": q["triggerPrice"], "quantity": q["quantity"], "reduceOnly": True}
+                               "triggerPrice": q["triggerPrice"], "quantity": "0",
+                               "closePosition": q.get("closePosition") == "true"}
+            assert "quantity" not in q and "reduceOnly" not in q
             return ok({"algoId": aid})
         if method == "DELETE":
             if path == "/fapi/v1/algoOrder":
@@ -140,12 +144,13 @@ def test_full_round_trip_with_algo_fallback(capsys):
     algo = [q for p, q in posts if p == "/fapi/v1/algoOrder"]
     assert [a["type"] for a in algo] == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]
     assert algo[0]["triggerPrice"] == "2280" and algo[1]["triggerPrice"] == "2520"
-    assert all(a["reduceOnly"] == "true" and a["workingType"] == "MARK_PRICE" and a["algoType"] == "CONDITIONAL" for a in algo)
+    assert all(a["closePosition"] == "true" and a["workingType"] == "MARK_PRICE" and a["algoType"] == "CONDITIONAL"
+               and "quantity" not in a and "reduceOnly" not in a for a in algo)
     assert "algo endpoint" in out and "found ['SL', 'TP']" in out
-    # cleaned up: orders cancelled, position closed reduce-only, nothing left
+    # cleaned up: orders cancelled, position closed with a normal market order, nothing left
     assert m.pos == 0 and not m.algos and not m.regular
     closing = [q for p, q in posts if p == "/fapi/v1/order" and q["type"] == "MARKET"][-1]
-    assert closing["side"] == "SELL" and closing["reduceOnly"] == "true"
+    assert closing["side"] == "SELL" and "reduceOnly" not in closing
     assert "all steps passed" in out and "THEKEY123" not in out and "THESECRET456" not in out
 
 

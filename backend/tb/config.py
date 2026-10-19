@@ -113,10 +113,13 @@ class Secrets:
 def load_secrets(env: Mapping[str, str] | None = None) -> Secrets:
     load_env()
     e = env if env is not None else os.environ
+    # TB_CHAT_PAUSED=1 mutes every Google Chat message (bot alerts, digests, checks, training notices) without
+    # removing the webhook; the dashboard over the tailnet is the live view meanwhile.
+    paused = e.get("TB_CHAT_PAUSED", "").strip().lower() in ("1", "true", "yes", "on")
     return Secrets(
         api_key=e.get("BINANCE_API_KEY", "").strip(),
         api_secret=e.get("BINANCE_API_SECRET", "").strip(),
-        chat_webhook=e.get("GOOGLE_CHAT_WEBHOOK_URL", "").strip(),
+        chat_webhook="" if paused else e.get("GOOGLE_CHAT_WEBHOOK_URL", "").strip(),
     )
 
 
@@ -177,6 +180,8 @@ CONTRACT_KEYS = (
     "decision_every_bars", "cooldown_bars", "max_trades_per_day", "entry_mode", "maker_timeout_s",
     "maker_reprices", "maker_on_timeout",
     "breakeven_r", "sl_cooldown_bars", "max_side_risk_pct", "partial_tp_r", "partial_tp_frac",
+    "min_tp_usd", "min_sl_usd", "max_net_exposure_pct", "reversal_z", "reversal_lock_r", "reversal_block_bars",
+    "mirror_enabled", "mirror_venue", "mirror_size",
 )
 
 
@@ -195,9 +200,9 @@ class Settings:
     tp_atr: float = 1.5
     sl_atr: float = 1.0
     trail: TrailCfg = TrailCfg()
-    short_enabled: bool = False
+    short_enabled: bool = True          # symmetric long/short (2026-10-19): the side is decided by the model's data, not a built-in lean
     prob_threshold_long: float = 0.70
-    prob_threshold_short: float = 0.80
+    prob_threshold_short: float = 0.70  # == prob_threshold_long: no side is favoured by the defaults
     corr_cap: CorrCap = CorrCap()
     universe_size: int = 8
     universe_refresh_s: int = 3600
@@ -223,6 +228,19 @@ class Settings:
     max_side_risk_pct: float = 60.0     # open stop-out risk of ONE side (longs or shorts), incl. a new entry, <= this % of the open-risk budget
     partial_tp_r: float = 1.5           # at this favourable move (x initial risk) close partial_tp_frac of the position; 0 = off
     partial_tp_frac: float = 0.5        # share of the quantity closed by the partial take-profit (once per position)
+    # ---- testnet mirror (docs/ARCHITECTURE.md "Testnet mirror"; tb/mirror.py). Every order action of the PAPER book is also sent,
+    # one-way, to the Binance futures testnet at minimum size, only to exercise the real order path. Never touches the paper book.
+    mirror_enabled: bool = False
+    mirror_venue: str = "binance_demo"  # the only venue for now ("live" is refused)
+    mirror_size: str = "min"            # smallest qty satisfying the venue's lot step AND min notional (+ a small margin)
+    # ---- dollar floor (user 2026-10-19): a trade whose TP or SL spans fewer USD than this is SKIPPED, never shrunk below it
+    min_tp_usd: float = 2.0             # dollar move to the take-profit for the ACTUAL qty (after derating / caps); 0 = off. Also the floor of a partial take-profit's gain
+    min_sl_usd: float = 2.0             # dollar move to the stop-loss for the actual qty; 0 = off
+    # ---- reversal protection (docs/ARCHITECTURE.md "Reversal protection"; tb/reversal.py, same maths in engine, shadow and tb.sim)
+    max_net_exposure_pct: float = 150.0  # |sum(side x notional x beta_vs_BTC)| <= this % of equity; an entry that reduces |net| is always allowed; 0 = off
+    reversal_z: float = 2.5             # basket (universe / BTC) 15 min or 1 h move AGAINST the book's net side with z >= this: lock winners, block that side; 0 = off
+    reversal_lock_r: float = 0.5        # only positions in profit >= this many initial risks get their stop tightened
+    reversal_block_bars: int = 6        # no NEW entries on the hurt side for this many 5m bars after a reversal signal
     # ---- engine-internal (not part of the API contract; stored but not exposed)
     paper_start_equity: float = 100.0
     slippage_pct: float = 0.0002        # market-order slippage (fraction)
@@ -317,6 +335,13 @@ class Settings:
         chk(1 <= self.max_side_risk_pct <= 100, "max_side_risk_pct must be 1..100")
         chk(0 <= self.partial_tp_r <= 20, "partial_tp_r must be 0..20 (0 = off)")
         chk(0.05 <= self.partial_tp_frac <= 0.95, "partial_tp_frac must be 0.05..0.95")
+        chk(0 <= self.min_tp_usd <= 10_000, "min_tp_usd must be 0..10000 (0 = off)")
+        chk(0 <= self.min_sl_usd <= 10_000, "min_sl_usd must be 0..10000 (0 = off)")
+        chk(self.max_net_exposure_pct == 0 or 10 <= self.max_net_exposure_pct <= 10_000,
+            "max_net_exposure_pct must be 0 (off) or 10..10000")
+        chk(self.reversal_z == 0 or 0.5 <= self.reversal_z <= 10, "reversal_z must be 0 (off) or 0.5..10")
+        chk(0 <= self.reversal_lock_r <= 20, "reversal_lock_r must be 0..20")
+        chk(0 <= self.reversal_block_bars <= 1000, "reversal_block_bars must be 0..1000")
         chk(self.trail.activate_r > 0 and self.trail.distance_atr > 0, "trail values must be > 0")
         chk(0 <= self.prob_threshold_long <= 1, "prob_threshold_long must be 0..1")
         chk(0 <= self.prob_threshold_short <= 1, "prob_threshold_short must be 0..1")
@@ -335,6 +360,9 @@ class Settings:
         chk(self.paper_start_equity > 0, "paper_start_equity must be > 0")
         chk(self.dd_basis in ("start", "peak"), "dd_basis must be 'start' or 'peak'")
         chk(self.capital_usd is None or self.capital_usd > 0, "capital_usd must be > 0 or null")
+        chk(self.mirror_venue != "live", "mirror_venue 'live' is refused: the mirror sends orders to the demo/testnet only")
+        chk(self.mirror_venue == "binance_demo", "mirror_venue must be binance_demo")
+        chk(self.mirror_size == "min", "mirror_size must be min")
 
 
 LIVE_KILL_DD_PCT = 25.0

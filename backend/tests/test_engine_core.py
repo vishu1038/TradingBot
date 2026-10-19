@@ -104,7 +104,7 @@ def test_open_places_stop_and_tp_and_records_state(store, tmp_path):
     assert (px - p["sl_price"]) * p["qty"] == pytest.approx(10.0, abs=0.1)      # -10 USD at the stop
     assert (p["tp_price"] - px) * p["qty"] == pytest.approx(5.0, abs=0.1)       # +5 USD at the target
     orders = eng.ex.open_conditional_orders("AAAUSDT")
-    assert {o.kind for o in orders} == {"SL", "TP"} and all(o.reduce_only for o in orders)
+    assert {o.kind for o in orders} == {"SL", "TP"} and all(o.close_position for o in orders)
     types = [e["type"] for e in store.events_after(0)]
     assert "position_opened" in types
     eng.alerts.flush(2)
@@ -300,6 +300,7 @@ def test_drawdown_derating_halves_size(store, tmp_path):
     eng2, _ = mk_engine(store, tmp_path)
     store.execute("DELETE FROM positions")
     eng2.ex.pos.clear()
+    eng2.ex.conds.clear()
     eng2.start_equity = eng2.peak_equity = eng2.equity / 0.6                  # 40% drawdown vs the 50% paper kill limit -> x0.5
     mult, parts = eng2.risk_multiplier()
     assert mult == pytest.approx(0.5) and parts["dd_pct"] == pytest.approx(40.0)
@@ -441,7 +442,7 @@ def test_new_bar_scores_records_signal_and_opens(store, tmp_path):
 
 
 def test_threshold_and_short_rules(store, tmp_path):
-    eng, data = mk_engine(store, tmp_path)
+    eng, data = mk_engine(store, tmp_path, settings={"short_enabled": False})     # (shorts are ON by default since 2026-10-19)
     eng.scorer = FixedScorer(0.69, 0.79)
     eng.model_info = S.ModelInfo("fixed", "1", None, 0.7, 0.8)
     run(eng.bars_cycle())

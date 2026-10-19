@@ -94,3 +94,22 @@ def always_long_every_n(n: int, offset: int = 0) -> Callable:
 
     gen.carries_probabilities = False  # type: ignore[attr-defined]
     return gen
+
+
+def every_n_entries(n: int, side: str = "both", offset: int = 0) -> Callable:
+    """Baseline: a trigger on every n-th bar. ``side`` 'long' | 'short' | 'both' (both alternates long / short on successive
+    triggers of a symbol - no built-in lean to either side, user 2026-10-19). Deterministic per symbol."""
+    if n < 1:
+        raise ValueError("n >= 1")
+    if side not in ("long", "short", "both"):
+        raise ValueError(side)
+
+    def gen(symbol: str, kl: pd.DataFrame):
+        i = np.arange(len(kl))
+        trig = ((i - offset) % n == 0) & (i >= offset)
+        k = np.cumsum(trig) - 1                                  # index of the trigger
+        pick_long = np.ones(len(kl), bool) if side == "long" else np.zeros(len(kl), bool) if side == "short" else (k % 2 == 0)
+        return np.where(trig & pick_long, 1.0, 0.0), np.where(trig & ~pick_long, 1.0, 0.0)
+
+    gen.carries_probabilities = False  # type: ignore[attr-defined]
+    return gen

@@ -70,7 +70,7 @@ def test_known_binance_doc_vector():
 
 def test_market_order_request_construction():
     ex, s = mk(Resp(200, {"orderId": 11, "status": "FILLED", "executedQty": "0.067", "avgPrice": "2364.5"}))
-    res = ex.market_order("ETHUSDT", "buy", 0.06789, reduce_only=False)
+    res = ex.market_order("ETHUSDT", "buy", 0.06789)
     c = s.calls[0]
     assert c["method"] == "POST" and urlsplit(c["url"]).path == "/fapi/v1/order"
     assert c["headers"]["X-MBX-APIKEY"] == "KEY123"
@@ -82,10 +82,10 @@ def test_market_order_request_construction():
     assert res.order_id == "o:11" and res.avg_price == 2364.5 and res.qty == pytest.approx(0.067)
 
 
-def test_reduce_only_flag_and_min_qty():
+def test_closing_market_order_is_a_normal_order_and_min_qty():
     ex, s = mk(Resp(200, {"orderId": 1, "status": "FILLED", "executedQty": "1", "avgPrice": "1"}))
-    ex.market_order("ETHUSDT", "SELL", 1.0, reduce_only=True)
-    assert qs(s.calls[0])["reduceOnly"] == "true"
+    ex.market_order("ETHUSDT", "SELL", 1.0)
+    assert "reduceOnly" not in qs(s.calls[0]) and qs(s.calls[0])["quantity"] == "1"
     with pytest.raises(ExchangeError):
         ex.market_order("ETHUSDT", "SELL", 0.0004)           # below min_qty after rounding
 
@@ -95,8 +95,9 @@ def test_stop_order_legacy_endpoint_params():
     oid = ex.place_stop("ETHUSDT", "SELL", 2215.555, 0.067)
     q = qs(s.calls[0])
     assert urlsplit(s.calls[0]["url"]).path == "/fapi/v1/order" and oid == "o:77"
-    assert (q["type"], q["side"], q["stopPrice"], q["quantity"]) == ("STOP_MARKET", "SELL", "2215.56", "0.067")
-    assert q["reduceOnly"] == "true" and q["workingType"] == "MARK_PRICE"
+    assert (q["type"], q["side"], q["stopPrice"]) == ("STOP_MARKET", "SELL", "2215.56")
+    assert q["closePosition"] == "true" and q["workingType"] == "MARK_PRICE"
+    assert "quantity" not in q and "reduceOnly" not in q                  # the TP/SL checkbox: close whatever is open
 
 
 def test_algo_switch_fallback_on_minus_4120():
@@ -107,7 +108,8 @@ def test_algo_switch_fallback_on_minus_4120():
     assert [urlsplit(c["url"]).path for c in s.calls] == ["/fapi/v1/order", "/fapi/v1/algoOrder"]
     q = qs(s.calls[1])
     assert q["algoType"] == "CONDITIONAL" and q["type"] == "STOP_MARKET" and q["triggerPrice"] == "2215.55"
-    assert "stopPrice" not in q and q["reduceOnly"] == "true" and q["workingType"] == "MARK_PRICE"
+    assert "stopPrice" not in q and q["closePosition"] == "true" and q["workingType"] == "MARK_PRICE"
+    assert "quantity" not in q and "reduceOnly" not in q
     assert q["clientAlgoId"].startswith("tb")
     # once switched, the legacy endpoint is not tried again
     ex.place_take_profit("ETHUSDT", "SELL", 2439.43, 0.067)

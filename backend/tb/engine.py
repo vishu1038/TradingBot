@@ -34,14 +34,16 @@ from .alerts import AlertDispatcher
 from .config import (LiveNotAllowed, Settings, db_path, load_secrets, models_dir, resolve_mode, trading_base_url,
                      PROD_BASE)
 from .adaptive import AdaptiveState, Decision
+from .adaptive import pick_side as _pick_side
 from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, next_decision_ms, next_rebalance_ms, rebalance_slot
-from .emergency import (Backoff, emergency_close, liq_clear, liq_map, liq_mark, liquidation_reason, reduce_rejected,
+from .emergency import (Backoff, close_flat, emergency_close, liq_clear, liq_map, liq_mark, liquidation_reason,
                         transient)
 from .exchange.base import CloseInfo, Exchange, ExchangeError, NetworkError, RateLimitError, opposite, order_side
 from .exits import SETTINGS_SPEC, ExitSpec, exit_atr, resolve_exit
 from .exits import bind as bind_exit
-from .protect import (MIN_STEP as PROTECT_MIN_STEP, Protect, breakeven_price, is_loss_exit, next_stop, partial_level,
-                      partial_split, tighter)
+from .protect import (MIN_STEP as PROTECT_MIN_STEP, Protect, breakeven_price, is_loss_exit, next_stop, partial_gain_ok,
+                      partial_level, partial_split, tighter)
+from .reversal import ReversalBook, ReversalCfg, beta_vs_btc, lock_stop, market_signal, net_side as _net_side, signed_net
 from .risk import (Book, atr14, check_entry, correlation_gate, dd_reference, derate_multiplier, drawdown_pct, kill_tripped, levels,
                    maintenance_margin, positions_without_stop, size_trade, sl_loss, slots_fit)
 from .safety import (DEGRADED, NORMAL, DriftMonitor, FaultTracker, check_bars, check_tick, merged_safety,
@@ -50,6 +52,7 @@ from .scorer import (KIND_PER_SYMBOL, FrameBundle, ModelInfo, NullScorer, Score,
                      per_symbol_window, reasons_to_dicts, scan_models, score_frames)
 from .shadow import Registry, ShadowBook, promotion_check, shadow_stats
 from .store import Store
+from .mirror import Mirror
 from . import capital as cap
 from . import guard as guard_mod
 
@@ -69,6 +72,9 @@ SYNC_LIVE_S = 5.0
 DEPTH_MIN_AGE_S = 10.0            # per-symbol order-book refresh period (8 symbols -> <= 0.8 weight-20 calls/s = ~960/min)
 DEPTH_WEIGHT_CEILING = 1500       # skip depth fetches while the minute's used weight is above this (limit 2400)
 BRACKET_TTL_S = 3600.0
+BETA_TTL_S = 3600.0               # a coin's beta vs BTC (7 days of 1h returns) is refreshed hourly ...
+BETA_RETRY_S = 300.0              # ... a failed fetch is retried after this long (meanwhile the old value, or 1.0)
+BETA_FETCH_PER_CYCLE = 3          # at most this many 1h-kline requests per bars cycle
 PROTECT_RETRY_S = 30.0            # after a failed stop move / partial take-profit / resize: wait this long before retrying
 
 
@@ -242,6 +248,15 @@ class Engine:
         self.liquidating: set[str] = set()
         self._alerted: set[str] = set()
         self._uni_sig: tuple | None = None                     # whitelist the current universe was built from
+        # testnet mirror (tb.mirror): a one-way follower of the paper book's order actions; inert unless settings.mirror_enabled
+        self.mirror = Mirror(store, self.alerts, lambda: self.cfg, mode=mode, clock=clock)
+        # reversal protection (tb.reversal): beta vs BTC per symbol (fetched hourly from 1h klines; missing = 1.0) and the
+        # block / lock windows of the live book (persisted in kv "reversal"), the newest basket signal
+        self.betas: dict[str, tuple[float, float]] = {}        # symbol -> (fetched_at, beta)
+        self.rev = ReversalBook()
+        self.rev.load(store.kv_get("reversal"))
+        self.rev_sig = None
+        self._rev_key: tuple | None = None
 
     # ================================================================== helpers
     async def io(self, fn: Callable, *a: Any, **kw: Any) -> Any:
@@ -687,6 +702,7 @@ class Engine:
         self.xsec_book.pop(pos["symbol"], None)
         self.time_stops.pop(str(pos["id"]), None)
         self.event("position_closed", {**trade, "id": tid})
+        self.mirror.on_close(pos["id"], pos["symbol"], reason, emergency=reason in ("kill", "liquidation"))
         log.info("closed %s %s %s: net pnl %+.3f (gross %+.3f, fees %.3f, funding cost %+.3f) %s", pos["symbol"], pos["side"],
                  pos["qty"], net, info.pnl, info.fees, info.funding_cost, reason)
         self.alerts.trade_closed(pos["symbol"], pos["side"], pos["entry_price"], info.exit_price, net,
@@ -709,38 +725,31 @@ class Engine:
                 self.alerts.send(f"[{self.mode}] {msg}", dedupe_key=f"drift{self.drift.level}")
 
     async def close_position(self, pos: dict, reason: str, emergency: bool = False) -> bool:
-        """Close at market (reduce-only), then clear leftover orders. Caller holds tlock.
+        """Close at market with a NORMAL order (no reduce-only anywhere), then clear leftover orders. Caller holds tlock.
 
         Per-symbol robust: a position the venue is liquidating gets no order; a failing close backs off (5 s .. 5 min,
-        reset on success) and is logged / alerted once per step; a reduce-only close the venue rejects with -2022 goes
-        through ``tb.emergency.emergency_close`` (cancel the symbol's reduce-only stops, retry, then one plain MARKET of
-        exactly the quantity the exchange reports). ``emergency=True`` (stop missing / beyond its stop) cancels the stops
-        first."""
+        reset on success) and is logged / alerted once per step. The close goes through ``tb.emergency.close_flat`` under the
+        symbol's lock: it re-reads the position, sends a market order for exactly the quantity the exchange reports and
+        verifies it is flat (a reverse position left by a racing stop is flattened and alerted). ``emergency=True`` (stop
+        missing / beyond its stop) cancels the TP/SL first."""
         sym = pos["symbol"]
         key = ("close", sym)
         if sym in self.liquidating:
             return False
         if not self.backoff.ready(key, self.clock()):
             return False
-        res = None
-        if not emergency:
-            try:
-                res = await self.io(self.ex.market_order, sym, opposite(order_side(pos["side"])), pos["qty"], True)
-            except ExchangeError as e:
-                if not reduce_rejected(e):
-                    self._bo_fail(key, sym, "close", e)
-                    return False
-                log.warning("close %s: reduce-only close rejected (%s); using the emergency close", sym, e)
-        if res is None:
-            out = await self.io(emergency_close, self.ex, sym, cancel_first=emergency, say=log.warning)
-            if out.liquidation:
-                self.liquidating.add(sym)
-                log.error("close %s skipped: %s", sym, out.detail)
-                return False
-            if not out.ok:
-                self._bo_fail(key, sym, "close", out.detail)
-                return False
-            res = out.result
+        out = await self.io(close_flat, self.ex, sym, cancel_first=emergency, say=log.warning)
+        if out.flipped:
+            self.alerts.engine_error("close_flip", f"{sym}: the close opened a reverse position (a stop filled in between); "
+                                                   f"it was flattened ({out.detail})")
+        if out.liquidation:
+            self.liquidating.add(sym)
+            log.error("close %s skipped: %s", sym, out.detail)
+            return False
+        if not out.ok:
+            self._bo_fail(key, sym, "close", out.detail)
+            return False
+        res = out.result
         self._bo_ok(key, sym)
         info = None
         for _ in range(4):
@@ -798,18 +807,16 @@ class Engine:
         """Market-close an unprotected / unwanted fill and record the flat round trip (fees are real). True if flat."""
         ex = self.ex
         close_side = opposite(order_side(side))
-        try:
-            await self.io(ex.market_order, sym, close_side, qty, True)
-            await self.io(ex.cancel_all, sym)
-        except ExchangeError as e:
-            # one coin that cannot be closed must not take the account down (no kill switch): the emergency close
-            # (cancel reduce-only stops, retry, plain market of the reported quantity); if even that fails the untracked
-            # position is retried with backoff by the reconcile (and the guard) - alerted once.
-            out = await self.io(emergency_close, ex, sym, cancel_first=True, say=log.warning)
-            if not out.ok:
-                if not out.liquidation:
-                    self._bo_fail(("recon", sym), sym, "EMERGENCY CLOSE of an unprotected fill", f"{e}; {out.detail}")
-                return False
+        # one coin that cannot be closed must not take the account down (no kill switch): ``close_flat`` re-reads the position,
+        # sends a normal market order for the reported quantity and verifies; if even that fails the untracked position is
+        # retried with backoff by the reconcile (and the guard) - alerted once.
+        out = await self.io(close_flat, ex, sym, cancel_first=True, say=log.warning)
+        if not out.ok:
+            if not out.liquidation:
+                self._bo_fail(("recon", sym), sym, "EMERGENCY CLOSE of an unprotected fill", out.detail)
+            return False
+        if out.flipped:
+            self.alerts.engine_error("close_flip", f"{sym}: closing the unprotected fill opened a reverse position; flattened")
         info = None
         try:
             info = await self.io(ex.last_close, sym, side, int(self.clock() * 1000) - 60_000)
@@ -837,7 +844,7 @@ class Engine:
             if lev is None:
                 return False
             try:
-                res = await self.io(ex.market_order, sym, osd, sz.qty, False)
+                res = await self.io(ex.market_order, sym, osd, sz.qty)
             except ExchangeError as e:
                 log.error("entry order failed for %s: %s", sym, e)
                 return False
@@ -916,6 +923,7 @@ class Engine:
         if self.mode == "live":
             self.store.kv_set("live_trades_opened", int(self.store.kv_get("live_trades_opened", 0) or 0) + 1)
         self.event("position_opened", {**pos, "id": pid})
+        self.mirror.on_open(pid, pos, via_maker=via_maker)
         log.info("opened %s %s qty=%s @ %s SL %s TP %s prob=%.3f mult=%.2f%s", side, sym, qty, fill_px, sl, tp, prob, mult,
                  " (maker)" if via_maker else "")
         self.alerts.trade_opened(sym, side, fill_px, qty, qty * fill_px, sl, tp or 0.0, prob, self.mode)
@@ -1046,7 +1054,7 @@ class Engine:
         ms["timeouts"] += 1
         if entry.maker_on_timeout == "taker" and self.entry_allowed(sym):
             try:
-                res = await self.io(ex.market_order, sym, osd, want, False)
+                res = await self.io(ex.market_order, sym, osd, want)
             except ExchangeError as e:
                 log.error("taker fallback for %s failed: %s", sym, e)
                 ms["skipped"] += 1
@@ -1072,25 +1080,118 @@ class Engine:
         self.brackets[sym] = (self.clock(), tiers)
         return tiers
 
+    # ---- reversal protection (tb.reversal; docs/ARCHITECTURE.md "Reversal protection")
+    def beta_of(self, sym: str) -> float:
+        """Beta of ``sym`` vs BTC from the last 7 days of 1h returns; 1.0 until fetched / when it cannot be estimated."""
+        ent = self.betas.get(sym)
+        return ent[1] if ent else 1.0
+
+    async def _klines_1h(self, sym: str) -> tuple[np.ndarray, np.ndarray]:
+        df = await self.io(self.data.klines, sym, "1h", 170)
+        df = df[df["open_time"] + 3_600_000 <= self.now_ms()] if len(df) else df
+        return df["open_time"].to_numpy(), df["close"].to_numpy()
+
+    async def refresh_betas(self) -> None:
+        """Re-estimate the beta of every watched / held coin (hourly, <= BETA_FETCH_PER_CYCLE requests per call, none while the
+        request weight is high). A failed fetch keeps the previous value (or 1.0) and is retried after BETA_RETRY_S."""
+        cfg = self.cfg
+        if cfg.max_net_exposure_pct <= 0:
+            return
+        now = self.clock()
+        self.betas["BTCUSDT"] = (now, 1.0)
+        due = [s for s in self.watchlist() if s != "BTCUSDT" and now - self.betas.get(s, (-1e9, 1.0))[0] >= BETA_TTL_S]
+        if due and getattr(self.data, "used_weight", 0) <= HISTORY_WEIGHT_CEILING:
+            try:
+                btc = await self._klines_1h("BTCUSDT")
+            except ExchangeError as e:
+                log.warning("beta: BTC 1h klines unavailable (%s); betas stay as they are", e)
+                btc = None
+            for sym in due[:BETA_FETCH_PER_CYCLE] if btc is not None else []:
+                try:
+                    t, c = await self._klines_1h(sym)
+                    self.betas[sym] = (now, beta_vs_btc(t, c, btc[0], btc[1]))
+                except ExchangeError as e:
+                    log.warning("beta: %s 1h klines unavailable (%s); keeping %.2f", sym, e, self.beta_of(sym))
+                    self.betas[sym] = (now - BETA_TTL_S + BETA_RETRY_S, self.beta_of(sym))
+        self.shadow.betas = {s: b for s, (_t, b) in self.betas.items()}
+
+    def net_exposure(self) -> float:
+        """Signed beta-weighted notional of the open positions and in-flight entries (+ long / - short)."""
+        return signed_net([(p["side"], p["notional"], self.beta_of(p["symbol"])) for p in self._db_positions()]
+                          + [(r.get("side", "long"), r["notional"], self.beta_of(s)) for s, r in self.pending.items()])
+
+    def reversal_step(self) -> None:
+        """Basket reversal detector for the live book and every shadow book. Cached per newest bar of the universe: a no-op until
+        a new closed 5m bar arrived. When the equal-weight universe / BTC moved against the book's net side by z >= reversal_z
+        (15 min or 1 h): new entries on that side are blocked (``self.rev``) and the winners' stops get tightened (``_protect``
+        does the live exchange-side move, ``ShadowBook.apply_reversal`` the shadow ones)."""
+        cfg = self.cfg
+        rc = ReversalCfg.from_settings(cfg)
+        if not rc.detector_on:
+            return
+        now_ms = self.now_ms()
+        frames: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        key: list = []
+        for s in dict.fromkeys([*self.universe, "BTCUSDT"]):
+            k = self.kl.get(s)
+            if k is None or self.faults.excluded(s):
+                continue
+            c = k[k["open_time"] + BAR_MS <= now_ms].tail(700)
+            if len(c) < 120:
+                continue
+            frames[s] = (c["open_time"].to_numpy(), c["close"].to_numpy())
+            key.append((s, int(c["open_time"].iloc[-1])))
+        if tuple(key) == self._rev_key:
+            return
+        self._rev_key = tuple(key)
+        btc = frames.get("BTCUSDT")
+        uni = {s: v for s, v in frames.items() if s in self.universe}
+        sig = market_signal(uni, btc)
+        self.rev_sig = sig
+        if sig is None:
+            return
+        side = _net_side(self.net_exposure(), self.equity)
+        tr = self.rev.step(sig, side, rc)
+        if tr is not None:
+            n_win = sum(1 for p in self._db_positions() if p["side"] == tr["side"]
+                        and lock_stop(p["side"], p["entry_price"], p.get("init_sl_price") or p["sl_price"], p["sl_price"],
+                                      self.marks.get(p["symbol"]) or 0.0, cfg.fee_taker, cfg.reversal_lock_r) is not None)
+            self.store.kv_set("reversal", self.rev.to_dict())
+            if tr["new"]:
+                msg = (f"MARKET REVERSAL against the {tr['side']} book: {tr['source']} z={tr['z']:.1f} >= {rc.z:g}; "
+                       f"{n_win} winner stop(s) to tighten, new {tr['side']}s blocked for {rc.block_bars} bars")
+                log.warning(msg)
+                self.event("reversal", {"model": "", "side": tr["side"], "z": tr["z"], "source": tr["source"], "locked": n_win,
+                                        "block_bars": rc.block_bars, "until": int(tr["until_ms"] // 1000)})
+                self.alerts.reversal(tr["side"], tr["z"], tr["source"], n_win, rc.block_bars, self.mode)
+        for ev in self.shadow.apply_reversal(sig, self.marks, now_ms):
+            if ev["new"]:
+                log.info("shadow %s: market reversal against its %s book (%s z=%.1f): %d stop(s) tightened, new %ss blocked",
+                         ev["model"], ev["side"], ev["source"], ev["z"], ev["locked"], ev["side"])
+                self.event("reversal", {"model": ev["model"], "side": ev["side"], "z": ev["z"], "source": ev["source"],
+                                        "locked": ev["locked"], "block_bars": rc.block_bars, "until": int(ev["until_ms"] // 1000)})
+
     def book(self) -> Book:
         """Account aggregates over the open positions AND the in-flight maker entries (cached brackets; no I/O)."""
-        n = mm = risk = 0.0
+        n = mm = risk = net = 0.0
         by_side = {"long": 0.0, "short": 0.0}
         for p in self._db_positions():
             ent = self.brackets.get(p["symbol"])
             n += p["notional"]
+            net += (1.0 if p["side"] == "long" else -1.0) * p["notional"] * self.beta_of(p["symbol"])
             mm += maintenance_margin(p["notional"], ent[1] if ent else None, self.cfg.maint_margin_rate)
             r = sl_loss(self.cfg, p["qty"], p["entry_price"], p["sl_price"], p["side"])
             risk += r
             by_side[p["side"]] = by_side.get(p["side"], 0.0) + r
         reserved = 0.0
-        for r in self.pending.values():          # a resting post-only entry already counts against every cap
+        for psym, r in self.pending.items():     # a resting post-only entry already counts against every cap
             n += r["notional"]
+            net += (1.0 if r.get("side", "long") == "long" else -1.0) * r["notional"] * self.beta_of(psym)
             mm += r["mm"]
             risk += r["risk"]
             by_side[r.get("side", "long")] = by_side.get(r.get("side", "long"), 0.0) + r["risk"]
             reserved += r["margin"]
-        return Book(self.equity, self.available - reserved, n, mm, risk, by_side["long"], by_side["short"])
+        return Book(self.equity, self.available - reserved, n, mm, risk, by_side["long"], by_side["short"], net)
 
     async def try_open(self, sym: str, side: str, prob: float, reasons: list, closed: pd.DataFrame, *,
                        neutral: bool = False, spec: ExitSpec | None = None, entry: EntryCfg | None = None) -> bool:
@@ -1115,6 +1216,12 @@ class Engine:
                 return False
             if cfg.max_positions is not None and len(positions) + len(self.pending) >= cfg.max_positions:
                 log.info("skip %s %s: blocked by max_positions=%d", side, sym, cfg.max_positions)
+                return False
+            self.reversal_step()
+            if self.rev.blocked(side, self.now_ms()):
+                last = self.rev.last or {}
+                log.info("skip %s %s: new %s entries are blocked after a market reversal signal (z %.1f, %s)", side, sym, side,
+                         float(last.get("z", 0.0)), last.get("source", "?"))
                 return False
             atr = exit_atr(spec, closed, self.now_ms())
             ref = self.marks.get(sym) or float(closed["close"].iloc[-1])
@@ -1143,13 +1250,14 @@ class Engine:
             brackets = await self.get_brackets(sym)
             bk = self.book()
             eff = spec.effective(cfg)
-            sz = size_trade(eff, side, ref, spec.atr_arg(atr, ref), f, bk.available, risk_mult=mult, brackets=brackets)
+            sz = size_trade(eff, side, ref, spec.atr_arg(atr, ref), f, bk.available, risk_mult=mult, brackets=brackets,
+                            tp_floor=spec.tp_enabled)               # (dollar floor inside: skipped, never shrunk below it)
             if not sz.ok:
                 log.info("skip %s %s: %s (risk mult %.2f)", side, sym, sz.reason, mult)
                 return False
             fee = sz.notional * cfg.fee_taker
             new_risk = sl_loss(cfg, sz.qty, sz.entry, sz.sl_price, side, entry_fee=True)
-            chk = check_entry(cfg, bk, sz.notional, sz.mm, new_risk, sz.margin, fee, side)
+            chk = check_entry(cfg, bk, sz.notional, sz.mm, new_risk, sz.margin, fee, side, beta=self.beta_of(sym))
             if not chk.ok:
                 log.info("skip %s %s: blocked by rule %s (%s)", side, sym, chk.rule, chk.detail)
                 return False
@@ -1525,6 +1633,10 @@ class Engine:
         atr = self._pos_atr(pos, sym) if pc.trail_enabled else None
         active, new_sl, why = next_stop(side, entry, pos["init_sl_price"], sl_cur, best, atr, bool(pos["trail_active"]), pc)
         new_sl = f.round_price(new_sl)
+        if self.rev.locking(side, self.now_ms()):        # market reversal against the book: lock the winners of the hurt side
+            lk = lock_stop(side, entry, pos["init_sl_price"], new_sl, m, self.cfg.fee_taker, self.cfg.reversal_lock_r)
+            if lk is not None and (f.round_price(lk) - new_sl) * d > 0:
+                new_sl, why = f.round_price(lk), "reversal"
         if active and not pos["trail_active"]:
             upd["trail_active"] = True
         if why and (new_sl - sl_cur) * d > max(f.tick_size, PROTECT_MIN_STEP * entry) and st.get("bar") != bar \
@@ -1533,12 +1645,15 @@ class Engine:
                 await self.close_position({**pos, **upd, "trail_active": active}, "trail" if active else "sl")
                 return True
             try:
-                new_id, stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, new_sl, pos["qty"],
-                                              pos.get("sl_order_id"))
+                new_id, stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, new_sl, None,
+                                              pos.get("sl_order_id"), old_price=sl_cur)
             except ExchangeError as e:
                 st["fail_t"] = now
-                log.error("%s stop move %s -> %s FAILED (%s); the old stop stays live, retry in %.0fs", sym, sl_cur, new_sl, e,
-                          PROTECT_RETRY_S)
+                rid = getattr(e, "restored_id", None)             # the old level was re-placed under a NEW order id
+                if rid:
+                    upd["sl_order_id"] = rid
+                log.error("%s stop move %s -> %s FAILED (%s); the old level is back (or the stop invariant re-places it), "
+                          "retry in %.0fs", sym, sl_cur, new_sl, e, PROTECT_RETRY_S)
             else:
                 st["bar"] = bar
                 st.pop("fail_t", None)
@@ -1550,6 +1665,7 @@ class Engine:
                 self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": new_sl, "trail_active": active,
                                                 "trail_price": upd.get("trail_price", pos.get("trail_price"))})
                 log.info("%s stop -> %s (%s; was %s, price %s)", sym, new_sl, why, sl_cur, m)
+                self.mirror.on_stop_move(pos["id"], sym, new_sl)
         # ---- partial take-profit (once per position; not for cross-sectional legs, which close on the rebalance)
         if not st.get("partial") and sym not in self.xsec_book:
             lvl = partial_level(side, entry, pos["init_sl_price"], pos.get("tp_price"), pc)
@@ -1558,7 +1674,7 @@ class Engine:
         return False
 
     async def _partial_tp(self, pos: dict, m: float, d: int, upd: dict, st: dict, f, pc: Protect, now: float) -> None:
-        """Close ``partial_tp_frac`` of the position with a reduce-only market order, book it as its own trade (exit reason
+        """Close ``partial_tp_frac`` of the position with a normal market order, book it as its own trade (exit reason
         "partial", NET pnl: fees and funding are costs), then resize the exchange stop / TP to the remainder."""
         sym, side, entry = pos["symbol"], pos["side"], pos["entry_price"]
         split = partial_split(pos["qty"], m, pc.partial_tp_frac, f)
@@ -1568,8 +1684,14 @@ class Engine:
                      sym, pos["qty"], pc.partial_tp_frac)
             return
         q, _ = split
+        lvl = partial_level(side, entry, pos["init_sl_price"], pos.get("tp_price"), pc)
+        if lvl is not None and not partial_gain_ok(side, entry, lvl, q, pc):
+            st["partial"] = "skipped"             # dollar floor: the piece would gain < min_tp_usd -> no partial, run to the full TP
+            log.info("partial take-profit skipped for %s: the %s closed at %.2fR would gain < $%g (min_tp_usd); running to the full TP",
+                     sym, q, pc.partial_tp_r, pc.min_tp_usd)
+            return
         try:
-            res = await self.io(self.ex.market_order, sym, opposite(order_side(side)), q, True)
+            res = await self.io(self.ex.market_order, sym, opposite(order_side(side)), q)      # a normal order: no reduce-only
         except ExchangeError as e:
             st["pfail_t"] = now
             log.error("partial take-profit order for %s failed: %s; retry in %.0fs", sym, e, PROTECT_RETRY_S)
@@ -1603,47 +1725,39 @@ class Engine:
                  side, sym, filled, filled + rem, px, pc.partial_tp_r, net, gross, fees, info.funding_cost)
         self.alerts.trade_closed(sym, side, entry, px, net, fees, "partial", self.mode)
         await self._resize_orders(pos, st, upd, now)
+        self.mirror.on_partial(pos["id"], sym, frac, pos.get("sl_price"), pos.get("tp_price") if pos.get("tp_order_id") else None)
         self.persist_state(force=True)
 
     async def _resize_orders(self, pos: dict, st: dict, upd: dict, now: float) -> None:
-        """After a partial close: stop and TP for exactly the remaining quantity, the stop at least at break-even.
-        The new orders are placed first; if the new stop cannot be placed the old (larger) one stays live and the
-        resize is retried every ``PROTECT_RETRY_S``."""
+        """After a partial close. The closePosition stop / take-profit cover the remainder by themselves, so nothing is resized;
+        what is left is the stop at least at break-even: if that is tighter than the current stop it is moved (cancel + replace
+        of the closePosition stop). A failed move is retried every ``PROTECT_RETRY_S``."""
         sym, side = pos["symbol"], pos["side"]
         close_side = opposite(order_side(side))
         f = await self.io(self.ex.filters, sym)
-        qty = float(pos["qty"])
         be = f.round_price(breakeven_price(side, pos["entry_price"], self.cfg.fee_taker))
-        sl = tighter(side, float(upd.get("sl_price", pos["sl_price"])), be)
-        try:
-            new_id, stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, sl, qty,
-                                          upd.get("sl_order_id", pos.get("sl_order_id")))
-        except ExchangeError as e:
-            st["resize"] = True
-            st["retry_t"] = now
-            log.error("%s: resizing the stop to the remaining %s FAILED (%s); the old stop stays live, retrying", sym, qty, e)
-            return
-        if stale:
-            st.setdefault("orphans", []).append(stale)
-        upd.update(sl_price=sl, sl_order_id=new_id)
-        pos.update(sl_price=sl, sl_order_id=new_id)
-        tp_id = upd.get("tp_order_id", pos.get("tp_order_id"))
-        if tp_id and pos.get("tp_price"):
+        cur = float(upd.get("sl_price", pos["sl_price"]))
+        sl = tighter(side, cur, be)
+        if sl != cur:
             try:
-                tp_new, tp_stale = await self.io(self.ex.replace_conditional, sym, "TP", close_side, pos["tp_price"], qty, tp_id)
-                upd["tp_order_id"] = pos["tp_order_id"] = tp_new
-                if tp_stale:
-                    st.setdefault("orphans", []).append(tp_stale)
+                new_id, _stale = await self.io(self.ex.replace_conditional, sym, "SL", close_side, sl, None,
+                                               upd.get("sl_order_id", pos.get("sl_order_id")), old_price=cur)
             except ExchangeError as e:
-                log.warning("%s: resizing the take-profit failed (%s); dropping it - the engine closes at TP itself", sym, e)
-                try:
-                    await self.io(self.ex.cancel_order, sym, tp_id)
-                except ExchangeError:
-                    st.setdefault("orphans", []).append(tp_id)
-                upd["tp_order_id"] = pos["tp_order_id"] = None
+                st["resize"] = True
+                st["retry_t"] = now
+                rid = getattr(e, "restored_id", None)
+                if rid:
+                    upd["sl_order_id"] = rid
+                    pos["sl_order_id"] = rid
+                    self.store.update_position(pos["id"], sl_order_id=rid)
+                log.error("%s: moving the stop to break-even after the partial FAILED (%s); retrying", sym, e)
+                return
+            upd.update(sl_price=sl, sl_order_id=new_id)
+            pos.update(sl_price=sl, sl_order_id=new_id)
+            self.store.update_position(pos["id"], sl_price=sl, sl_order_id=new_id)
         st.pop("resize", None)
-        self.store.update_position(pos["id"], **{k: upd[k] for k in ("sl_price", "sl_order_id", "tp_order_id") if k in upd})
-        self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": sl, "qty": qty})
+        self.event("position_updated", {"id": pos["id"], "symbol": sym, "sl_price": float(upd.get("sl_price", pos["sl_price"])),
+                                        "qty": float(pos["qty"])})
 
     async def _protect_retry(self, pos: dict, st: dict, upd: dict, now: float) -> None:
         """Housekeeping of one position: cancel stops left over by a move, retry an unfinished resize."""
@@ -1695,6 +1809,7 @@ class Engine:
                 log.exception("bar processing failed for %s", sym)
         if watch:
             self.faults.observe_exchange(errs >= max(1, len(watch) // 2))
+        await self.refresh_betas()
         try:
             await self.universe_models_cycle()
         except Exception:
@@ -1846,18 +1961,12 @@ class Engine:
             return None
 
     def pick_side(self, sc: Score | None, info: ModelInfo | None) -> tuple[str | None, float]:
-        """('long'|'short'|None, prob) for a Score under the model's thresholds (long wins a tie; shorts need short_enabled)."""
+        """('long'|'short'|None, prob) for a Score under the model's thresholds (symmetric: the larger margin over its own threshold
+        wins, an exact tie picks neither; shorts need short_enabled)."""
         if sc is None:
             return None, 0.0
         tl, ts = self.model_thresholds(info)
-        pl, ps = float(sc.prob_long), float(sc.prob_short)
-        cand_l = pl >= tl
-        cand_s = self.cfg.short_enabled and ps >= ts
-        if cand_l and (not cand_s or pl >= ps):
-            return "long", pl
-        if cand_s:
-            return "short", ps
-        return None, 0.0
+        return _pick_side(float(sc.prob_long), float(sc.prob_short), tl, ts, self.cfg.short_enabled)
 
     async def on_new_bar(self, sym: str, closed: pd.DataFrame, fresh: bool) -> None:
         cfg = self.cfg
@@ -1869,6 +1978,7 @@ class Engine:
             for tr in self.shadow.on_bar(sym, int(bar.open_time), float(bar.low), float(bar.high), self.clock(), frame=closed,
                                   close=float(bar.close)):
                 self._record_shadow(tr)
+        self.reversal_step()
         if sym not in self.trade_symbols():
             return
         info = self.model_info
@@ -1976,11 +2086,14 @@ class Engine:
         ok = {s: sc for s, sc in scores.items() if math.isfinite(float(sc.prob_long)) and math.isfinite(float(sc.prob_short))
               and (float(sc.prob_long) > 0 or float(sc.prob_short) > 0)}      # (0 / 0 = not tradable for the ranker)
         longs = sorted(ok, key=lambda s: (-float(ok[s].prob_long), s))[:xc.top_k]
-        out = {s: "long" for s in longs}
-        if short_enabled:
-            rest = [s for s in ok if s not in out]
-            out.update({s: "short" for s in sorted(rest, key=lambda s: (-float(ok[s].prob_short), s))[:xc.bottom_k]})
-        return out
+        shorts = sorted(ok, key=lambda s: (-float(ok[s].prob_short), s))[:xc.bottom_k] if short_enabled else []
+        for s in set(longs) & set(shorts):          # a coin both lists want: the larger probability wins, an exact tie goes to neither
+            pl, ps = float(ok[s].prob_long), float(ok[s].prob_short)
+            if pl >= ps:
+                shorts.remove(s)
+            if ps >= pl:
+                longs.remove(s)
+        return {**{s: "long" for s in longs}, **{s: "short" for s in shorts}}
 
     def universe_frames(self, info: ModelInfo, boundary_ms: int) -> dict[str, FrameBundle]:
         """Bundles of the universe symbols whose newest closed bar is at/after ``boundary_ms`` and long enough."""
@@ -2070,11 +2183,13 @@ class Engine:
         longs = [s for s, v in targets.items() if v == "long"]
         shorts = [s for s, v in targets.items() if v == "short"]
         legs: list[tuple[str, str]] = []
+        lead_short = bool(shorts) and (not longs or max(float(scores[s].prob_short) for s in shorts)
+                                       > max(float(scores[s].prob_long) for s in longs))   # the stronger side goes first
         for i in range(max(len(longs), len(shorts))):          # alternate so a binding cap cannot starve one side
-            if i < len(longs):
-                legs.append((longs[i], "long"))
-            if i < len(shorts):
-                legs.append((shorts[i], "short"))
+            pair = ((shorts, "short"), (longs, "long")) if lead_short else ((longs, "long"), (shorts, "short"))
+            for lst, sd in pair:
+                if i < len(lst):
+                    legs.append((lst[i], sd))
         for sym, side in legs:
             if self.xsec_book.get(sym) == side:
                 continue
@@ -2237,7 +2352,11 @@ class Engine:
         return {"max_positions": n_open + slots_fit(cfg, b, n_open, ref),
                 "total_leverage": b.open_notional / eq if eq == eq else 0.0, "max_total_leverage": cfg.max_total_leverage,
                 "margin_ratio": b.open_mm / eq if eq == eq else 0.0, "max_margin_ratio": cfg.max_margin_ratio,
-                "open_risk_pct": b.open_risk / eq * 100.0 if eq == eq else 0.0, "max_open_risk_pct": cfg.max_open_risk_pct}
+                "open_risk_pct": b.open_risk / eq * 100.0 if eq == eq else 0.0, "max_open_risk_pct": cfg.max_open_risk_pct,
+                "net_exposure_pct": b.open_net / eq * 100.0 if eq == eq else 0.0, "max_net_exposure_pct": cfg.max_net_exposure_pct,
+                "reversal": {"blocked": [sd for sd in ("long", "short") if self.rev.blocked(sd, self.now_ms())],
+                             "last": self.rev.last,
+                             "z": {k: (round(v, 2) if v == v else None) for k, v in self.rev_sig.z.items()} if self.rev_sig is not None else None}}
 
     def models_status(self) -> list[dict]:
         """Loaded models for the status page: kind, role, history need, decision cadence, entry / exit template."""
@@ -2419,12 +2538,14 @@ class Engine:
             ("heartbeat", 1.0, self.heartbeat_cycle), ("commands", 0.5, self.commands_cycle),
             ("prices", 3.0, self.prices_cycle), ("bars", 4.0, self.bars_cycle),
             ("universe", 5.0, self.universe_cycle), ("housekeeping", 10.0, self.housekeeping_cycle),
-            ("derivs", 20.0, self.derivs_cycle), ("depth", 1.0, self.depth_cycle)]]
+            ("derivs", 20.0, self.derivs_cycle), ("depth", 1.0, self.depth_cycle),
+            ("mirror", 1.0, self.mirror.cycle)]]
         await self.stop_event.wait()
         log.info("engine stopping (open positions keep their exchange-side stops)")
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.mirror.stop()
         self.persist_state(force=True)
         self.store.beat(self.mode, __version__, os.getpid(), {"stopped": True})
 

@@ -135,7 +135,9 @@ class PaperExchange(Exchange):
     def set_isolated(self, symbol: str) -> None:
         return None
 
-    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> OrderResult:
+    def market_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        """NORMAL market order, same semantics as the venue in one-way mode: the same direction adds to the position, the
+        opposite direction reduces / closes it, and a quantity beyond the position opens the opposite one with the rest."""
         side = side.upper()
         with self._lock:
             f = self.filters(symbol)
@@ -144,14 +146,14 @@ class PaperExchange(Exchange):
                 raise ExchangeError(f"qty {qty} below min_qty {f.min_qty}", code=-4003)
             px = self._slip(side, self._price(symbol), self.cfg.slippage_pct)
             p = self.pos.get(symbol)
-            if reduce_only:
-                if not p or (p.side == "long") != (side == "SELL"):
-                    raise ExchangeError("ReduceOnly Order is rejected", code=-2022)
-                q = min(q, p.qty)
-                info = self._close_qty(p, q, px, "manual")
-                return OrderResult(self._id(), symbol, side, q, px, "FILLED", info.fees)
             if p and (p.side == "long") != (side == "BUY"):
-                raise ExchangeError("opposite position open (one-way mode)", code=-4061)
+                closing = min(q, p.qty)
+                info = self._close_qty(p, closing, px, "manual")
+                fee = info.fees
+                rest = f.round_qty(q - closing)
+                if rest >= f.min_qty and rest > 0:
+                    fee += self._open_fill(symbol, side, rest, px, rest * px * self.cfg.fee_taker)
+                return OrderResult(self._id(), symbol, side, q, px, "FILLED", fee)
             fee = self._open_fill(symbol, side, q, px, q * px * self.cfg.fee_taker)
             return OrderResult(self._id(), symbol, side, q, px, "FILLED", fee)
 
@@ -187,14 +189,11 @@ class PaperExchange(Exchange):
             t = self.filters(symbol).tick_size
             return m - t, m + t                                 # no book available: one tick either side of the mark
 
-    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
-                    reduce_only: bool = False) -> OrderResult:
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True) -> OrderResult:
         """Resting limit entry. Conservative fill model: it fills only when the mark / a later candle trades
         THROUGH the limit price (strictly), at the limit price, with the maker fee and no slippage; the fill
         may be partial (``maker_fill_ratio`` of the remaining quantity per through-event)."""
         side = side.upper()
-        if reduce_only:
-            raise ExchangeError("paper venue: reduce-only limit orders are not simulated")
         with self._lock:
             f = self.filters(symbol)
             q = f.round_qty(qty)
@@ -259,7 +258,7 @@ class PaperExchange(Exchange):
         with self._lock:
             return list(self.limits)
 
-    def _place_cond(self, kind: str, symbol: str, side: str, price: float, qty: float) -> str:
+    def _place_cond(self, kind: str, symbol: str, side: str, price: float, qty: float | None = None) -> str:
         with self._lock:
             f = self.filters(symbol)
             price = f.round_price(price)
@@ -272,15 +271,19 @@ class PaperExchange(Exchange):
                 bad = price <= mark
             if bad:
                 raise ExchangeError("Order would immediately trigger", code=-2021)
-            c = _Cond(self._id(), symbol, kind, side, price, f.round_qty(qty))
+            if any(c.symbol == symbol and c.kind == kind and c.side == side for c in self.conds.values()):
+                # the venue keeps ONE closePosition stop / take-profit per direction
+                raise ExchangeError("An open stop or take profit order with GTE and closePosition in the direction is existing.",
+                                    code=-4130)
+            c = _Cond(self._id(), symbol, kind, side, price, 0.0)         # closePosition: no quantity
             self.conds[c.id] = c
             return c.id
 
-    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> str:
-        return self._place_cond("SL", symbol, side, stop_price, qty)
+    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float | None = None) -> str:
+        return self._place_cond("SL", symbol, side, stop_price)
 
-    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float) -> str:
-        return self._place_cond("TP", symbol, side, tp_price, qty)
+    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float | None = None) -> str:
+        return self._place_cond("TP", symbol, side, tp_price)
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         with self._lock:
@@ -304,7 +307,7 @@ class PaperExchange(Exchange):
 
     def open_conditional_orders(self, symbol: str | None = None) -> list[ConditionalOrder]:
         with self._lock:
-            return [ConditionalOrder(c.id, c.symbol, c.kind, c.side, c.trigger, c.qty, True)
+            return [ConditionalOrder(c.id, c.symbol, c.kind, c.side, c.trigger, c.qty, True)      # closePosition
                     for c in self.conds.values() if symbol is None or c.symbol == symbol]
 
     # ------------------------------------------------------------------ accounting
@@ -393,12 +396,12 @@ class PaperExchange(Exchange):
                     # sim convention (tb.sim.template): slippage + stop_slippage_extra on stop fills
                     s = self.cfg.slippage_pct + self.cfg.stop_slippage_pct
                     px = base * (1 - s) if long else base * (1 + s)
-                    return self._close_qty(p, min(c.qty, p.qty), px, "sl")
+                    return self._close_qty(p, p.qty, px, "sl")                  # closePosition: the whole position
             else:
                 hit = m >= c.trigger if long else m <= c.trigger
                 if hit:
                     px = c.trigger                  # resting-limit style: exactly the TP price, no slippage (sim)
-                    return self._close_qty(p, min(c.qty, p.qty), px, "tp")
+                    return self._close_qty(p, p.qty, px, "tp")
         return None
 
     def funding_due(self, now: float | None = None) -> bool:

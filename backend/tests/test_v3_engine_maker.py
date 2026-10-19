@@ -210,7 +210,7 @@ def test_partial_fill_cancels_the_rest_and_protects_exactly_the_filled_quantity(
     assert p["qty"] == pytest.approx(full * 0.4, rel=0.02) and p["qty"] < full
     assert eng.ex.limits == {}                                           # the remainder was cancelled, never re-posted
     sl = [o for o in eng.ex.open_conditional_orders(sym) if o.kind == "SL"][0]
-    assert sl.qty == pytest.approx(p["qty"])
+    assert sl.close_position and sl.qty == 0.0                          # closePosition: no quantity at all
     assert eng.maker_stats["partial"] == 1 and eng.maker_stats["filled"] == 1
 
 

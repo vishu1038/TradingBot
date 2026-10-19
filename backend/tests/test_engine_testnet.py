@@ -47,12 +47,17 @@ class FakeVenue(FakeData):
     def set_leverage(self, s, lev): self.log.append(("lev", s, lev))
     def set_isolated(self, s): self.log.append(("iso", s))
 
-    def market_order(self, symbol, side, qty, reduce_only=False):
+    def market_order(self, symbol, side, qty):
+        """Normal order, one-way mode: against an open position it closes it (and drops its closePosition TP/SL)."""
         if symbol not in self.marks:
             raise ExchangeError("Invalid symbol", code=-1121)
         px = self.fill_override or self.marks[symbol]
-        self.log.append(("market", symbol, side, qty, reduce_only, px))
-        if reduce_only:
+        cur = self.pos.get(symbol)
+        closing = cur is not None and (cur.side == "long") == (side == "SELL")
+        self.log.append(("market", symbol, side, qty, closing, px))
+        if closing and qty < cur.qty - 1e-9:                 # a partial: the closePosition TP/SL stay and cover the rest
+            cur.qty = round(cur.qty - qty, 8)
+        elif closing:
             self.pos.pop(symbol, None)
             self.orders = [o for o in self.orders if o.symbol != symbol]
         else:
@@ -66,12 +71,13 @@ class FakeVenue(FakeData):
                 raise ExchangeError("Order would immediately trigger.", code=-2021)
         elif price <= mark:
             raise ExchangeError("Order would immediately trigger.", code=-2021)
-        self.orders.append(ConditionalOrder(f"o:{len(self.orders) + 100}", symbol, kind, side, price, qty, True))
+        self._oid = getattr(self, "_oid", 100) + 1             # monotonic: ids are never reused after a cancel
+        self.orders.append(ConditionalOrder(f"o:{self._oid}", symbol, kind, side, price, qty, True))
         self.log.append((kind, symbol, side, price, qty))
         return self.orders[-1].order_id
 
-    def place_stop(self, symbol, side, price, qty): return self._cond("SL", symbol, side, price, qty)
-    def place_take_profit(self, symbol, side, price, qty): return self._cond("TP", symbol, side, price, qty)
+    def place_stop(self, symbol, side, price, qty=None): return self._cond("SL", symbol, side, price, qty)
+    def place_take_profit(self, symbol, side, price, qty=None): return self._cond("TP", symbol, side, price, qty)
     def cancel_order(self, symbol, oid): self.orders = [o for o in self.orders if o.order_id != oid]
     def cancel_all(self, symbol): self.orders = [o for o in self.orders if o.symbol != symbol]
     def open_conditional_orders(self, symbol=None): return [o for o in self.orders if symbol in (None, o.symbol)]
@@ -238,7 +244,7 @@ def test_stop_on_wrong_side_of_venue_mark_is_never_sent(store, tmp_path):
     assert store.get_positions() == []                                              # never left unprotected
     assert not [x for x in venue.log if x[0] == "SL"]                                # the bad stop was not even sent
     assert venue.pos == {}                                                           # closed at market
-    assert [x for x in venue.log if x[0] == "market"][-1][4] is True                 # reduce-only
+    assert [x for x in venue.log if x[0] == "market"][-1][2] == "SELL"               # a normal closing order
 
 
 def test_positions_marked_and_exits_use_venue_mark(store, tmp_path):

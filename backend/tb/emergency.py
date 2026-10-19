@@ -1,23 +1,24 @@
 """Emergency-path primitives shared by the guard and the engine (imports neither of them).
 
 Incident 2026-10-19 (testnet): two trailed stops triggered but the venue's market fills failed, so the positions stayed
-open with no stop; every later close was rejected with -2022 (reduce-only), one coin ran past its liquidation price, and the
-guard's account-wide FLATTEN plus the engine's invariant loops hammered the venue every few seconds for hours. The rules
-below are what both processes now follow:
+open with no stop, one coin ran past its liquidation price, and the guard's account-wide FLATTEN plus the engine's invariant
+loops hammered the venue every few seconds for hours. The rules below are what both processes now follow:
 
 * ``Backoff``: per key (symbol + action) exponential 5 s -> 10 s -> ... -> 5 min, reset on success. A failure is logged /
   alerted once per backoff step, never once per loop.
 * ``liquidation_reason``: a position whose mark is through its liquidation price (or whose isolated margin is gone) is
   already in the venue's liquidation engine: no orders are sent for it, it is alerted once and re-checked each cycle; when it
   disappears the engine records the trade with ``exit_reason = "liquidation"``.
-* ``emergency_close``: cancel the symbol's reduce-only conditional orders (they can make the exchange reject the closing
-  order with -2022), close reduce-only, and if the venue still rejects with -2022 while it shows the position (and it is not
-  liquidating) send ONE plain MARKET order of exactly the quantity it reports (one-way mode: the opposite side with that
-  quantity can only close, never flip).
+* ``close_flat`` (alias ``emergency_close``): NO reduce-only orders anywhere (user rule 2026-10-20). Under the symbol's lock:
+  re-read the position (the exchange is the truth; flat -> done; liquidating -> nothing is sent), optionally cancel its
+  TP/SL first, send a NORMAL market order for exactly the reported quantity in the closing direction, then verify. If the
+  position came back as the OPPOSITE side (a stop filled between the read and the order: the normal order opened a reverse
+  position) it is flattened the same way and the outcome carries ``flipped=True`` so the caller can alert.
 """
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -28,7 +29,6 @@ log = logging.getLogger("tb.emergency")
 BACKOFF_BASE_S = 5.0
 BACKOFF_MAX_S = 300.0
 KEY_LIQ = "liquidating"          # kv: {symbol: {"since", "reason", "side", "qty", "entry", "liq", "mark"}}
-REDUCE_REJECTED = -2022          # "ReduceOnly Order is rejected"
 
 
 # ----------------------------------------------------------------------------- backoff
@@ -120,16 +120,13 @@ class CloseOutcome:
     detail: str = ""
     flat: bool = False                 # the exchange showed no position (already closed / closed now)
     liquidation: bool = False          # the venue is liquidating it: nothing was sent
-    method: str = ""                   # reduce_only | cancel_retry | plain_market
+    method: str = ""                   # market | market+flip_undone
+    flipped: bool = False              # a reverse position appeared (race with a stop) and was flattened: callers alert
     result: Any = None                 # OrderResult of the closing order
     error: ExchangeError | None = field(default=None, repr=False)
 
     def __bool__(self) -> bool:
         return self.ok
-
-
-def reduce_rejected(e: ExchangeError) -> bool:
-    return e.code == REDUCE_REJECTED or "reduceonly" in str(e).lower().replace(" ", "")
 
 
 def transient(e: BaseException) -> bool:
@@ -140,9 +137,20 @@ def _find(ex: Any, symbol: str) -> PositionInfo | None:
     return next((p for p in ex.positions() if p.symbol == symbol), None)
 
 
-def cancel_reduce_only(ex: Any, symbol: str, say: Callable[[str], None] | None = None) -> int:
-    """Cancel every reduce-only conditional order of ``symbol`` (legacy and algo ids alike: ``cancel_order`` routes on the
-    id prefix). Best effort: a failure is reported, never raised. Returns how many were cancelled."""
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def symbol_lock(symbol: str) -> threading.Lock:
+    """One lock per symbol: two close paths of this process (engine invariant, kill, time stop, mirror ...) cannot interleave their
+    read -> order -> verify sequences. (Another process, the guard, is covered by the post-order verification instead.)"""
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(symbol, threading.Lock())
+
+
+def cancel_conditionals(ex: Any, symbol: str, say: Callable[[str], None] | None = None) -> int:
+    """Cancel every conditional (TP / SL) order of ``symbol`` (legacy and algo ids alike: ``cancel_order`` routes on the id
+    prefix). Best effort: a failure is reported, never raised. Returns how many were cancelled."""
     n = 0
     try:
         orders = ex.open_conditional_orders(symbol)
@@ -151,7 +159,7 @@ def cancel_reduce_only(ex: Any, symbol: str, say: Callable[[str], None] | None =
             say(f"cannot list the conditional orders of {symbol}: {e}")
         return 0
     for o in orders:
-        if o.symbol != symbol or not o.reduce_only:
+        if o.symbol != symbol:
             continue
         try:
             ex.cancel_order(symbol, o.order_id)
@@ -162,85 +170,64 @@ def cancel_reduce_only(ex: Any, symbol: str, say: Callable[[str], None] | None =
     return n
 
 
-def emergency_close(ex: Any, symbol: str, *, cancel_first: bool = True,
-                    say: Callable[[str], None] | None = None) -> CloseOutcome:
-    """Close ``symbol`` on the exchange, robust against the -2022 rejection. Never raises ``ExchangeError``.
+def close_flat(ex: Any, symbol: str, *, cancel_first: bool = False,
+               say: Callable[[str], None] | None = None) -> CloseOutcome:
+    """Close ``symbol`` on the exchange with a NORMAL market order. Never raises ``ExchangeError``.
 
-    1. re-read the position (the exchange is the truth): flat -> done; liquidating -> no order is sent;
-    2. cancel its reduce-only conditional orders (``cancel_first``; otherwise only if the plain close is rejected);
-    3. reduce-only market close of the exchange-reported quantity;
-    4. on -2022: re-read; still open and not liquidating -> ONE non-reduce-only MARKET of exactly the reported quantity;
-    5. verify (an order the venue accepted but never filled does not count as closed).
+    Under the symbol lock: 1. re-read the position (flat -> done; liquidating -> no order is sent); 2. cancel its TP/SL first
+    (``cancel_first``: removes the race with a stop that fills at the same moment); 3. market order for exactly the reported
+    quantity in the closing direction; 4. verify: the exchange must show it gone. A reverse position (opposite side) is
+    flattened the same way and reported through ``flipped``; an order that was accepted but left the position open is a failure.
     """
     say = say or (lambda m: log.warning("%s", m))
-    try:
-        pos = _find(ex, symbol)
-    except ExchangeError as e:
-        return CloseOutcome(False, f"cannot read the position: {e}", error=e)
-    if pos is None:
-        return CloseOutcome(True, "already flat", flat=True)
-    why = liquidation_reason(pos)
-    if why:
-        return CloseOutcome(False, f"in liquidation ({why}); no order sent", liquidation=True)
-    side = "SELL" if pos.side == "long" else "BUY"
-    cancelled = False
-    if cancel_first:
-        cancelled = True
-        cancel_reduce_only(ex, symbol, say)
-    res = None
-    method = "reduce_only"
-    err: ExchangeError | None = None
-    try:
-        res = ex.market_order(symbol, side, pos.qty, reduce_only=True)
-    except ExchangeError as e:
-        err = e
-        if not reduce_rejected(e):
-            return CloseOutcome(False, f"close rejected: {e}", error=e)
-    if err is not None and not cancelled:
-        # the exchange can reject a reduce-only close while reduce-only stops already cover the whole position
-        cancelled = True
-        cancel_reduce_only(ex, symbol, say)
+    with symbol_lock(symbol):
         try:
-            res = ex.market_order(symbol, side, pos.qty, reduce_only=True)
-            err, method = None, "cancel_retry"
+            pos = _find(ex, symbol)
         except ExchangeError as e:
-            err = e
-            if not reduce_rejected(e):
-                return CloseOutcome(False, f"close rejected: {e}", error=e)
-    if err is not None:
-        try:
-            pos2 = _find(ex, symbol)               # fresh read immediately before the non-reduce-only order
-        except ExchangeError as e:
-            return CloseOutcome(False, f"close rejected ({err}); cannot re-read the position: {e}", error=e)
-        if pos2 is None:
-            return CloseOutcome(True, f"flat after -2022 ({err})", flat=True)
-        why = liquidation_reason(pos2)
+            return CloseOutcome(False, f"cannot read the position: {e}", error=e)
+        if pos is None:
+            return CloseOutcome(True, "already flat", flat=True)
+        why = liquidation_reason(pos)
         if why:
-            return CloseOutcome(False, f"-2022 and in liquidation ({why}); no order sent", liquidation=True, error=err)
-        side2 = "SELL" if pos2.side == "long" else "BUY"
-        say(f"{symbol}: reduce-only close rejected ({err}) while the exchange shows {pos2.side} {pos2.qty}; "
-            f"sending one plain MARKET {side2} {pos2.qty}")
+            return CloseOutcome(False, f"in liquidation ({why}); no order sent", liquidation=True)
+        if cancel_first:
+            cancel_conditionals(ex, symbol, say)
+        side = "SELL" if pos.side == "long" else "BUY"
         try:
-            res = ex.market_order(symbol, side2, pos2.qty, reduce_only=False)
-            method, pos = "plain_market", pos2
+            res = ex.market_order(symbol, side, pos.qty)
         except ExchangeError as e:
-            return CloseOutcome(False, f"plain market close failed: {e}", error=e)
-    # verify: the exchange must show the position gone
-    try:
-        left = _find(ex, symbol)
-    except ExchangeError as e:
-        return CloseOutcome(True, f"closed ({method}); verification unavailable: {e}", method=method, result=res)
-    if left is None:
+            return CloseOutcome(False, f"close rejected: {e}", error=e)
+        method = "market"
+        flipped = False
         try:
-            ex.cancel_all(symbol)
+            left = _find(ex, symbol)
         except ExchangeError as e:
-            say(f"{symbol}: closed but leftover orders could not be cancelled: {e}")
-        return CloseOutcome(True, f"closed ({method})", flat=True, method=method, result=res)
-    if left.side != pos.side:                      # (a plain market order that raced with a stop: flipped) undo at once
-        say(f"{symbol}: the plain close flipped the position to {left.side} {left.qty}; closing the remainder reduce-only")
-        try:
-            res = ex.market_order(symbol, "SELL" if left.side == "long" else "BUY", left.qty, reduce_only=True)
-        except ExchangeError as e:
-            return CloseOutcome(False, f"flipped position could not be closed: {e}", method=method, error=e)
-        return CloseOutcome(True, f"closed ({method}) after undoing a flip", method=method, result=res)
-    return CloseOutcome(False, f"order accepted but {left.qty} still open ({method})", method=method, result=res)
+            return CloseOutcome(True, f"closed ({method}); verification unavailable: {e}", method=method, result=res)
+        if left is not None and left.side != pos.side:       # the stop filled first: our normal order opened a reverse position
+            flipped = True
+            say(f"{symbol}: the close opened a reverse {left.side} {left.qty} (a stop filled in between); flattening it")
+            try:
+                res = ex.market_order(symbol, "SELL" if left.side == "long" else "BUY", left.qty)
+            except ExchangeError as e:
+                return CloseOutcome(False, f"reverse position {left.side} {left.qty} could not be flattened: {e}", method=method,
+                                    flipped=True, error=e)
+            method = "market+flip_undone"
+            try:
+                left = _find(ex, symbol)
+            except ExchangeError as e:
+                return CloseOutcome(True, f"closed ({method}); verification unavailable: {e}", method=method, flipped=True,
+                                    result=res)
+        if left is None:
+            try:
+                ex.cancel_all(symbol)                         # leftover TP / SL of the closed position
+            except ExchangeError as e:
+                say(f"{symbol}: closed but leftover orders could not be cancelled: {e}")
+            return CloseOutcome(True, f"closed ({method})", flat=True, method=method, flipped=flipped, result=res)
+        return CloseOutcome(False, f"order accepted but {left.qty} {left.side} still open ({method})", method=method,
+                            flipped=flipped, result=res)
+
+
+def emergency_close(ex: Any, symbol: str, *, cancel_first: bool = True,
+                    say: Callable[[str], None] | None = None) -> CloseOutcome:
+    """Guard / engine emergency path: ``close_flat`` with the TP/SL cancelled first by default."""
+    return close_flat(ex, symbol, cancel_first=cancel_first, say=say)

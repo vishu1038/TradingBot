@@ -308,6 +308,20 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
             time.sleep(0.1)
         return {"ok": True, "queued": True}
 
+    @app.get("/api/mirror")
+    def mirror() -> dict:
+        """Testnet mirror: venue health, success rate, latency, error classes, divergences, open mirror positions, last 50 events."""
+        from .mirror import summary
+
+        return summary(store, store.get_settings())
+
+    @app.post("/api/mirror/retry")
+    def mirror_retry() -> dict:
+        """"Retry mirror": clear an order-reject verdict / symbol backoffs, reload the testnet keys, re-poll the account. The engine
+        picks the flag up within ~2 s (a kv row: no engine command, no exchange access from the API)."""
+        store.kv_set("mirror_retry", time.time())
+        return {"ok": True}
+
     @app.get("/api/lab/reports")
     def lab_reports() -> list[dict]:
         return store.get_lab_reports()

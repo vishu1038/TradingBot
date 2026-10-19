@@ -6,7 +6,8 @@ Why it exists (incident 2026-10-19): +32 % equity that was mostly OPEN profit on
   entry +- round-trip fees (never loosens);
 * trailing: the existing ``tb.risk.trail_update`` (ratchet only), combined with the break-even stop by ``next_stop``;
 * partial take-profit: at ``partial_tp_r`` x initial risk close ``partial_tp_frac`` of the quantity (once per position);
-  the remainder's stop moves to at least break-even (``partial_level`` / ``partial_split``);
+  the remainder's stop moves to at least break-even (``partial_level`` / ``partial_split``); skipped when the piece would gain
+  less than ``min_tp_usd`` at its level (``partial_gain_ok``);
 * losing-exit cooldown reasons (``LOSS_EXIT_REASONS``), shared by the live gate and the sims.
 """
 from __future__ import annotations
@@ -35,16 +36,17 @@ class Protect:
     partial_tp_r: float = 1.5         # 0 = off
     partial_tp_frac: float = 0.5
     fee_rate: float = 0.0005          # taker fee per side (fraction)
+    min_tp_usd: float = 0.0           # dollar floor: the partial piece must gain at least this at its level (0 = off)
 
     @classmethod
     def from_settings(cls, cfg: Any) -> "Protect":
         return cls(cfg.breakeven_r, cfg.trail.enabled, cfg.trail.activate_r, cfg.trail.distance_atr,
-                   cfg.partial_tp_r, cfg.partial_tp_frac, cfg.fee_taker)
+                   cfg.partial_tp_r, cfg.partial_tp_frac, cfg.fee_taker, cfg.min_tp_usd)
 
     @classmethod
     def from_sim(cls, cfg: Any) -> "Protect":
         return cls(cfg.breakeven_r, cfg.trail_enabled, cfg.trail_activate_r, cfg.trail_distance_atr,
-                   cfg.partial_tp_r, cfg.partial_tp_frac, cfg.fee_taker)
+                   cfg.partial_tp_r, cfg.partial_tp_frac, cfg.fee_taker, getattr(cfg, "min_tp_usd", 0.0))
 
     @property
     def partial_on(self) -> bool:
@@ -110,6 +112,15 @@ def partial_split(qty: float, price: float, frac: float, f: Any) -> tuple[float,
     if q * price < f.min_notional or rem * price < f.min_notional:
         return None
     return q, rem
+
+
+def partial_gain_ok(side: str, entry: float, level: float, close_qty: float, p: Protect) -> bool:
+    """Dollar floor of the partial take-profit: the piece that would be closed must gain >= ``min_tp_usd`` at the partial level
+    (gross price move x quantity); otherwise there is NO partial and the position runs to its full TP (user 2026-10-19)."""
+    if p.min_tp_usd <= 0:
+        return True
+    d = 1.0 if side == "long" else -1.0
+    return (level - entry) * d * close_qty >= p.min_tp_usd * (1.0 - 1e-6)
 
 
 def stop_loss_usd(side: str, qty: float, entry: float, sl: float, fee: float, slip: float, stop_slip: float,

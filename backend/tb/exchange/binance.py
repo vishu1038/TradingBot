@@ -239,8 +239,7 @@ class BinanceExchange(Exchange):
             if e.code != -4046:        # "No need to change margin type"
                 raise
 
-    def market_order_params(self, symbol: str, side: str, qty: float, reduce_only: bool,
-                            client_id: str | None = None) -> dict[str, Any]:
+    def market_order_params(self, symbol: str, side: str, qty: float, client_id: str | None = None) -> dict[str, Any]:
         f = self.filters(symbol)
         q = f.round_qty(qty)
         if q < f.min_qty or q <= 0:
@@ -248,12 +247,10 @@ class BinanceExchange(Exchange):
         p: dict[str, Any] = {"symbol": symbol, "side": side.upper(), "type": "MARKET", "quantity": f.qty_str(qty),
                              "newOrderRespType": "RESULT",
                              "newClientOrderId": client_id or f"tb{uuid.uuid4().hex[:24]}"}
-        if reduce_only:
-            p["reduceOnly"] = True
         return p
 
-    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> OrderResult:
-        params = self.market_order_params(symbol, side, qty, reduce_only)
+    def market_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        params = self.market_order_params(symbol, side, qty)
         try:
             r = self._request("POST", "/fapi/v1/order", params, signed=True)
         except NetworkError:
@@ -294,8 +291,7 @@ class BinanceExchange(Exchange):
                            float(r.get("avgPrice") or 0), str(r.get("status", "")), 0.0, ex,
                            float(r.get("price") or price or 0))
 
-    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
-                    reduce_only: bool = False) -> OrderResult:
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True) -> OrderResult:
         f = self.filters(symbol)
         q = f.round_qty(qty)
         if q < f.min_qty or q <= 0:
@@ -304,8 +300,6 @@ class BinanceExchange(Exchange):
         p: dict[str, Any] = {"symbol": symbol, "side": side.upper(), "type": "LIMIT", "quantity": f.qty_str(qty),
                              "price": f.price_str(price), "timeInForce": "GTX" if post_only else "GTC",
                              "newOrderRespType": "RESULT", "newClientOrderId": cid}
-        if reduce_only:
-            p["reduceOnly"] = True
         try:
             r = self._request("POST", "/fapi/v1/order", p, signed=True)
         except NetworkError:
@@ -323,17 +317,18 @@ class BinanceExchange(Exchange):
     def open_entry_orders(self, symbol: str | None = None) -> list[tuple[str, str]]:
         out = []
         for r in self._request("GET", "/fapi/v1/openOrders", {"symbol": symbol} if symbol else {}, signed=True):
-            if r.get("type") == "LIMIT" and not r.get("reduceOnly") \
-                    and str(r.get("clientOrderId", "")).startswith("tbm"):
+            if r.get("type") == "LIMIT" and str(r.get("clientOrderId", "")).startswith("tbm"):
                 out.append((r["symbol"], f"o:{r['orderId']}"))
         return out
 
-    def conditional_params(self, kind: str, symbol: str, side: str, price: float, qty: float,
+    def conditional_params(self, kind: str, symbol: str, side: str, price: float, qty: float | None,
                            algo: bool) -> dict[str, Any]:
+        """TP / SL as the Binance UI's TP/SL checkbox does: STOP_MARKET / TAKE_PROFIT_MARKET with ``closePosition=true`` on the
+        MARK_PRICE, NO quantity and NO reduceOnly (``qty`` is ignored). Same parameters on the legacy and the algo endpoint."""
         f = self.filters(symbol)
         typ = "STOP_MARKET" if kind == "SL" else "TAKE_PROFIT_MARKET"
-        p: dict[str, Any] = {"symbol": symbol, "side": side.upper(), "type": typ, "quantity": f.qty_str(qty),
-                             "reduceOnly": True, "workingType": "MARK_PRICE"}
+        p: dict[str, Any] = {"symbol": symbol, "side": side.upper(), "type": typ,
+                             "closePosition": True, "workingType": "MARK_PRICE"}
         if algo:
             p["algoType"] = "CONDITIONAL"
             p["triggerPrice"] = f.price_str(price)
@@ -343,7 +338,7 @@ class BinanceExchange(Exchange):
             p["newClientOrderId"] = f"tb{uuid.uuid4().hex[:24]}"
         return p
 
-    def _place_conditional(self, kind: str, symbol: str, side: str, price: float, qty: float) -> str:
+    def _place_conditional(self, kind: str, symbol: str, side: str, price: float, qty: float | None = None) -> str:
         if not self._algo_active and self.conditional_mode != "algo":
             try:
                 r = self._request("POST", "/fapi/v1/order", self.conditional_params(kind, symbol, side, price, qty, False),
@@ -366,10 +361,10 @@ class BinanceExchange(Exchange):
             raise
         return f"a:{r['algoId']}"
 
-    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> str:
+    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float | None = None) -> str:
         return self._place_conditional("SL", symbol, side, stop_price, qty)
 
-    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float) -> str:
+    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float | None = None) -> str:
         return self._place_conditional("TP", symbol, side, tp_price, qty)
 
     @staticmethod
@@ -407,8 +402,8 @@ class BinanceExchange(Exchange):
         for r in self._request("GET", "/fapi/v1/openOrders", p, signed=True):
             if r.get("type") in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
                 out.append(ConditionalOrder(f"o:{r['orderId']}", r["symbol"], "SL" if r["type"] == "STOP_MARKET" else "TP",
-                                            r["side"], float(r["stopPrice"]), float(r["origQty"]),
-                                            bool(r.get("reduceOnly") or r.get("closePosition"))))
+                                            r["side"], float(r["stopPrice"]), float(r.get("origQty") or 0),
+                                            bool(r.get("closePosition"))))
         if self.conditional_mode != "legacy":
             try:
                 for r in self._request("GET", "/fapi/v1/openAlgoOrders", p, signed=True) or []:
@@ -416,7 +411,7 @@ class BinanceExchange(Exchange):
                     if ot in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
                         out.append(ConditionalOrder(f"a:{r['algoId']}", r["symbol"], "SL" if ot == "STOP_MARKET" else "TP",
                                                     r["side"], float(r["triggerPrice"]), float(r.get("quantity") or 0),
-                                                    bool(r.get("reduceOnly") or r.get("closePosition"))))
+                                                    bool(r.get("closePosition"))))
             except ExchangeError as e:
                 if self._algo_active:
                     raise
@@ -448,6 +443,11 @@ class BinanceExchange(Exchange):
     def balance(self) -> Balance:
         a = self._request("GET", "/fapi/v2/account", {}, signed=True)
         return Balance(float(a["totalWalletBalance"]), float(a["availableBalance"]), float(a["totalUnrealizedProfit"]))
+
+    def account_info(self) -> dict:
+        """Raw signed ``GET /fapi/v2/account`` (totalMarginBalance, availableBalance, canTrade, ...): the testnet mirror's
+        account-health poll needs fields ``balance()`` does not keep."""
+        return self._request("GET", "/fapi/v2/account", {}, signed=True)
 
     def user_trades(self, symbol: str, since_ms: int) -> list[dict]:
         return self._request("GET", "/fapi/v1/userTrades", {"symbol": symbol, "startTime": since_ms, "limit": 100},

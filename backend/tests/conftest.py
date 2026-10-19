@@ -98,6 +98,43 @@ def fake_data() -> FakeData:
     return FakeData()
 
 
+LEGACY_OFF = {"max_net_exposure_pct": 0.0, "reversal_z": 0.0, "min_tp_usd": 0.0, "min_sl_usd": 0.0}
+
+
+def _set_init_defaults(cls, overrides):
+    """Swap defaults of a dataclass ``__init__`` in place; returns the original tuple."""
+    import dataclasses
+
+    names = [f.name for f in dataclasses.fields(cls) if f.init]
+    old = cls.__init__.__defaults__
+    new = tuple(overrides.get(n, d) for n, d in zip(names, old))
+    cls.__init__.__defaults__ = new
+    return old
+
+
+@pytest.fixture(autouse=True)
+def _legacy_risk_defaults(request):
+    """The reversal protection (net-exposure cap, reversal detector) and the dollar floor (2026-10-19) are new rules with their own
+    tests. Every OTHER test exercises other rules with several same-side positions / tiny sizes, so for them these four defaults are
+    off; a test that wants the shipped defaults is marked ``@pytest.mark.real_risk_defaults``."""
+    if request.node.get_closest_marker("real_risk_defaults"):
+        yield
+        return
+    from tb.sim.template import SimConfig
+
+    o1 = _set_init_defaults(Settings, LEGACY_OFF)
+    o2 = _set_init_defaults(SimConfig, LEGACY_OFF)
+    try:
+        yield
+    finally:
+        Settings.__init__.__defaults__ = o1
+        SimConfig.__init__.__defaults__ = o2
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_risk_defaults: run with the shipped net-exposure / reversal / dollar-floor defaults")
+
+
 def pytest_collection_finish(session):
     """Move everything imported during collection (pandas, numpy, the whole tb package ...) out of the GC's reach: a full
     collection over that heap takes ~50 ms and landed inside timing-sensitive tests (test_alerts non-blocking dispatch)."""

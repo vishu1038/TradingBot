@@ -148,8 +148,13 @@ class ConditionalOrder:
     kind: str                       # SL | TP
     side: str                       # BUY | SELL
     trigger_price: float
-    qty: float
-    reduce_only: bool = True
+    qty: float                      # informational: closePosition orders carry no quantity (0)
+    close_position: bool = True     # closePosition=true: closes whatever is open at trigger time (no quantity, never reduce-only)
+
+    def covers(self, position_qty: float) -> bool:
+        """True when this order closes a position of ``position_qty``: a closePosition order always does; an older-style order
+        with an explicit quantity (placed before the closePosition rule) only when it is at least as large."""
+        return self.close_position or self.qty >= position_qty * 0.999
 
 
 @dataclass
@@ -229,15 +234,18 @@ class Exchange(ABC):
     def set_isolated(self, symbol: str) -> None: ...
 
     @abstractmethod
-    def market_order(self, symbol: str, side: str, qty: float, reduce_only: bool = False) -> OrderResult: ...
+    def market_order(self, symbol: str, side: str, qty: float) -> OrderResult:
+        """NORMAL market order (never reduce-only). One-way mode: against an open position it reduces / closes it, and a quantity
+        larger than the position would open the opposite one (callers re-read the position first)."""
 
     @abstractmethod
-    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float) -> str:
-        """Reduce-only STOP_MARKET (workingType MARK_PRICE). ``side`` is the order side (closing)."""
+    def place_stop(self, symbol: str, side: str, stop_price: float, qty: float | None = None) -> str:
+        """STOP_MARKET with closePosition=true (workingType MARK_PRICE; no quantity, no reduceOnly). ``side`` is the order side
+        (closing). ``qty`` is accepted for old callers and ignored. One closePosition stop per direction (-4130 otherwise)."""
 
     @abstractmethod
-    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float) -> str:
-        """Reduce-only TAKE_PROFIT_MARKET."""
+    def place_take_profit(self, symbol: str, side: str, tp_price: float, qty: float | None = None) -> str:
+        """TAKE_PROFIT_MARKET with closePosition=true (see ``place_stop``)."""
 
     @abstractmethod
     def cancel_order(self, symbol: str, order_id: str) -> None: ...
@@ -271,8 +279,7 @@ class Exchange(ABC):
         """(best bid, best ask) of the venue's own order book."""
         raise ExchangeError(f"{self.name} exchange has no best bid/ask support")
 
-    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True,
-                    reduce_only: bool = False) -> OrderResult:
+    def limit_order(self, symbol: str, side: str, qty: float, price: float, post_only: bool = True) -> OrderResult:
         """Resting LIMIT order; ``post_only`` = time-in-force GTX. A post-only order that would take liquidity is
         rejected with ``ExchangeError(code=-5022)``. Returns immediately (status NEW / PARTIALLY_FILLED / FILLED)."""
         raise ExchangeError(f"{self.name} exchange has no limit-order support")
@@ -285,24 +292,27 @@ class Exchange(ABC):
         """[(symbol, order_id)] of resting NON-conditional maker entries (stale ones left by a crashed engine)."""
         return []
 
-    def replace_conditional(self, symbol: str, kind: str, side: str, price: float, qty: float,
-                            old_id: str | None = None, retries: int = 3,
-                            pause_s: float = 0.4) -> tuple[str, str | None]:
-        """Move a protective order: place the NEW reduce-only stop (``kind`` "SL") / take-profit ("TP") first and cancel the
-        old one only afterwards, so the position is never without protection. Returns ``(new_id, stale_id)``;
-        ``stale_id`` is the old order when it could not be cancelled (harmless: reduce-only; the caller retries the
-        cancel). If every attempt to place the new order fails the exception propagates and the OLD order is untouched.
-        -2021 ("would immediately trigger": the price is already through the level) is never retried."""
+    def replace_conditional(self, symbol: str, kind: str, side: str, price: float, qty: float | None = None,
+                            old_id: str | None = None, retries: int = 3, pause_s: float = 0.4,
+                            old_price: float | None = None) -> tuple[str, str | None]:
+        """Move a protective closePosition order: CANCEL the old one, then place the new stop (``kind`` "SL") / take-profit
+        ("TP"). The venue allows only one closePosition stop (and one take-profit) per direction (-4130), so the new order cannot be
+        placed first. If the cancel fails the old order is untouched (the exception propagates); if every placement attempt fails
+        the OLD level is restored (``old_price``) before the exception propagates, so the position is not left without
+        protection. -2021 ("would immediately trigger": price already through the level) is never retried. ``qty`` is
+        ignored (closePosition). Returns ``(new_id, None)`` (the second slot is kept for old callers: no stale ids exist)."""
         import logging
         import time
 
         log = logging.getLogger("tb.exchange")
         place = self.place_stop if kind == "SL" else self.place_take_profit
+        if old_id:
+            self.cancel_order(symbol, old_id)
         last: ExchangeError | None = None
         new_id = None
         for i in range(max(1, retries)):
             try:
-                new_id = place(symbol, side, price, qty)
+                new_id = place(symbol, side, price)
                 break
             except ExchangeError as e:
                 last = e
@@ -314,14 +324,14 @@ class Exchange(ABC):
                     time.sleep(pause_s * (i + 1))
         if new_id is None:
             assert last is not None
+            if old_id and old_price:
+                try:
+                    last.restored_id = place(symbol, side, old_price)        # (the caller must track the NEW id of the old level)
+                    log.warning("replace %s %s: the old level %s was restored", kind, symbol, old_price)
+                except ExchangeError as e:
+                    log.error("replace %s %s: the old level %s could NOT be restored (%s); the stop invariant re-places it", kind,
+                              symbol, old_price, e)
             raise last
-        if old_id:
-            try:
-                self.cancel_order(symbol, old_id)
-            except ExchangeError as e:
-                log.warning("replace %s %s: new order %s is live but cancelling the old %s failed: %s", kind, symbol,
-                            new_id, old_id, e)
-                return new_id, old_id
         return new_id, None
 
     # ---- helpers
