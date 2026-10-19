@@ -355,6 +355,13 @@ def create_app(db: str | Path | None = None, *, control_wait_s: float = 4.0, ui:
                     pts[-1]["pnl"] = cum
                 else:
                     pts.append({"t": int(r["exit_time"]), "pnl": cum})
+            # the engine's per-minute mark-to-market samples (open trades included) make the curve continuous
+            marks = [s for s in store.get_shadow_equity(n, since) if s["t"] > pts[0]["t"]]
+            if marks:
+                closes = {p["t"]: p["pnl"] for p in pts}
+                for s in marks:
+                    closes.setdefault(int(s["t"]), float(s["pnl"]))
+                pts = [{"t": t, "pnl": v} for t, v in sorted(closes.items())]
             out.append({"model": n, "status": entries[n], "kind": (metas.get(n) or {}).get("kind") or "per_symbol_5m",
                         "points": pts[-limit:]})
         return out

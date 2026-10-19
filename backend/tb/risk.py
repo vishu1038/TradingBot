@@ -51,10 +51,12 @@ def atr14(high: Sequence[float], low: Sequence[float], close: Sequence[float], n
 
 
 def atr_pct(high: Sequence[float], low: Sequence[float], close: Sequence[float], bars: int = 72) -> float | None:
-    """Mean true range over the last ``bars`` (6h of 5m) as % of the last close."""
+    """Mean true range over the last ``bars`` (6h of 5m) as % of the last close. Too little history (fewer than
+    min(``bars``, 14) true ranges) -> None. (A fixed 14 floor made universe_atr_bars < 14 rank nothing.)"""
+    want = bars
     if len(close) < bars + 1:
         bars = len(close) - 1
-    if bars < 14:
+    if bars < max(2, min(want, 14)):
         return None
     tr = true_range(np.asarray(high), np.asarray(low), np.asarray(close))
     return float(np.mean(tr[-bars:]) / float(close[-1]) * 100.0)

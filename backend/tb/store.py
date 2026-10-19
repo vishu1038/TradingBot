@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS ix_trades_closed ON trades(closed_at);
 CREATE TABLE IF NOT EXISTS equity (t INTEGER PRIMARY KEY, equity REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS shadow_equity (t INTEGER NOT NULL, model TEXT NOT NULL, pnl REAL NOT NULL, PRIMARY KEY (model, t));
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     t INTEGER NOT NULL, symbol TEXT NOT NULL, prob_long REAL NOT NULL, prob_short REAL NOT NULL,
@@ -346,6 +347,17 @@ class Store:
             (t["model"], t["symbol"], t["side"], int(t["entry_time"]), int(t["exit_time"]), t["entry_price"],
              t["exit_price"], t["qty"], t["pnl"], t.get("fees", 0.0), t["exit_reason"], t.get("prob")))
         return int(cur.lastrowid)
+
+    def add_shadow_equity(self, t: int, pnl_by_model: dict[str, float]) -> None:
+        """One mark-to-market sample per model (realised + open PnL since the stake started), for smooth bot curves."""
+        for m, v in pnl_by_model.items():
+            self.execute("INSERT INTO shadow_equity(t,model,pnl) VALUES(?,?,?) ON CONFLICT(model,t) DO UPDATE SET pnl=excluded.pnl",
+                         (int(t), m, float(v)))
+        self.execute("DELETE FROM shadow_equity WHERE t<?", (int(t) - 30 * 86400,))
+
+    def get_shadow_equity(self, model: str, since: int | None = None) -> list[dict]:
+        return [dict(r) for r in self.query("SELECT t, pnl FROM shadow_equity WHERE model=? AND t>=? ORDER BY t",
+                                            (model, int(since or 0)))]
 
     def get_shadow_trades(self, model: str | None = None, since: int | None = None) -> list[dict]:
         q, a = "SELECT * FROM shadow_trades WHERE 1=1", []

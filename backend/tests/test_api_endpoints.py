@@ -292,6 +292,25 @@ def test_shadow_equity_endpoint(env, tmp_path, monkeypatch):
     assert c.get("/api/shadow/equity?limit=1").status_code == 422
 
 
+def test_shadow_equity_merges_minute_marks(env, tmp_path, monkeypatch):
+    """The engine's per-minute mark-to-market samples fill the curve between closes (no more step lines)."""
+    c, s = env
+    d = tmp_path / "models"
+    d.mkdir()
+    monkeypatch.setenv("TB_MODELS", str(d))
+    import json
+    (d / "champ.json").write_text(json.dumps({"name": "champ", "status": "champion"}))
+    t0 = 1_700_000_000
+    s.add_shadow_trade({"model": "champ", "symbol": "A", "side": "long", "entry_time": t0 + 10, "exit_time": t0 + 300,
+                        "entry_price": 1, "exit_price": 1, "qty": 1, "pnl": 1.0, "exit_reason": "tp"})
+    for k, v in ((60, -0.4), (120, -0.9), (180, 0.3), (300, 999.0), (360, 1.2)):
+        s.add_shadow_equity(t0 + k, {"champ": v})
+    pts = {r["model"]: r for r in c.get("/api/shadow/equity").json()}["champ"]["points"]
+    assert [p["t"] - t0 for p in pts] == [10, 60, 120, 180, 300, 360]
+    assert pts[4]["pnl"] == pytest.approx(1.0)          # a close time keeps the exact realised value
+    assert pts[1]["pnl"] == pytest.approx(-0.4) and pts[-1]["pnl"] == pytest.approx(1.2)
+
+
 def test_cors_localhost_only(env):
     c, _ = env
     ok = c.get("/api/health", headers={"Origin": "http://localhost:5173"})

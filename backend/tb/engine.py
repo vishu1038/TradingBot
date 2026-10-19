@@ -203,6 +203,7 @@ class Engine:
         self._last_sync = 0.0
         self._last_stop_check = 0.0
         self._last_equity_write = 0.0
+        self._last_shadow_eq = 0.0
         self._last_persist = 0.0
         self._last_day = datetime.now(timezone.utc).date().isoformat()
         # safety layer
@@ -2486,6 +2487,30 @@ class Engine:
             "running": self.running, "universe": len(self.universe), "loops": self.stats["loops"],
             "errors": self.stats["errors"], "safety": view["state"], "model": self.scorer.name})
 
+    def shadow_mtm(self) -> dict[str, float]:
+        """Per model: NET realised PnL of its shadow trades since the stake started + the open shadow positions marked to
+        the current price (net of the fees already paid). The Bots page plots this every minute, so curves move with
+        open trades instead of jumping only when a trade closes."""
+        since = cap.since_t(self.store) or 0
+        out = {r["model"]: float(r["s"]) for r in
+               self.store.query("SELECT model, COALESCE(SUM(pnl),0) s FROM shadow_trades WHERE entry_time>=? GROUP BY model",
+                                (int(since),))}
+        for p in self.shadow.pos.values():
+            m = self.marks.get(p.symbol)
+            if not m:
+                continue
+            d = 1.0 if p.side == "long" else -1.0
+            out[p.model] = out.get(p.model, 0.0) + (m - p.entry) * p.qty * d + p.part_gross - p.part_fees - p.entry_fee
+        for name in self.shadow_names():
+            out.setdefault(name, 0.0)
+        return out
+
+    def shadow_names(self) -> list[str]:
+        names = list(self.challengers)
+        if self.model_info and self.model_info.name not in names:
+            names.append(self.model_info.name)
+        return names
+
     async def housekeeping_cycle(self) -> None:
         now = self.clock()
         self.reload_models()
@@ -2493,6 +2518,12 @@ class Engine:
             self._last_equity_write = now
             self.store.add_equity(int(now), self.equity)
             self.event("equity", {"t": int(now), "equity": self.equity})
+        if now - self._last_shadow_eq >= 60:
+            self._last_shadow_eq = now
+            try:
+                self.store.add_shadow_equity(int(now), self.shadow_mtm())
+            except Exception as e:  # the bots chart is decoration; never let it break housekeeping
+                log.warning("shadow equity sample failed: %s", e)
         self.event("status", {"equity": self.equity, "running": self.running, "kill": bool(self.kill.get("tripped"))})
         self.store.prune_events(3600)
         self.store.prune_logs(5000)
