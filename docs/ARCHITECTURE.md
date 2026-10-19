@@ -258,6 +258,20 @@ reports which value is break-even after fees for the chosen exit mode.
   closes on a multiple of `decision_every_bars` on the UTC grid (12 = every full hour); cooldown counts from the coin's last entry
   or exit, max trades per UTC day counts entries (all coins). Restart-safe (seeded from the DB). Thresholds: classic models use the
   Settings, V3 kinds use the artifact's `thresholds` (Settings if absent).
+- **Adaptive cadence** (`entry_cfg.decision_mode: "adaptive"`, `backend/tb/adaptive.py`; default `"fixed"` = the grid above). The model
+  is SCORED on every closed 5m bar (signals recorded every bar) but a coin may only ENTER at a decision point: (a) REGULAR, `gap`
+  bars after its last regular look, `gap = clamp(round(base_gap_bars * median_vol / current_vol), min_regular_gap_bars,
+  max_regular_gap_bars)` (defaults 12 / 3 / 24; vol = std of the last 12 5m log-returns vs its trailing-7d median: volatile = looks
+  more often); normal threshold. (b) EVENT on the coin's newest closed bar: 5m range >= `ev_range_atr` (1.5) x ATR14, volume
+  z-score (48 bars) >= `ev_volume_z` (2.5), close beyond the prior closed 1h bar's high/low (`ev_breakout`), OI moved >=
+  `ev_oi_jump_pct` (1.0 %) over 3 bars, or the side's probability rose >= `ev_prob_jump` (0.10) since the coin's last decision
+  point; the entry then needs `prob >= threshold + ev_extra_conf` (0.05). `min_gap_bars` (1) spaces any two decision points of a
+  coin. A threshold <= 0 switches that event off. The live champion and every shadow model call the same `AdaptiveState.step`
+  (the shadow stats measure the live behaviour); state is in memory, first sight after a restart counts the previous
+  `base_gap_bars` grid close as the last regular look. Event entries are logged (`adaptive entry ETHUSDT long: event
+  volume_z=3.1, p=0.71`), regular decisions log the coin's current gap. `/api/status` `decisions` and `models[]` add
+  `decision_mode`, the gap settings, `last_decision` {t, symbol, kind, action, prob, reason} and `decision_counts`. Training
+  (`ml/mtf_dataset.py`) still labels on the fixed hourly grid.
 - **Time stop / max_open.** `exit_cfg.horizon_bars` (any exit mode): the position is closed at market that many 5m bars after the
   entry (exit reason `timeout`; shadow: at that bar's close, adverse slippage, taker fee), persisted in kv `time_stops`.
   `entry_cfg.max_open`: concurrent positions allowed (live: all open positions + in-flight entries; shadow: that model's own).

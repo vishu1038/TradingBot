@@ -16,6 +16,14 @@ from .config import Settings
 BAR_MS = 300_000
 
 
+def _flt(v: Any, default: float, lo: float, hi: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f and lo <= f <= hi else default
+
+
 def _int(v: Any, default: int, lo: int, hi: int) -> int:
     try:
         f = float(v)
@@ -37,6 +45,22 @@ class EntryCfg:
     maker_on_timeout: str = "skip"
     sl_cooldown_bars: int = 0           # per coin: no new entry for N bars after a LOSING sl/trail/kill/timeout/liquidation exit
     max_open: int | None = None         # entry_cfg only: concurrent positions this model may hold (null = unlimited)
+    # ---- adaptive cadence (entry_cfg only; see tb.adaptive). "fixed" = the UTC-grid ``decision_every_bars`` above.
+    decision_mode: str = "fixed"
+    base_gap_bars: int = 12             # regular decision gap of a coin with median volatility
+    min_regular_gap_bars: int = 3       # ... of a very volatile coin (15 min)
+    max_regular_gap_bars: int = 24      # ... of a very quiet coin (2 h)
+    min_gap_bars: int = 1               # minimum bars between two decision points (regular or event) of one coin
+    ev_range_atr: float = 1.5           # event: 5m range >= x * 5m ATR14            (<= 0: off)
+    ev_volume_z: float = 2.5            # event: 5m volume z-score vs trailing 48 bars (<= 0: off)
+    ev_breakout: bool = True            # event: close beyond the prior closed 1h bar's high / low
+    ev_oi_jump_pct: float = 1.0         # event: open interest moved >= x % over 3 bars (<= 0: off)
+    ev_prob_jump: float = 0.10          # event: side probability rose >= x since the coin's last decision point (<= 0: off)
+    ev_extra_conf: float = 0.05         # an event entry needs prob >= threshold + x
+
+    @property
+    def adaptive(self) -> bool:
+        return self.decision_mode == "adaptive"
 
     @classmethod
     def resolve(cls, cfg: Settings, entry_cfg: Mapping[str, Any] | None = None) -> "EntryCfg":
@@ -58,7 +82,18 @@ class EntryCfg:
             maker_reprices=_int(e.get("maker_reprices"), cfg.maker_reprices, 0, 10),
             maker_on_timeout=on_to if on_to in ("skip", "taker") else cfg.maker_on_timeout,
             sl_cooldown_bars=_int(e.get("sl_cooldown_bars"), cfg.sl_cooldown_bars, 0, 100_000),
-            max_open=_int(e.get("max_open"), 0, 1, 1000) or None)
+            max_open=_int(e.get("max_open"), 0, 1, 1000) or None,
+            decision_mode="adaptive" if e.get("decision_mode") == "adaptive" else "fixed",
+            base_gap_bars=_int(e.get("base_gap_bars"), 12, 1, 4032),
+            min_regular_gap_bars=_int(e.get("min_regular_gap_bars"), 3, 1, 4032),
+            max_regular_gap_bars=_int(e.get("max_regular_gap_bars"), 24, 1, 4032),
+            min_gap_bars=_int(e.get("min_gap_bars"), 1, 1, 4032),
+            ev_range_atr=_flt(e.get("ev_range_atr"), 1.5, 0.0, 1000.0),
+            ev_volume_z=_flt(e.get("ev_volume_z"), 2.5, 0.0, 1000.0),
+            ev_breakout=bool(e["ev_breakout"]) if isinstance(e.get("ev_breakout"), bool) else True,
+            ev_oi_jump_pct=_flt(e.get("ev_oi_jump_pct"), 1.0, 0.0, 1000.0),
+            ev_prob_jump=_flt(e.get("ev_prob_jump"), 0.10, 0.0, 1.0),
+            ev_extra_conf=_flt(e.get("ev_extra_conf"), 0.05, 0.0, 1.0))
 
 
 @dataclass(frozen=True)

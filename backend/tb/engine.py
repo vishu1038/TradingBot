@@ -33,6 +33,7 @@ from . import __version__
 from .alerts import AlertDispatcher
 from .config import (LiveNotAllowed, Settings, db_path, load_secrets, models_dir, resolve_mode, trading_base_url,
                      PROD_BASE)
+from .adaptive import AdaptiveState, Decision
 from .entry import EntryCfg, EntryGate, XsecCfg, day_start, is_decision_bar, next_decision_ms, next_rebalance_ms, rebalance_slot
 from .emergency import (Backoff, emergency_close, liq_clear, liq_map, liq_mark, liquidation_reason, reduce_rejected,
                         transient)
@@ -220,6 +221,7 @@ class Engine:
         self.hist_warned: dict[str, float] = {}
         self.live_gate = EntryGate()                           # cooldown / trades-per-day of the real account
         self.shadow_gates: dict[str, EntryGate] = {}           # ... and of every shadow model
+        self.adaptive_states: dict[str, AdaptiveState] = {}    # per model: adaptive-cadence bookkeeping (tb.adaptive)
         self.pending: dict[str, dict] = {}                     # symbol -> reservation of an in-flight maker entry
         self.maker_poll_s = MAKER_POLL_S
         self.maker_sleep: Callable = asyncio.sleep             # tests replace it with a no-op
@@ -415,6 +417,19 @@ class Engine:
             return cfg.prob_threshold_long, cfg.prob_threshold_short
         return (info.threshold_long if info.threshold_long is not None else cfg.prob_threshold_long,
                 info.threshold_short if info.threshold_short is not None else cfg.prob_threshold_short)
+
+    def adaptive_decide(self, name: str, info: ModelInfo | None, sym: str, closed: pd.DataFrame, sc: Score | None,
+                        ent: EntryCfg) -> Decision:
+        """Adaptive cadence for one (model, coin, closed bar): is it a decision point and what would it enter?  ONE
+        function for the live champion and every shadow model, so the shadow stats measure what the live bot does."""
+        if sc is None:
+            return Decision()
+        st = self.adaptive_states.get(name)
+        if st is None:
+            st = self.adaptive_states[name] = AdaptiveState()
+        tl, ts = self.model_thresholds(info)
+        return st.step(sym, closed, self.feed.metrics.get(sym), float(sc.prob_long), float(sc.prob_short), ent, tl, ts,
+                       self.cfg.short_enabled)
 
     def recompute_history_need(self) -> None:
         need = FIRST_FETCH
@@ -1860,7 +1875,8 @@ class Engine:
         active = not isinstance(self.scorer, NullScorer)
         ent = self.model_entry(info)
         xsec_champ = active and info is not None and info.kind == "xsec"
-        decision = is_decision_bar(int(bar.open_time), ent.decision_every_bars)
+        adaptive = ent.adaptive and not xsec_champ
+        decision = adaptive or is_decision_bar(int(bar.open_time), ent.decision_every_bars)     # adaptive: scored every bar
         cache: dict = {}
         sc: Score | None = None
         prob_l = prob_s = 0.0
@@ -1869,7 +1885,14 @@ class Engine:
             sc = await self.score_one(self.scorer, info, sym, closed, cache)
             if sc is not None:
                 prob_l, prob_s, reasons = float(sc.prob_long), float(sc.prob_short), reasons_to_dicts(sc.reasons)
-        action, prob = self.pick_side(sc, info)
+        dec: Decision | None = None
+        if adaptive and active:
+            dec = self.adaptive_decide(info.name if info else "?", info, sym, closed, sc, ent)
+            action, prob = dec.side, dec.prob
+            if dec.kind == "regular":
+                log.info("adaptive regular decision %s: %s -> %s p=%.2f", sym, dec.reason, dec.side or "none", dec.prob)
+        else:
+            action, prob = self.pick_side(sc, info)
         action = action or "none"
         if not active or (decision and not xsec_champ):          # (cadence > 1: signals only at decision points)
             t = int(bar.open_time // 1000) + 300
@@ -1878,34 +1901,47 @@ class Engine:
                                   "reasons": reasons})
         # shadow mode: every model (champion + challengers) takes its would-be trades with its own entry / exit template
         if self.challengers:
-            await self.shadow_signals(sym, closed, bar, cache, sc if (active and decision and not xsec_champ) else None)
+            await self.shadow_signals(sym, closed, bar, cache, sc if (active and decision and not xsec_champ) else None, dec)
         if action != "none":
             if fresh:
                 ok, why = self.live_gate.check(sym, self.clock(), ent, len(self._db_positions()) + len(self.pending))
                 if ok:
+                    if dec is not None and dec.kind:
+                        self.adaptive_states[info.name if info else "?"].entered(dec.kind)
+                        if dec.kind == "event":
+                            log.info("adaptive entry %s %s: %s, p=%.2f", sym, action, dec.reason, prob)
                     await self.try_open(sym, action, prob, reasons, closed)
                 else:
                     log.info("signal %s %s skipped: %s", action, sym, why)
             else:
                 log.info("signal %s %s ignored: bar not fresh", action, sym)
 
-    async def shadow_signals(self, sym: str, closed: pd.DataFrame, bar, cache: dict, champ_sc: Score | None) -> None:
+    async def shadow_signals(self, sym: str, closed: pd.DataFrame, bar, cache: dict, champ_sc: Score | None,
+                             champ_dec: Decision | None = None) -> None:
         cfg = self.cfg
         f = await self.io(self.ex.filters, sym)
         price = self.marks.get(sym) or float(closed["close"].iloc[-1])
         now = self.clock()
-        models: list[tuple[str, ModelInfo | None, Score | None, EntryCfg]] = []
+        models: list[tuple[str, ModelInfo | None, Score | None, EntryCfg, Decision | None]] = []
         if self.model_info:
-            models.append((self.model_info.name, self.model_info, champ_sc, self.model_entry(self.model_info)))
+            ent0 = self.model_entry(self.model_info)
+            models.append((self.model_info.name, self.model_info, champ_sc, ent0, champ_dec))   # (champion: decided in on_new_bar)
         for name, (sc_obj, info) in self.challengers.items():
             if info.kind == "xsec":
                 continue                                       # rebalanced in universe_models_cycle
             ent = self.model_entry(info)
+            if ent.adaptive:
+                sc = await self.score_one(sc_obj, info, sym, closed, cache)
+                models.append((name, info, sc, ent, self.adaptive_decide(name, info, sym, closed, sc, ent)))
+                continue
             if not is_decision_bar(int(bar.open_time), ent.decision_every_bars):
                 continue
-            models.append((name, info, await self.score_one(sc_obj, info, sym, closed, cache), ent))
-        for name, info, sc, ent in models:
-            side, prob = self.pick_side(sc, info)
+            models.append((name, info, await self.score_one(sc_obj, info, sym, closed, cache), ent, None))
+        for name, info, sc, ent, dec in models:
+            if dec is not None:
+                side, prob = dec.side, dec.prob
+            else:
+                side, prob = self.pick_side(sc, info)
             if not side:
                 continue
             gate = self.shadow_gate(name)
@@ -1921,6 +1957,10 @@ class Engine:
             if self.shadow.open(name, sym, side, prob, float(closed["close"].iloc[-1]) if maker else price, now, atr, f,
                                 spec=spec, entry=ent, decision_open_ms=int(bar.open_time)):
                 gate.record_entry(sym, now)
+                if dec is not None and dec.kind and not (self.model_info and name == self.model_info.name):
+                    self.adaptive_states[name].entered(dec.kind)
+                    if dec.kind == "event":
+                        log.info("adaptive shadow entry %s %s %s: %s, p=%.2f", name, sym, side, dec.reason, dec.prob)
 
     def _record_shadow(self, tr: dict) -> None:
         self.store.add_shadow_trade(tr)
@@ -2215,6 +2255,9 @@ class Engine:
                 xc = XsecCfg.resolve(info.entry_cfg, info.meta)
                 row.update(rebalance_every_h=xc.rebalance_every_h, top_k=xc.top_k, bottom_k=xc.bottom_k,
                            next_decision_t=next_rebalance_ms(now_ms, xc.rebalance_every_h) / 1000.0)
+            elif ent.adaptive:
+                row["next_decision_t"] = next_decision_ms(now_ms, 1) / 1000.0         # scored on every closed 5m bar
+                row.update(self.adaptive_status(name, ent))
             else:
                 row["next_decision_t"] = next_decision_ms(now_ms, ent.decision_every_bars) / 1000.0
             sh = self.shadow.stats.get(name)
@@ -2222,6 +2265,15 @@ class Engine:
                 row["shadow_maker"] = dict(sh)
             out.append(row)
         return out
+
+    def adaptive_status(self, name: str, ent: EntryCfg) -> dict:
+        """Adaptive-cadence view of one model: its config, counts of regular / event decision points and entries, and the
+        newest decision point (time, coin, kind, action, reason)."""
+        st = self.adaptive_states.get(name)
+        return {"decision_mode": "adaptive", "base_gap_bars": ent.base_gap_bars,
+                "min_regular_gap_bars": ent.min_regular_gap_bars, "max_regular_gap_bars": ent.max_regular_gap_bars,
+                "min_gap_bars": ent.min_gap_bars, "ev_extra_conf": ent.ev_extra_conf,
+                "last_decision": (st.last if st else None), "decision_counts": (st.counts if st else None)}
 
     def decisions_status(self) -> dict:
         """Champion decision cadence / entry limits for the status page."""
@@ -2233,8 +2285,9 @@ class Engine:
         if active:
             assert info is not None
             nxt = (next_rebalance_ms(now_ms, XsecCfg.resolve(info.entry_cfg, info.meta).rebalance_every_h) if info.kind == "xsec"
-                   else next_decision_ms(now_ms, ent.decision_every_bars)) / 1000.0
-        return {"kind": info.kind if active and info else None, "next_decision_t": nxt,
+                   else next_decision_ms(now_ms, 1 if ent.adaptive else ent.decision_every_bars)) / 1000.0
+        extra = self.adaptive_status(info.name, ent) if active and info and ent.adaptive and info.kind != "xsec" else {}
+        return {**extra, "kind": info.kind if active and info else None, "next_decision_t": nxt,
                 "decision_every_bars": ent.decision_every_bars, "cooldown_bars": ent.cooldown_bars,
                 "trades_today": self.live_gate.trades_today(self.clock()), "max_trades_per_day": ent.max_trades_per_day,
                 "entry_mode": ent.entry_mode, "history_bars_5m": self.hist_need,
