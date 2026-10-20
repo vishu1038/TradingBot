@@ -13,3 +13,11 @@ def test_stored_safety_view_follows_the_drift_sample_size(store, tmp_path):
     assert eng.drift_state.n == 1                          # the engine itself always knew
     run(eng.heartbeat_cycle())
     assert store.kv_get("safety_engine")["drift"]["n"] == 1
+
+
+def test_a_restart_seeds_the_drift_monitor_from_stored_trades(store, tmp_path):
+    eng, data = mk_engine(store, tmp_path)
+    open_long(eng)
+    assert run(eng.close_position(store.get_positions()[0], "manual"))
+    eng2, _ = mk_engine(store, tmp_path)                  # same DB: the restarted engine remembers the evidence
+    assert eng2.drift_state.n == 1

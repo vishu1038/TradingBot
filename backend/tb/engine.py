@@ -210,6 +210,7 @@ class Engine:
         self.faults = FaultTracker(self.cfg.fault_mature_n, self.cfg.fault_recover_m)
         self.drift = DriftMonitor(self.cfg.drift_n)
         self.drift_state = self.drift.update([], [])
+        self._update_drift()          # seed from the stored trades: a restart must not forget the drift evidence
         self.slips: deque[float] = deque(maxlen=30)
         self.slip_alarm = False
         self.safety_view: dict[str, Any] = {"state": NORMAL, "reasons": []}
