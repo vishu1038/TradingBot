@@ -37,7 +37,7 @@ class Score:
 
 
 KIND_PER_SYMBOL = "per_symbol_5m"
-KINDS = (KIND_PER_SYMBOL, "mtf", "gbm", "xsec")
+KINDS = (KIND_PER_SYMBOL, "mtf", "gbm", "xsec", "rules")
 
 
 @dataclass
@@ -182,7 +182,8 @@ def is_paper_only(entry: ModelEntry) -> bool:
     return PAPER_ONLY_MARKER.lower() in str(entry.meta.get("note", "")).lower()
 
 
-_KIND_MODULE = {KIND_PER_SYMBOL: "model_np", "mtf": "model_np", "gbm": "model_gbm", "xsec": "model_xsec"}
+_KIND_MODULE = {KIND_PER_SYMBOL: "model_np", "mtf": "model_np", "gbm": "model_gbm", "xsec": "model_xsec",
+                "rules": "model_rules"}
 
 
 def model_kind(meta: Mapping[str, Any]) -> str:
@@ -216,7 +217,7 @@ def _history_bars(meta: Mapping[str, Any], scorer: Any, kind: str) -> int:
 
 def load_model(entry: ModelEntry) -> tuple[Scorer, ModelInfo] | None:
     """Load one artifact, dispatching on its ``kind`` (per_symbol_5m / mtf -> ``tb.model_np``, gbm ->
-    ``tb.model_gbm``, xsec -> ``tb.model_xsec``). An unknown kind, a missing module or a broken artifact is
+    ``tb.model_gbm``, xsec -> ``tb.model_xsec``, rules -> ``tb.model_rules``). An unknown kind, a missing module or a broken artifact is
     logged and skipped (None): a model can never crash the engine."""
     kind = model_kind(entry.meta)
     mod_name = _KIND_MODULE.get(kind)
