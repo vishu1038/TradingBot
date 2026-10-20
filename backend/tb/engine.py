@@ -2502,7 +2502,8 @@ class Engine:
         for p in self.shadow.pos.values():
             m = self.marks.get(p.symbol)
             if not m:
-                continue
+                # right after a start the marks are not loaded yet: leaving the open position out drew a fake drop
+                return {}
             d = 1.0 if p.side == "long" else -1.0
             out[p.model] = out.get(p.model, 0.0) + (m - p.entry) * p.qty * d + p.part_gross - p.part_fees - p.entry_fee
         for name in self.shadow_names():
