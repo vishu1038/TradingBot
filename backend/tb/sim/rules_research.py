@@ -573,6 +573,9 @@ def main(argv: list[str]) -> None:
             print(table(res, p, carried).to_string(index=False))
     elif cmd == "export":
         export_models()
+    elif cmd in ("build_mr", "dev_mr", "holdout_mr", "preview_mr", "export_mr"):      # the separate mean-reversion family
+        from . import rules_research_mr
+        rules_research_mr.main(argv)
     else:
         print(__doc__)
 

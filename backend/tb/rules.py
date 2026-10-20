@@ -18,6 +18,13 @@ Setups (decided before looking at results):
                         within the last 6 bars, entry when the MACD histogram turns in the regime direction;
   * S2 breakout       : close beyond the prior 20-bar high / low, volume z-score > 2, MACD histogram on the same side;
   * S3 momentum       : MACD line crosses its signal line in the regime direction with RSI 50-70 (long) / 30-50 (short).
+
+Mean-reversion family (pre-registered 2026-10-21, separate from the trend family; ``MR_MODES`` / ``MR_SETUPS``):
+  * S4 mean reversion : LONG when price is stretched below its mean - close < EMA20 - 2 x ATR14 AND Bollinger z(20, close) <= -2
+                        AND RSI14 < 25 - SHORT the mirror (close > EMA20 + 2 ATR, z >= +2, RSI > 75), all on the variant's own
+                        timeframe, decided at the bar close.  Both sides are allowed, the regime does not pick the side:
+                        mode ``chop`` trades only while the COIN's own regime is chop (a coin with too little history for its
+                        regime is not "chop"), mode ``any`` has no regime gate.
 """
 from __future__ import annotations
 
@@ -34,8 +41,10 @@ BARS_PER_HOUR = 12
 
 MODES = ("btc", "coin")
 SETUPS = ("S1", "S2", "S3")
+MR_MODES = ("chop", "any")                 # mean-reversion regime gates (NOT part of MODES: the 12-variant trend family is unchanged)
+MR_SETUPS = ("S4",)
 TFS = ("5m", "1h")
-SETUP_NAMES = {"S1": "trend pullback", "S2": "breakout", "S3": "momentum continuation"}
+SETUP_NAMES = {"S1": "trend pullback", "S2": "breakout", "S3": "momentum continuation", "S4": "mean reversion"}
 
 
 # ----------------------------------------------------------------------------------------------- indicators
@@ -215,6 +224,16 @@ def coin_regime(close_1h, fast: int = 50, slow: int = 200, slope_hours: int = 6)
     return np.where(up, 1, np.where(dn, -1, 0)).astype("int8")
 
 
+def coin_regime_valid(close_1h, fast: int = 50, slow: int = 200, slope_hours: int = 6) -> np.ndarray:
+    """``coin_regime`` with an explicit 'unknown' value: 2 where the regime filters have not got a full window yet (a young coin is
+    not 'chop'), otherwise +1 / -1 / 0 exactly as ``coin_regime``."""
+    c = np.asarray(close_1h, dtype="float64")
+    ef, es = ema(c, fast), ema(c, slow)
+    slope = ef - shift(ef, slope_hours)
+    reg = coin_regime(c, fast, slow, slope_hours)
+    return np.where(np.isfinite(es) & np.isfinite(slope), reg, 2).astype("int8")
+
+
 def asof(t_end_src: np.ndarray, values: np.ndarray, t_query: np.ndarray, fill: float = 0) -> np.ndarray:
     """``values`` of the last source bar whose close time is <= ``t_query`` (``fill`` before the first)."""
     j = np.searchsorted(t_end_src, t_query, side="right") - 1
@@ -228,8 +247,8 @@ def asof(t_end_src: np.ndarray, values: np.ndarray, t_query: np.ndarray, fill: f
 @dataclass(frozen=True)
 class RuleCfg:
     """One rule variant. The numbers are FIXED (decided before any backtest); only mode / setup / tf vary."""
-    mode: str = "btc"                  # btc | coin
-    setup: str = "S1"                  # S1 | S2 | S3
+    mode: str = "btc"                  # btc | coin (trend family) ; chop | any (mean-reversion family)
+    setup: str = "S1"                  # S1 | S2 | S3 (trend) ; S4 (mean reversion)
     tf: str = "1h"                     # 5m | 1h
     ema_pullback: int = 20
     pullback_bars: int = 6
@@ -247,14 +266,28 @@ class RuleCfg:
     coin_fast: int = 50
     coin_slow: int = 200
     coin_slope_hours: int = 6
+    mr_ema: int = 20                   # S4 constants (pre-registered)
+    mr_atr_n: int = 14
+    mr_atr_mult: float = 2.0
+    mr_bb_n: int = 20
+    mr_bb_z: float = 2.0
+    mr_rsi_n: int = 14
+    mr_rsi_lo: float = 25.0
+    mr_rsi_hi: float = 75.0
 
     def __post_init__(self):
-        if self.mode not in MODES or self.setup not in SETUPS or self.tf not in TFS:
+        trend_ok = self.mode in MODES and self.setup in SETUPS
+        mr_ok = self.mode in MR_MODES and self.setup in MR_SETUPS
+        if not (trend_ok or mr_ok) or self.tf not in TFS:
             raise ValueError(f"bad rule variant {self.mode}/{self.setup}/{self.tf}")
 
     @property
+    def is_mr(self) -> bool:
+        return self.setup in MR_SETUPS
+
+    @property
     def key(self) -> str:
-        return f"{self.mode}_{self.setup}_{self.tf}"
+        return f"mr_{self.mode}_{self.tf}" if self.is_mr else f"{self.mode}_{self.setup}_{self.tf}"
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -269,10 +302,15 @@ class RuleCfg:
 
     def history_bars_5m(self) -> int:
         """5m rows after which every output is final (window-independent): the longest filter chain on its timeframe + slack."""
-        hours = max(ema_taps(self.btc_ema_hours) if self.mode == "btc" else ema_taps(self.coin_slow) + self.coin_slope_hours,
-                    self.btc_ret_hours + 1 if self.mode == "btc" else 0)
-        regime_5m = (hours + 2) * BARS_PER_HOUR
+        if self.mode == "any":
+            hours = 0                                              # no regime gate
+        else:
+            hours = max(ema_taps(self.btc_ema_hours) if self.mode == "btc" else ema_taps(self.coin_slow) + self.coin_slope_hours,
+                        self.btc_ret_hours + 1 if self.mode == "btc" else 0)
+        regime_5m = (hours + 2) * BARS_PER_HOUR if hours else 0
         chain = max(macd_taps() + 2, self.rsi_n * 6 + self.pullback_bars + 4, self.vol_z_n + 4, self.brk_n + 2, ema_taps(self.ema_pullback) + 8)
+        if self.is_mr:
+            chain = max(ema_taps(self.mr_ema) + 4, self.mr_rsi_n * 6 + 4, self.mr_bb_n + 4, self.mr_atr_n + 4)
         setup_5m = chain if self.tf == "5m" else (chain + 2) * BARS_PER_HOUR
         return int(max(regime_5m, setup_5m) + BARS_PER_HOUR)
 
@@ -280,6 +318,15 @@ class RuleCfg:
 def _setup_raw(cfg: RuleCfg, b: Bars) -> tuple[np.ndarray, np.ndarray]:
     """(long, short) setup conditions per bar WITHOUT the regime filter."""
     c, h, l, v = b.c, b.h, b.l, b.v
+    if cfg.setup == "S4":
+        e = ema(c, cfg.mr_ema)
+        a = atr_sma(h, l, c, cfg.mr_atr_n)
+        mu, sd = rolling_mean(c, cfg.mr_bb_n), rolling_std(c, cfg.mr_bb_n)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            z = np.where(sd > 0, (c - mu) / sd, np.nan)
+            r = rsi(c, cfg.mr_rsi_n)
+            return ((c < e - cfg.mr_atr_mult * a) & (z <= -cfg.mr_bb_z) & (r < cfg.mr_rsi_lo),
+                    (c > e + cfg.mr_atr_mult * a) & (z >= cfg.mr_bb_z) & (r > cfg.mr_rsi_hi))
     _, _, hist = macd(c)
     h1, h2 = shift(hist, 1), shift(hist, 2)
     with np.errstate(invalid="ignore"):
@@ -312,7 +359,14 @@ class RuleSignals:
 
 
 def regime_for(cfg: RuleCfg, own_1h: Bars, btc_1h: Bars | None, t_query: np.ndarray) -> np.ndarray:
-    """The regime of ``cfg.mode`` as of each query close time (0 = chop / not enough history / no BTC data)."""
+    """The regime of ``cfg.mode`` as of each query close time (0 = chop / not enough history / no BTC data).  Mean-reversion modes:
+    ``chop`` -> the coin's regime with 2 = unknown (not enough history, never tradeable), ``any`` -> all zeros (no gate)."""
+    if cfg.mode == "any":
+        return np.zeros(len(t_query), "int8")
+    if cfg.mode == "chop":
+        if not len(own_1h):
+            return np.full(len(t_query), 2, "int8")
+        return asof(own_1h.t_end, coin_regime_valid(own_1h.c, cfg.coin_fast, cfg.coin_slow, cfg.coin_slope_hours), t_query, fill=2)
     if cfg.mode == "btc":
         if btc_1h is None or not len(btc_1h):
             return np.zeros(len(t_query), "int8")
@@ -344,6 +398,9 @@ def rule_signals(kl: pd.DataFrame, btc_kl: pd.DataFrame | None, cfg: RuleCfg) ->
         lo, sh = np.zeros(n, bool), np.zeros(n, bool)
         lo[j[ok]], sh[j[ok]] = lo_h[ok], sh_h[ok]
         due = (t_close % HOUR_MS) == 0
+    if cfg.is_mr:                                                 # both sides, optionally only while the coin's own regime is chop
+        gate = (reg == 0) if cfg.mode == "chop" else np.ones(n, bool)
+        return RuleSignals(lo & gate & due, sh & gate & due, reg, due)
     return RuleSignals(lo & (reg > 0) & due, sh & (reg < 0) & due, reg, due)
 
 
@@ -357,5 +414,10 @@ def last_signal(kl: pd.DataFrame, btc_kl: pd.DataFrame | None, cfg: RuleCfg) -> 
 
 
 def describe(cfg: RuleCfg) -> str:
+    if cfg.is_mr:
+        gate = "only while the coin's own trend regime is chop" if cfg.mode == "chop" else "no regime gate"
+        return (f"mean reversion on {cfg.tf} bars: LONG when close < EMA{cfg.mr_ema} - {cfg.mr_atr_mult:g} x ATR{cfg.mr_atr_n}, "
+                f"Bollinger z({cfg.mr_bb_n}) <= -{cfg.mr_bb_z:g} and RSI{cfg.mr_rsi_n} < {cfg.mr_rsi_lo:g}; SHORT the mirror "
+                f"(RSI > {cfg.mr_rsi_hi:g}); both sides, {gate}")
     who = "BTC's trend" if cfg.mode == "btc" else "the coin's own trend"
     return f"{SETUP_NAMES[cfg.setup]} on {cfg.tf} bars, side chosen by {who}"

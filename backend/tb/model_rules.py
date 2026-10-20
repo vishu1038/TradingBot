@@ -72,7 +72,11 @@ class RulesScorer:
         side, regime = rules.last_signal(kl, btc_kl, cfg)
         if side is None:
             return Score(0.0, 0.0, [])
-        label = f"{cfg.mode} regime {'up' if regime > 0 else 'down'}: {rules.SETUP_NAMES[cfg.setup]} ({cfg.tf})"
+        if cfg.is_mr:
+            label = (f"coin regime chop: {rules.SETUP_NAMES[cfg.setup]} ({cfg.tf})" if cfg.mode == "chop"
+                     else f"no regime gate: {rules.SETUP_NAMES[cfg.setup]} ({cfg.tf})")
+        else:
+            label = f"{cfg.mode} regime {'up' if regime > 0 else 'down'}: {rules.SETUP_NAMES[cfg.setup]} ({cfg.tf})"
         reasons = [Reason("regime", label, float(regime), 1.0), Reason("setup", rules.describe(cfg), 1.0, 1.0)]
         return Score(1.0, 0.0, reasons) if side == "long" else Score(0.0, 1.0, reasons)
 
