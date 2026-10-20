@@ -2474,8 +2474,11 @@ class Engine:
             self.ex.set_cfg(self.cfg)
         view = self.compute_safety()
         self.safety_view = view
+        # drift z / n are part of the signature: with the level alone the stored view (what /api/status shows) kept the
+        # startup "n=0" forever while the level stayed 0
+        z = self.drift_state.z
         sig = (view["state"], tuple(view["reasons"]), tuple((f["symbol"], f["kind"]) for f in view["faults"]),
-               self.drift_state.level, round(view["derate_mult"], 2))
+               self.drift_state.level, self.drift_state.n, None if z is None else round(z, 2), round(view["derate_mult"], 2))
         if sig != self._safety_sig:
             self._safety_sig = sig
             self.store.kv_set("safety_engine", view)
